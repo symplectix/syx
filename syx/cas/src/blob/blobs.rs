@@ -35,8 +35,8 @@ use crate::hash::{
     ToBytes,
 };
 
-pub(super) struct Blobs<'a, S> {
-    storage:        &'a S,
+pub(super) struct Blobs<S> {
+    storage:        S,
     // The chunk-size knobs from `consts`, as fields instead of globals.
     // Unlike `Encoder`'s compression knobs, these aren't safe to change
     // carelessly -- see `consts` for why -- so there's no builder to
@@ -46,8 +46,8 @@ pub(super) struct Blobs<'a, S> {
     chunk_max_size: usize,
 }
 
-impl<'a, S: Storage> Blobs<'a, S> {
-    pub(super) const fn new(storage: &'a S) -> Self {
+impl<S: Storage> Blobs<S> {
+    pub(super) const fn new(storage: S) -> Self {
         Self {
             storage,
             chunk_min_size: consts::CHUNK_MIN_SIZE,
@@ -88,7 +88,7 @@ impl<'a, S: Storage> Blobs<'a, S> {
         w: &mut W,
     ) -> io::Result<bool> {
         let decoder = entry::Decoder::new();
-        let Some((flags, decoded)) = decoder.load(self.storage, digest).await? else {
+        let Some((flags, decoded)) = decoder.load(&self.storage, digest).await? else {
             return Ok(false);
         };
 
@@ -111,7 +111,7 @@ impl<'a, S: Storage> Blobs<'a, S> {
         }
 
         for entry in manifest {
-            let Some((chunk_flags, raw)) = decoder.load(self.storage, &entry.digest).await? else {
+            let Some((chunk_flags, raw)) = decoder.load(&self.storage, &entry.digest).await? else {
                 return Err(invalid_data(format!(
                     "manifest references missing chunk {:x}",
                     entry.digest
@@ -181,7 +181,7 @@ impl<'a, S: Storage> Blobs<'a, S> {
             manifest.put_u32(chunk.length as u32);
             chunk_digests.part(digest.as_ref());
             last_digest = Some(digest);
-            encoder.save(self.storage, digest, chunk.data, entry::Flags::empty()).await?;
+            encoder.save(&self.storage, digest, chunk.data, entry::Flags::empty()).await?;
         }
 
         if total != len {
@@ -207,7 +207,7 @@ impl<'a, S: Storage> Blobs<'a, S> {
             manifest.put_slice(digest.as_ref());
             manifest.put_u32(0);
             last_digest = Some(digest);
-            encoder.save(self.storage, digest, Vec::new(), entry::Flags::empty()).await?;
+            encoder.save(&self.storage, digest, Vec::new(), entry::Flags::empty()).await?;
         }
 
         // Each chunk (real or the synthetic empty one above) appends
@@ -225,7 +225,7 @@ impl<'a, S: Storage> Blobs<'a, S> {
             Ok(last_digest.expect("manifest.len() == 36 implies last_digest was set"))
         } else {
             let blob_digest = chunk_digests.digest();
-            encoder.save(self.storage, blob_digest, manifest, entry::Flags::MANIFEST).await?;
+            encoder.save(&self.storage, blob_digest, manifest, entry::Flags::MANIFEST).await?;
             Ok(blob_digest)
         }
     }

@@ -25,3 +25,17 @@ pub trait Storage: Sync {
     /// Store `bytes` under `key`.
     fn put_blob(&self, key: &[u8], bytes: Bytes) -> impl Future<Output = io::Result<()>> + Send;
 }
+
+impl<T: Storage> Storage for &T {
+    fn contains_blob(&self, key: &[u8]) -> impl Future<Output = io::Result<bool>> + Send {
+        (*self).contains_blob(key)
+    }
+
+    fn get_blob(&self, key: &[u8]) -> impl Future<Output = io::Result<Option<Bytes>>> + Send {
+        (*self).get_blob(key)
+    }
+
+    fn put_blob(&self, key: &[u8], bytes: Bytes) -> impl Future<Output = io::Result<()>> + Send {
+        (*self).put_blob(key, bytes)
+    }
+}
