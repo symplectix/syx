@@ -55,10 +55,9 @@ pub struct Storage<T> {
     decoding: Decoding,
 }
 
-/// Moves already-encoded bytes in and out by a key the caller supplies.
-/// Chunking, manifest encoding/decoding, digest computation and verification,
-/// and compression all live one layer up, in `Storage`. A `Backend` impl doesn't
-/// interpret `key` or `bytes`, it just stores bytes under bytes.
+/// Moves bytes in and out by a key the caller supplies.
+/// A `Backend` doesn't interpret `key` or `bytes`,
+/// it just stores bytes under bytes.
 pub trait Backend: Sync {
     /// Whether `key` is already stored, without fetching its value.
     fn contains_blob(&self, key: &[u8]) -> impl Future<Output = io::Result<bool>> + Send;
@@ -89,9 +88,9 @@ impl<T: Backend> Storage<T> {
     pub const fn new(backend: T) -> Self {
         Self {
             backend,
+            chunking: Chunking::new(),
             encoding: Encoding::new(),
             decoding: Decoding::new(),
-            chunking: Chunking::new(),
         }
     }
 
@@ -299,10 +298,20 @@ impl<T: Backend> Storage<T> {
     }
 }
 
-mod defaults {
-    //! Default tuning values for chunking and compression.
+pub(crate) mod defaults {
+    //! Default values for chunking and encoding.
     //!
-    //! # Compression: `COMPRESSION_LEVEL`, `SNIFF_LEN`, `SNIFF_MAX_RATIO`
+    //! # Chunking: `CHUNK_MIN_SIZE`, `CHUNK_AVG_SIZE`, `CHUNK_MAX_SIZE`
+    //!
+    //! NOT safe to change without consequence -- see `Chunking` for why.
+    //! min/avg set the dedup-vs-compression tradeoff: smaller chunks
+    //! dedup more precisely (a small change in content only invalidates
+    //! a small chunk) but compress worse (less context per chunk for
+    //! zstd to find matches in, plus more per-chunk framing overhead);
+    //! larger chunks compress better but dedup more coarsely (one
+    //! changed byte invalidates the whole chunk it falls in).
+    //!
+    //! # Encoding: `COMPRESSION_LEVEL`, `SNIFF_LEN`, `SNIFF_MAX_RATIO`
     //!
     //! Safe to change at any time. Each is a pure write-time heuristic:
     //! every stored chunk records its own compressed-or-not decision,
@@ -315,16 +324,6 @@ mod defaults {
     //! some real (if modest) compression on the table; looser values
     //! capture more of those marginal savings but spend more CPU chasing
     //! chunks that barely shrink.
-    //!
-    //! # Chunking: `CHUNK_MIN_SIZE`, `CHUNK_AVG_SIZE`, `CHUNK_MAX_SIZE`
-    //!
-    //! NOT safe to change without consequence -- see `Chunking` for why.
-    //! min/avg set the dedup-vs-compression tradeoff: smaller chunks
-    //! dedup more precisely (a small change in content only invalidates
-    //! a small chunk) but compress worse (less context per chunk for
-    //! zstd to find matches in, plus more per-chunk framing overhead);
-    //! larger chunks compress better but dedup more coarsely (one
-    //! changed byte invalidates the whole chunk it falls in).
 
     /// One step above zstd's own default level (3), trading a bit more
     /// CPU for a bit better ratio. Worth it here because `SNIFF_MAX_RATIO`
@@ -363,17 +362,14 @@ mod defaults {
     );
 }
 
-/// The chunk-size knobs from `defaults`, as a value instead of globals.
+/// The chunk-size knobs.
 ///
-/// Unlike `Encoding`'s knobs, these aren't safe to change carelessly,
-/// so there's no builder to override them per call. Chunk boundaries
-/// depend on these parameters, so changing them shifts where cuts
-/// fall: even byte-identical content gets split into different chunks
-/// than before, with different digests. Existing chunks and manifests
-/// stay perfectly readable (a chunk's key is just the hash of its own
-/// bytes, independent of how it was cut), but new writes no longer
-/// dedup against what's already stored under the old parameters --
-/// only future writes, among themselves, do.
+/// These aren't safe to change carelessly. Chunk boundaries depend on
+/// these parameters, so changing them shifts where cuts fall:
+/// even byte-identical content gets split into different chunks than
+/// before, with different digests. Existing chunks and manifests stay
+/// perfectly readable, but new writes no longer dedup against what's
+/// already stored under the old parameters.
 #[derive(Clone, Copy)]
 pub(super) struct Chunking {
     min_size: usize,
@@ -397,9 +393,7 @@ impl Chunking {
     }
 }
 
-/// The compression knobs from `defaults`, as a value instead of
-/// globals. `Default` gives back exactly `defaults`' values; tests
-/// build their own.
+/// How to encode the chunk.
 #[derive(Clone, Copy)]
 pub(super) struct Encoding {
     compression_level: i32,
@@ -467,7 +461,8 @@ impl Encoding {
     }
 }
 
-/// The read-side counterpart to `Encoder`.
+/// How to decode the chunk.
+/// The read-side counterpart to `Encoding`.
 #[derive(Clone, Copy)]
 pub(super) struct Decoding {
     // Unlike encoding, decoding needs no options for now.
@@ -484,8 +479,6 @@ impl Decoding {
         Self {}
     }
 
-    /// The inverse of `Encoder::encode`.
-    ///
     /// The not-worth-compressing case is just a cheap sub-slice
     /// of the already-allocated buffer.
     pub(super) fn decode(&self, stored: Bytes) -> io::Result<(Flags, Bytes)> {
