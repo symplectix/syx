@@ -4,6 +4,7 @@ mod blob;
 mod hash;
 
 pub use blob::{
+    Backend,
     Storage,
     copy_from,
     get,

@@ -17,51 +17,53 @@ use crate::hash::{
 #[cfg(test)]
 mod tests;
 
-mod blobs;
 mod consts;
 mod storage;
 
-pub use storage::Storage;
+pub use storage::{
+    Backend,
+    Storage,
+};
 
 /// Reads the content at `digest`, if present.
-pub async fn get<S, T>(storage: &S, digest: &Digest) -> io::Result<Option<T>>
+pub async fn get<S, T>(backend: &S, digest: &Digest) -> io::Result<Option<T>>
 where
-    S: Storage,
+    S: Backend,
     T: FromBytes,
 {
-    blobs::Blobs::new(storage).get(digest).await
+    Storage::new(backend).get(digest).await
 }
 
 /// Store `content`, addressed by its own digest, and return that
 /// digest. A thin wrapper over `copy_from`, over the already
 /// in-memory bytes.
-pub async fn put<S, T>(storage: &S, content: &T) -> io::Result<Digest>
+pub async fn put<S, T>(backend: &S, content: &T) -> io::Result<Digest>
 where
-    S: Storage,
+    S: Backend,
     T: ToBytes,
 {
-    blobs::Blobs::new(storage).put(content).await
+    Storage::new(backend).put(content).await
 }
 
 /// Reads the content at `digest` if present and write it to `w`.
 ///
 /// `get` is the better choice for values small enough that this doesn't matter.
-pub async fn read_into<S, W>(storage: &S, digest: &Digest, w: &mut W) -> io::Result<bool>
+pub async fn read_into<S, W>(backend: &S, digest: &Digest, w: &mut W) -> io::Result<bool>
 where
-    S: Storage,
+    S: Backend,
     W: AsyncWrite + Unpin,
 {
-    blobs::Blobs::new(storage).read_into(digest, w).await
+    Storage::new(backend).read_into(digest, w).await
 }
 
 /// Store the content read from `r` of `len` bytes, addressed by its own
 /// digest.
-pub async fn copy_from<S, R>(storage: &S, len: u64, r: &mut R) -> io::Result<Digest>
+pub async fn copy_from<S, R>(backend: &S, len: u64, r: &mut R) -> io::Result<Digest>
 where
-    S: Storage,
+    S: Backend,
     R: AsyncRead + Unpin,
 {
-    blobs::Blobs::new(storage).copy_from(len, r).await
+    Storage::new(backend).copy_from(len, r).await
 }
 
 /// A reference to one chunk from within a manifest: its digest and its
