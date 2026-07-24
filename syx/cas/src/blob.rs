@@ -19,7 +19,6 @@ mod tests;
 
 mod blobs;
 mod consts;
-mod entry;
 mod storage;
 
 pub use storage::Storage;

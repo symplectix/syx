@@ -6,7 +6,6 @@ rust.library(
         "src/blob.rs",
         "src/blob/blobs.rs",
         "src/blob/consts.rs",
-        "src/blob/entry.rs",
         "src/blob/storage.rs",
         "src/blob/tests.rs",
         "src/hash.rs",

@@ -7,6 +7,7 @@
 use std::io;
 use std::pin::pin;
 
+use bitflags::bitflags;
 use bytes::{
     BufMut,
     Bytes,
@@ -19,13 +20,13 @@ use tokio::io::{
     AsyncWrite,
     AsyncWriteExt as _,
 };
+use tokio::task;
 
 use super::{
     Storage,
     consts,
     decode_manifest,
     digest_of,
-    entry,
     invalid_data,
 };
 use crate::hash::{
@@ -35,12 +36,135 @@ use crate::hash::{
     ToBytes,
 };
 
+bitflags! {
+    /// The trailing byte of every entry's stored payload.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct Flags: u8 {
+        /// The payload that follows is compressed by zstd.
+        const COMPRESSED = 1 << 0;
+        /// The payload is a manifest (an ordered list of ChunkRef),
+        /// not content itself.
+        const MANIFEST = 1 << 1;
+    }
+}
+
+/// The compression knobs from `consts`, as a value instead of
+/// globals. `Default` gives back exactly `consts`' values; tests
+/// build their own.
+#[derive(Clone, Copy)]
+pub(super) struct Encoder {
+    compression_level: i32,
+    sniff_len:         usize,
+    sniff_max_ratio:   f64,
+}
+
+impl Default for Encoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Encoder {
+    pub(super) const fn new() -> Self {
+        Self {
+            compression_level: consts::COMPRESSION_LEVEL,
+            sniff_len:         consts::SNIFF_LEN,
+            sniff_max_ratio:   consts::SNIFF_MAX_RATIO,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(super) const fn compression_level(mut self, level: i32) -> Self {
+        self.compression_level = level;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(super) const fn sniff_len(mut self, len: usize) -> Self {
+        self.sniff_len = len;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(super) const fn sniff_max_ratio(mut self, ratio: f64) -> Self {
+        self.sniff_max_ratio = ratio;
+        self
+    }
+
+    /// Compress `bytes` with zstd if that's worthwhile, and append a
+    /// flag byte recording whether it was.
+    pub(super) fn encode(&self, mut flags: Flags, mut bytes: Vec<u8>) -> Vec<u8> {
+        let sample = &bytes[..bytes.len().min(self.sniff_len)];
+        if self.worth_compressing(sample) {
+            let mut compressed = zstd::bulk::compress(&bytes, self.compression_level)
+                .expect("zstd compression of an in-memory buffer should not fail");
+            flags |= Flags::COMPRESSED;
+            compressed.push(flags.bits());
+            return compressed;
+        }
+        bytes.push(flags.bits());
+        bytes
+    }
+
+    /// Whether compressing `sample` shrinks it enough to be worth
+    /// compressing the rest of the chunk it was taken from.
+    pub(super) fn worth_compressing(&self, sample: &[u8]) -> bool {
+        if sample.is_empty() {
+            return false;
+        }
+        let compressed_len =
+            zstd::bulk::compress(sample, self.compression_level).map_or(sample.len(), |c| c.len());
+        (compressed_len as f64) < (sample.len() as f64) * self.sniff_max_ratio
+    }
+}
+
+/// The read-side counterpart to `Encoder`.
+#[derive(Clone, Copy)]
+pub(super) struct Decoder {
+    // Unlike encoding, decoding needs no options for now.
+}
+
+impl Default for Decoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decoder {
+    pub(super) const fn new() -> Self {
+        Self {}
+    }
+
+    /// The inverse of `Encoder::encode`.
+    ///
+    /// The not-worth-compressing case is just a cheap sub-slice
+    /// of the already-allocated buffer.
+    pub(super) fn decode(&self, stored: Bytes) -> io::Result<(Flags, Bytes)> {
+        if stored.is_empty() {
+            return Err(invalid_data("stored content is missing its trailing flag byte"));
+        }
+        let mut bytes = stored.slice(..stored.len() - 1);
+        let mut flags = Flags::from_bits_retain(stored[stored.len() - 1]);
+        if flags.contains(Flags::COMPRESSED) {
+            // `bytes` is decompressed from here on -- the returned flags
+            // should describe it.
+            flags.remove(Flags::COMPRESSED);
+            bytes = Bytes::from(
+                zstd::decode_all(bytes.as_ref())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            );
+        }
+        Ok((flags, bytes))
+    }
+}
+
 pub(super) struct Blobs<S> {
-    storage:        S,
-    // The chunk-size knobs from `consts`, as fields instead of globals.
-    // Unlike `Encoder`'s compression knobs, these aren't safe to change
-    // carelessly -- see `consts` for why -- so there's no builder to
-    // override them per call.
+    storage: S,
+    encoder: Encoder,
+    decoder: Decoder,
+
+    // The chunk-size knobs. These aren't safe to change carelessly
+    // so there's no builder to override them per call.
     chunk_min_size: usize,
     chunk_avg_size: usize,
     chunk_max_size: usize,
@@ -50,10 +174,45 @@ impl<S: Storage> Blobs<S> {
     pub(super) const fn new(storage: S) -> Self {
         Self {
             storage,
+            encoder: Encoder::new(),
+            decoder: Decoder::new(),
             chunk_min_size: consts::CHUNK_MIN_SIZE,
             chunk_avg_size: consts::CHUNK_AVG_SIZE,
             chunk_max_size: consts::CHUNK_MAX_SIZE,
         }
+    }
+
+    /// Write one entry under `key`, skipping the encode step entirely
+    /// if `key` is already stored.
+    async fn save(&self, key: Digest, bytes: Vec<u8>, flags: Flags) -> io::Result<()> {
+        if self.storage.contains_blob(key.as_ref()).await? {
+            return Ok(());
+        }
+        let encoder = self.encoder;
+
+        // Encoding runs in its own `spawn_blocking`, independent of however
+        // the backend chooses to run `put_blob` itself: it's CPU-bound work
+        // that always needs to stay off the async executor, regardless of
+        // which backend `S` is.
+        let encoded = task::spawn_blocking(move || encoder.encode(flags, bytes))
+            .await
+            .expect("encode should not panic");
+        self.storage.put_blob(key.as_ref(), Bytes::from(encoded)).await
+    }
+
+    /// Fetch and decode one entry (a chunk or a manifest).
+    ///
+    /// Callers should check the digest themselves, since what it
+    /// should be verified against differs for a manifest's own entry vs.
+    /// one of the chunks it lists.
+    async fn load(&self, digest: &Digest) -> io::Result<Option<(Flags, Bytes)>> {
+        let Some(stored) = self.storage.get_blob(digest.as_ref()).await? else {
+            return Ok(None);
+        };
+        let decoder = self.decoder;
+        task::spawn_blocking(move || decoder.decode(stored).map(Some))
+            .await
+            .expect("decode should not panic")
     }
 
     /// Reads the content at `digest`, if present.
@@ -87,12 +246,11 @@ impl<S: Storage> Blobs<S> {
         digest: &Digest,
         w: &mut W,
     ) -> io::Result<bool> {
-        let decoder = entry::Decoder::new();
-        let Some((flags, decoded)) = decoder.load(&self.storage, digest).await? else {
+        let Some((flags, decoded)) = self.load(digest).await? else {
             return Ok(false);
         };
 
-        if !flags.contains(entry::Flags::MANIFEST) {
+        if !flags.contains(Flags::MANIFEST) {
             if digest_of(&decoded) != *digest {
                 return Err(invalid_data("direct content digest mismatch"));
             }
@@ -111,13 +269,13 @@ impl<S: Storage> Blobs<S> {
         }
 
         for entry in manifest {
-            let Some((chunk_flags, raw)) = decoder.load(&self.storage, &entry.digest).await? else {
+            let Some((chunk_flags, raw)) = self.load(&entry.digest).await? else {
                 return Err(invalid_data(format!(
                     "manifest references missing chunk {:x}",
                     entry.digest
                 )));
             };
-            if chunk_flags.contains(entry::Flags::MANIFEST) {
+            if chunk_flags.contains(Flags::MANIFEST) {
                 return Err(invalid_data(format!(
                     "chunk {:x} entry is itself a manifest",
                     entry.digest
@@ -160,7 +318,6 @@ impl<S: Storage> Blobs<S> {
             self.chunk_max_size,
         );
         let mut chunks = pin!(cdc.as_stream());
-        let encoder = entry::Encoder::new();
 
         // Only the most recent digest is needed to detect the zero/one/many
         // chunks cases below; the multi-chunk blob digest itself is folded
@@ -181,7 +338,7 @@ impl<S: Storage> Blobs<S> {
             manifest.put_u32(chunk.length as u32);
             chunk_digests.part(digest.as_ref());
             last_digest = Some(digest);
-            encoder.save(&self.storage, digest, chunk.data, entry::Flags::empty()).await?;
+            self.save(digest, chunk.data, Flags::empty()).await?;
         }
 
         if total != len {
@@ -207,7 +364,7 @@ impl<S: Storage> Blobs<S> {
             manifest.put_slice(digest.as_ref());
             manifest.put_u32(0);
             last_digest = Some(digest);
-            encoder.save(&self.storage, digest, Vec::new(), entry::Flags::empty()).await?;
+            self.save(digest, Vec::new(), Flags::empty()).await?;
         }
 
         // Each chunk (real or the synthetic empty one above) appends
@@ -225,7 +382,7 @@ impl<S: Storage> Blobs<S> {
             Ok(last_digest.expect("manifest.len() == 36 implies last_digest was set"))
         } else {
             let blob_digest = chunk_digests.digest();
-            encoder.save(&self.storage, blob_digest, manifest, entry::Flags::MANIFEST).await?;
+            self.save(blob_digest, manifest, Flags::MANIFEST).await?;
             Ok(blob_digest)
         }
     }
