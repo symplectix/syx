@@ -17,7 +17,6 @@ use crate::hash::{
 #[cfg(test)]
 mod tests;
 
-mod consts;
 mod storage;
 
 pub use storage::{

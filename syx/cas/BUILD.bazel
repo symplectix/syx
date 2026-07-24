@@ -4,7 +4,6 @@ rust.library(
     name = "cas",
     srcs = [
         "src/blob.rs",
-        "src/blob/consts.rs",
         "src/blob/storage.rs",
         "src/blob/tests.rs",
         "src/hash.rs",

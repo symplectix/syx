@@ -23,7 +23,6 @@ use tokio::io::{
 use tokio::task;
 
 use super::{
-    consts,
     decode_manifest,
     digest_of,
     invalid_data,
@@ -47,128 +46,13 @@ bitflags! {
     }
 }
 
-/// The compression knobs from `consts`, as a value instead of
-/// globals. `Default` gives back exactly `consts`' values; tests
-/// build their own.
-#[derive(Clone, Copy)]
-pub(super) struct Encoder {
-    compression_level: i32,
-    sniff_len:         usize,
-    sniff_max_ratio:   f64,
-}
-
-impl Default for Encoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Encoder {
-    pub(super) const fn new() -> Self {
-        Self {
-            compression_level: consts::COMPRESSION_LEVEL,
-            sniff_len:         consts::SNIFF_LEN,
-            sniff_max_ratio:   consts::SNIFF_MAX_RATIO,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(super) const fn compression_level(mut self, level: i32) -> Self {
-        self.compression_level = level;
-        self
-    }
-
-    #[allow(dead_code)]
-    pub(super) const fn sniff_len(mut self, len: usize) -> Self {
-        self.sniff_len = len;
-        self
-    }
-
-    #[allow(dead_code)]
-    pub(super) const fn sniff_max_ratio(mut self, ratio: f64) -> Self {
-        self.sniff_max_ratio = ratio;
-        self
-    }
-
-    /// Compress `bytes` with zstd if that's worthwhile, and append a
-    /// flag byte recording whether it was.
-    pub(super) fn encode(&self, mut flags: Flags, mut bytes: Vec<u8>) -> Vec<u8> {
-        let sample = &bytes[..bytes.len().min(self.sniff_len)];
-        if self.worth_compressing(sample) {
-            let mut compressed = zstd::bulk::compress(&bytes, self.compression_level)
-                .expect("zstd compression of an in-memory buffer should not fail");
-            flags |= Flags::COMPRESSED;
-            compressed.push(flags.bits());
-            return compressed;
-        }
-        bytes.push(flags.bits());
-        bytes
-    }
-
-    /// Whether compressing `sample` shrinks it enough to be worth
-    /// compressing the rest of the chunk it was taken from.
-    pub(super) fn worth_compressing(&self, sample: &[u8]) -> bool {
-        if sample.is_empty() {
-            return false;
-        }
-        let compressed_len =
-            zstd::bulk::compress(sample, self.compression_level).map_or(sample.len(), |c| c.len());
-        (compressed_len as f64) < (sample.len() as f64) * self.sniff_max_ratio
-    }
-}
-
-/// The read-side counterpart to `Encoder`.
-#[derive(Clone, Copy)]
-pub(super) struct Decoder {
-    // Unlike encoding, decoding needs no options for now.
-}
-
-impl Default for Decoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decoder {
-    pub(super) const fn new() -> Self {
-        Self {}
-    }
-
-    /// The inverse of `Encoder::encode`.
-    ///
-    /// The not-worth-compressing case is just a cheap sub-slice
-    /// of the already-allocated buffer.
-    pub(super) fn decode(&self, stored: Bytes) -> io::Result<(Flags, Bytes)> {
-        if stored.is_empty() {
-            return Err(invalid_data("stored content is missing its trailing flag byte"));
-        }
-        let mut bytes = stored.slice(..stored.len() - 1);
-        let mut flags = Flags::from_bits_retain(stored[stored.len() - 1]);
-        if flags.contains(Flags::COMPRESSED) {
-            // `bytes` is decompressed from here on -- the returned flags
-            // should describe it.
-            flags.remove(Flags::COMPRESSED);
-            bytes = Bytes::from(
-                zstd::decode_all(bytes.as_ref())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-            );
-        }
-        Ok((flags, bytes))
-    }
-}
-
 /// Chunking and encoding on the way in,
 /// decoding and verifying on the way out.
 pub struct Storage<T> {
-    backend: T,
-    encoder: Encoder,
-    decoder: Decoder,
-
-    // The chunk-size knobs. These aren't safe to change carelessly
-    // so there's no builder to override them per call.
-    chunk_min_size: usize,
-    chunk_avg_size: usize,
-    chunk_max_size: usize,
+    backend:  T,
+    chunking: Chunking,
+    encoding: Encoding,
+    decoding: Decoding,
 }
 
 /// Moves already-encoded bytes in and out by a key the caller supplies.
@@ -201,16 +85,13 @@ impl<T: Backend> Backend for &T {
 }
 
 impl<T: Backend> Storage<T> {
-    /// Wraps `backend`, with `Encoder`/`Decoder` and the chunk-size
-    /// knobs set to their `consts` defaults.
+    /// Wraps `backend`.
     pub const fn new(backend: T) -> Self {
         Self {
             backend,
-            encoder: Encoder::new(),
-            decoder: Decoder::new(),
-            chunk_min_size: consts::CHUNK_MIN_SIZE,
-            chunk_avg_size: consts::CHUNK_AVG_SIZE,
-            chunk_max_size: consts::CHUNK_MAX_SIZE,
+            encoding: Encoding::new(),
+            decoding: Decoding::new(),
+            chunking: Chunking::new(),
         }
     }
 
@@ -220,7 +101,7 @@ impl<T: Backend> Storage<T> {
         if self.backend.contains_blob(key.as_ref()).await? {
             return Ok(());
         }
-        let encoder = self.encoder;
+        let encoder = self.encoding;
 
         // Encoding runs in its own `spawn_blocking`, independent of however
         // the backend chooses to run `put_blob` itself: it's CPU-bound work
@@ -241,7 +122,7 @@ impl<T: Backend> Storage<T> {
         let Some(stored) = self.backend.get_blob(digest.as_ref()).await? else {
             return Ok(None);
         };
-        let decoder = self.decoder;
+        let decoder = self.decoding;
         task::spawn_blocking(move || decoder.decode(stored).map(Some))
             .await
             .expect("decode should not panic")
@@ -343,9 +224,9 @@ impl<T: Backend> Storage<T> {
         let source = r.take(len);
         let mut cdc = v2020::AsyncStreamCDC::new(
             source,
-            self.chunk_min_size,
-            self.chunk_avg_size,
-            self.chunk_max_size,
+            self.chunking.min_size,
+            self.chunking.avg_size,
+            self.chunking.max_size,
         );
         let mut chunks = pin!(cdc.as_stream());
 
@@ -415,5 +296,213 @@ impl<T: Backend> Storage<T> {
             self.save(blob_digest, manifest, Flags::MANIFEST).await?;
             Ok(blob_digest)
         }
+    }
+}
+
+mod defaults {
+    //! Default tuning values for chunking and compression.
+    //!
+    //! # Compression: `COMPRESSION_LEVEL`, `SNIFF_LEN`, `SNIFF_MAX_RATIO`
+    //!
+    //! Safe to change at any time. Each is a pure write-time heuristic:
+    //! every stored chunk records its own compressed-or-not decision,
+    //! so changing these only affects future writes, never how existing
+    //! ones are read back.
+    //!
+    //! `SNIFF_LEN`/`SNIFF_MAX_RATIO` trade CPU against storage savings:
+    //! stricter (a lower `SNIFF_MAX_RATIO`) only bothers compressing
+    //! chunks with a clearly worthwhile payoff, saving CPU but leaving
+    //! some real (if modest) compression on the table; looser values
+    //! capture more of those marginal savings but spend more CPU chasing
+    //! chunks that barely shrink.
+    //!
+    //! # Chunking: `CHUNK_MIN_SIZE`, `CHUNK_AVG_SIZE`, `CHUNK_MAX_SIZE`
+    //!
+    //! NOT safe to change without consequence -- see `Chunking` for why.
+    //! min/avg set the dedup-vs-compression tradeoff: smaller chunks
+    //! dedup more precisely (a small change in content only invalidates
+    //! a small chunk) but compress worse (less context per chunk for
+    //! zstd to find matches in, plus more per-chunk framing overhead);
+    //! larger chunks compress better but dedup more coarsely (one
+    //! changed byte invalidates the whole chunk it falls in).
+
+    /// One step above zstd's own default level (3), trading a bit more
+    /// CPU for a bit better ratio. Worth it here because `SNIFF_MAX_RATIO`
+    /// already filters out content that isn't worth compressing in the
+    /// first place, so every chunk that reaches this point already has
+    /// a real payoff to chase.
+    pub(crate) const COMPRESSION_LEVEL: i32 = 4;
+
+    /// How many bytes of a chunk to sample before deciding whether
+    /// it's worth compressing.
+    pub(crate) const SNIFF_LEN: usize = 16 * 1024;
+
+    /// Skip compression if the sniffed sample doesn't shrink to less
+    /// than this fraction of its own size. Already-compressed content
+    /// typically doesn't shrink further, so this avoids paying to
+    /// compress the rest of it for nothing.
+    pub(crate) const SNIFF_MAX_RATIO: f64 = 0.95;
+
+    pub(crate) const CHUNK_MIN_SIZE: usize = SNIFF_LEN * 4;
+    pub(crate) const CHUNK_AVG_SIZE: usize = CHUNK_MIN_SIZE * 8;
+    pub(crate) const CHUNK_MAX_SIZE: usize = CHUNK_AVG_SIZE * 4;
+
+    const _: () = assert!(
+        SNIFF_LEN < CHUNK_MIN_SIZE,
+        "SNIFF_LEN must stay smaller than `CHUNK_MIN_SIZE`: \
+        otherwise every regular chunk would have its whole content \"sampled\" \
+        -- compressed once to decide, then compressed again from scratch."
+    );
+
+    const _: () = assert!(
+        CHUNK_MAX_SIZE <= 4 * 1024 * 1024,
+        "CHUNK_MAX_SIZE has a hard ceiling to respect: \
+        gRPC's default max message size is 4MB, and a chunk is expected to \
+        map to one message on the wire, so this should stay comfortably under that. \
+        Not just below 4MB, leave room for message framing overhead too.",
+    );
+}
+
+/// The chunk-size knobs from `defaults`, as a value instead of globals.
+///
+/// Unlike `Encoding`'s knobs, these aren't safe to change carelessly,
+/// so there's no builder to override them per call. Chunk boundaries
+/// depend on these parameters, so changing them shifts where cuts
+/// fall: even byte-identical content gets split into different chunks
+/// than before, with different digests. Existing chunks and manifests
+/// stay perfectly readable (a chunk's key is just the hash of its own
+/// bytes, independent of how it was cut), but new writes no longer
+/// dedup against what's already stored under the old parameters --
+/// only future writes, among themselves, do.
+#[derive(Clone, Copy)]
+pub(super) struct Chunking {
+    min_size: usize,
+    avg_size: usize,
+    max_size: usize,
+}
+
+impl Default for Chunking {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Chunking {
+    pub(super) const fn new() -> Self {
+        Self {
+            min_size: defaults::CHUNK_MIN_SIZE,
+            avg_size: defaults::CHUNK_AVG_SIZE,
+            max_size: defaults::CHUNK_MAX_SIZE,
+        }
+    }
+}
+
+/// The compression knobs from `defaults`, as a value instead of
+/// globals. `Default` gives back exactly `defaults`' values; tests
+/// build their own.
+#[derive(Clone, Copy)]
+pub(super) struct Encoding {
+    compression_level: i32,
+    sniff_len:         usize,
+    sniff_max_ratio:   f64,
+}
+
+impl Default for Encoding {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Encoding {
+    pub(super) const fn new() -> Self {
+        Self {
+            compression_level: defaults::COMPRESSION_LEVEL,
+            sniff_len:         defaults::SNIFF_LEN,
+            sniff_max_ratio:   defaults::SNIFF_MAX_RATIO,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(super) const fn compression_level(mut self, level: i32) -> Self {
+        self.compression_level = level;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(super) const fn sniff_len(mut self, len: usize) -> Self {
+        self.sniff_len = len;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(super) const fn sniff_max_ratio(mut self, ratio: f64) -> Self {
+        self.sniff_max_ratio = ratio;
+        self
+    }
+
+    /// Compress `bytes` with zstd if that's worthwhile, and append a
+    /// flag byte recording whether it was.
+    pub(super) fn encode(&self, mut flags: Flags, mut bytes: Vec<u8>) -> Vec<u8> {
+        let sample = &bytes[..bytes.len().min(self.sniff_len)];
+        if self.worth_compressing(sample) {
+            let mut compressed = zstd::bulk::compress(&bytes, self.compression_level)
+                .expect("zstd compression of an in-memory buffer should not fail");
+            flags |= Flags::COMPRESSED;
+            compressed.push(flags.bits());
+            return compressed;
+        }
+        bytes.push(flags.bits());
+        bytes
+    }
+
+    /// Whether compressing `sample` shrinks it enough to be worth
+    /// compressing the rest of the chunk it was taken from.
+    pub(super) fn worth_compressing(&self, sample: &[u8]) -> bool {
+        if sample.is_empty() {
+            return false;
+        }
+        let compressed_len =
+            zstd::bulk::compress(sample, self.compression_level).map_or(sample.len(), |c| c.len());
+        (compressed_len as f64) < (sample.len() as f64) * self.sniff_max_ratio
+    }
+}
+
+/// The read-side counterpart to `Encoder`.
+#[derive(Clone, Copy)]
+pub(super) struct Decoding {
+    // Unlike encoding, decoding needs no options for now.
+}
+
+impl Default for Decoding {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decoding {
+    pub(super) const fn new() -> Self {
+        Self {}
+    }
+
+    /// The inverse of `Encoder::encode`.
+    ///
+    /// The not-worth-compressing case is just a cheap sub-slice
+    /// of the already-allocated buffer.
+    pub(super) fn decode(&self, stored: Bytes) -> io::Result<(Flags, Bytes)> {
+        if stored.is_empty() {
+            return Err(invalid_data("stored content is missing its trailing flag byte"));
+        }
+        let mut bytes = stored.slice(..stored.len() - 1);
+        let mut flags = Flags::from_bits_retain(stored[stored.len() - 1]);
+        if flags.contains(Flags::COMPRESSED) {
+            // `bytes` is decompressed from here on -- the returned flags
+            // should describe it.
+            flags.remove(Flags::COMPRESSED);
+            bytes = Bytes::from(
+                zstd::decode_all(bytes.as_ref())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            );
+        }
+        Ok((flags, bytes))
     }
 }

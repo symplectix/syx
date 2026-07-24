@@ -135,38 +135,38 @@ impl CountEntries for TmpBackend {
 }
 
 fn encode(flags: storage::Flags, raw: Vec<u8>) -> Vec<u8> {
-    storage::Encoder::new().encode(flags, raw)
+    storage::Encoding::new().encode(flags, raw)
 }
 
 #[test]
 fn worth_compressing_is_true_for_repetitive_content() {
-    assert!(storage::Encoder::new().worth_compressing(&[b'a'; 4096]));
+    assert!(storage::Encoding::new().worth_compressing(&[b'a'; 4096]));
 }
 
 #[test]
 fn worth_compressing_is_false_for_random_content() {
-    assert!(!storage::Encoder::new().worth_compressing(&testing::random_bytes(4096)));
+    assert!(!storage::Encoding::new().worth_compressing(&testing::random_bytes(4096)));
 }
 
 #[test]
 fn worth_compressing_is_false_for_empty_content() {
-    assert!(!storage::Encoder::new().worth_compressing(&[]));
+    assert!(!storage::Encoding::new().worth_compressing(&[]));
 }
 
 #[test]
 fn an_overridden_sniff_max_ratio_leaves_the_rest_at_their_defaults() {
     let sample = testing::random_bytes(4096);
-    assert!(!storage::Encoder::new().worth_compressing(&sample));
+    assert!(!storage::Encoding::new().worth_compressing(&sample));
     // >1.0: zstd's frame overhead makes `compressed_len` a little
     // *larger* than random data's own length, not just equal to it.
-    assert!(storage::Encoder::new().sniff_max_ratio(2.0).worth_compressing(&sample));
+    assert!(storage::Encoding::new().sniff_max_ratio(2.0).worth_compressing(&sample));
 }
 
 #[test]
 fn encode_entry_round_trips_through_decode_entry() {
     for raw in [b"a".repeat(4096), testing::random_bytes(4096)] {
         let stored = encode(storage::Flags::empty(), raw.clone());
-        let (flags, decoded) = storage::Decoder::new().decode(Bytes::from(stored)).unwrap();
+        let (flags, decoded) = storage::Decoding::new().decode(Bytes::from(stored)).unwrap();
         assert!(!flags.contains(storage::Flags::MANIFEST));
         // `decoded` is always plain bytes regardless of whether it
         // was compressed on disk, so the returned flags shouldn't
@@ -199,7 +199,7 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
     // Long enough, and shared for long enough, that content-defined
     // chunking is guaranteed to produce at least one identical cut
     // chunk in both blobs before they diverge.
-    let shared = testing::random_bytes(consts::CHUNK_MAX_SIZE * 2);
+    let shared = testing::random_bytes(storage::defaults::CHUNK_MAX_SIZE * 2);
     let blob_a = {
         let mut blob_a = shared.clone();
         blob_a.extend_from_slice(b"-a-suffix");
@@ -269,7 +269,7 @@ async fn get_returns_invalid_data_for_a_tampered_chunk() {
     // Needs a real (non-manifest) key to target, so this one stays
     // `MemBackend`-only rather than being generalized over `Backend`.
     let storage = MemBackend::default();
-    let content = testing::random_bytes(consts::CHUNK_MAX_SIZE * 2);
+    let content = testing::random_bytes(storage::defaults::CHUNK_MAX_SIZE * 2);
     let d = put(&storage, &Bytes::from(content)).await.unwrap();
 
     let chunk_key = storage.any_key_except(d.as_ref());
@@ -302,7 +302,7 @@ async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
     // Needs a real (non-manifest) key to target, so this one stays
     // `MemBackend`-only rather than being generalized over `Backend`.
     let storage = MemBackend::default();
-    let content = testing::random_bytes(consts::CHUNK_MAX_SIZE * 2);
+    let content = testing::random_bytes(storage::defaults::CHUNK_MAX_SIZE * 2);
     let d = put(&storage, &Bytes::from(content)).await.unwrap();
 
     let chunk_key = storage.any_key_except(d.as_ref());
@@ -317,7 +317,7 @@ async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
 #[tokio::test]
 async fn get_returns_invalid_data_for_a_tampered_manifest() {
     async fn check(storage: impl Backend) {
-        let content = testing::random_bytes(consts::CHUNK_MAX_SIZE * 2);
+        let content = testing::random_bytes(storage::defaults::CHUNK_MAX_SIZE * 2);
         let d = put(&storage, &Bytes::from(content)).await.unwrap();
 
         let tampered = encode(storage::Flags::MANIFEST, b"not a valid manifest body".to_vec());
