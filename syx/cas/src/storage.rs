@@ -1,9 +1,4 @@
-//! Operations over blobs, bound to one `Backend` -- chunking and
-//! encoding on the way in, decoding and verifying on the way out.
-//! `backend` is bound once here instead of being threaded through
-//! every call, since `get`/`put`/`read_into`/`copy_from` all need it.
-//! The free functions in `super` construct one of these per call; this
-//! type itself stays private to `blob`.
+//! Operations over blobs, bound to one `Backend`.
 use std::io;
 use std::pin::pin;
 
