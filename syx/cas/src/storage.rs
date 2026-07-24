@@ -7,6 +7,7 @@
 use std::io;
 use std::pin::pin;
 
+use bitflags::bitflags;
 use bytes::{
     Buf,
     BufMut,
@@ -22,13 +23,28 @@ use tokio::io::{
 };
 use tokio::task;
 
-use super::Flags;
 use crate::hash::{
     Digest,
     FromBytes,
     Hasher,
     ToBytes,
 };
+
+#[cfg(test)]
+#[path = "storage_test.rs"]
+mod tests;
+
+bitflags! {
+    /// The trailing byte of every entry's stored payload.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Flags: u8 {
+        /// The payload that follows is compressed by zstd.
+        const COMPRESSED = 1 << 0;
+        /// The payload is a manifest (an ordered list of ChunkRef),
+        /// not content itself.
+        const MANIFEST = 1 << 1;
+    }
+}
 
 /// Chunking and encoding on the way in,
 /// decoding and verifying on the way out.

@@ -2,6 +2,7 @@
 
 mod blob;
 mod hash;
+mod storage;
 
 pub use blob::{
     Backend,

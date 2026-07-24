@@ -1,7 +1,10 @@
 //! A content-addressed blob store.
 use std::io;
 
-use bitflags::bitflags;
+pub use storage::{
+    Backend,
+    Storage,
+};
 use tokio::io::{
     AsyncRead,
     AsyncWrite,
@@ -12,16 +15,7 @@ use crate::hash::{
     FromBytes,
     ToBytes,
 };
-
-#[cfg(test)]
-mod tests;
-
-mod storage;
-
-pub use storage::{
-    Backend,
-    Storage,
-};
+use crate::storage;
 
 /// Reads the content at `digest`, if present.
 pub async fn get<S, T>(backend: &S, digest: &Digest) -> io::Result<Option<T>>
@@ -62,16 +56,4 @@ where
     R: AsyncRead + Unpin,
 {
     Storage::new(backend).copy_from(len, r).await
-}
-
-bitflags! {
-    /// The trailing byte of every entry's stored payload.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct Flags: u8 {
-        /// The payload that follows is compressed by zstd.
-        const COMPRESSED = 1 << 0;
-        /// The payload is a manifest (an ordered list of ChunkRef),
-        /// not content itself.
-        const MANIFEST = 1 << 1;
-    }
 }

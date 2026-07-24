@@ -15,6 +15,11 @@ use tokio::{
 };
 
 use super::*;
+use crate::blob::{
+    get,
+    put,
+    read_into,
+};
 use crate::hash::Hasher;
 
 /// An in-memory `Backend`.
@@ -136,38 +141,38 @@ impl CountEntries for TmpBackend {
 }
 
 fn encode(flags: Flags, raw: Vec<u8>) -> Vec<u8> {
-    storage::Encoding::new().encode(flags, raw)
+    Encoding::new().encode(flags, raw)
 }
 
 #[test]
 fn worth_compressing_is_true_for_repetitive_content() {
-    assert!(storage::Encoding::new().worth_compressing(&[b'a'; 4096]));
+    assert!(Encoding::new().worth_compressing(&[b'a'; 4096]));
 }
 
 #[test]
 fn worth_compressing_is_false_for_random_content() {
-    assert!(!storage::Encoding::new().worth_compressing(&testing::random_bytes(4096)));
+    assert!(!Encoding::new().worth_compressing(&testing::random_bytes(4096)));
 }
 
 #[test]
 fn worth_compressing_is_false_for_empty_content() {
-    assert!(!storage::Encoding::new().worth_compressing(&[]));
+    assert!(!Encoding::new().worth_compressing(&[]));
 }
 
 #[test]
 fn an_overridden_sniff_max_ratio_leaves_the_rest_at_their_defaults() {
     let sample = testing::random_bytes(4096);
-    assert!(!storage::Encoding::new().worth_compressing(&sample));
+    assert!(!Encoding::new().worth_compressing(&sample));
     // >1.0: zstd's frame overhead makes `compressed_len` a little
     // *larger* than random data's own length, not just equal to it.
-    assert!(storage::Encoding::new().sniff_max_ratio(2.0).worth_compressing(&sample));
+    assert!(Encoding::new().sniff_max_ratio(2.0).worth_compressing(&sample));
 }
 
 #[test]
 fn encode_entry_round_trips_through_decode_entry() {
     for raw in [b"a".repeat(4096), testing::random_bytes(4096)] {
         let stored = encode(Flags::empty(), raw.clone());
-        let (flags, decoded) = storage::Decoding::new().decode(Bytes::from(stored)).unwrap();
+        let (flags, decoded) = Decoding::new().decode(Bytes::from(stored)).unwrap();
         assert!(!flags.contains(Flags::MANIFEST));
         // `decoded` is always plain bytes regardless of whether it
         // was compressed on disk, so the returned flags shouldn't
@@ -186,7 +191,7 @@ async fn a_single_chunks_digest_is_the_content_digest_not_a_wrapped_one() {
     // whichever `Backend` happens to be behind it.
     async fn check(storage: impl Backend) {
         let content = testing::random_bytes(4096); // well under CHUNK_MIN_SIZE
-        let content_digest = storage::digest_of(&content);
+        let content_digest = digest_of(&content);
         let d = put(&storage, &Bytes::from(content)).await.unwrap();
         assert_eq!(d, content_digest);
     }
@@ -200,7 +205,7 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
     // Long enough, and shared for long enough, that content-defined
     // chunking is guaranteed to produce at least one identical cut
     // chunk in both blobs before they diverge.
-    let shared = testing::random_bytes(storage::defaults::CHUNK_MAX_SIZE * 2);
+    let shared = testing::random_bytes(defaults::CHUNK_MAX_SIZE * 2);
     let blob_a = {
         let mut blob_a = shared.clone();
         blob_a.extend_from_slice(b"-a-suffix");
@@ -270,7 +275,7 @@ async fn get_returns_invalid_data_for_a_tampered_chunk() {
     // Needs a real (non-manifest) key to target, so this one stays
     // `MemBackend`-only rather than being generalized over `Backend`.
     let storage = MemBackend::default();
-    let content = testing::random_bytes(storage::defaults::CHUNK_MAX_SIZE * 2);
+    let content = testing::random_bytes(defaults::CHUNK_MAX_SIZE * 2);
     let d = put(&storage, &Bytes::from(content)).await.unwrap();
 
     let chunk_key = storage.any_key_except(d.as_ref());
@@ -303,7 +308,7 @@ async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
     // Needs a real (non-manifest) key to target, so this one stays
     // `MemBackend`-only rather than being generalized over `Backend`.
     let storage = MemBackend::default();
-    let content = testing::random_bytes(storage::defaults::CHUNK_MAX_SIZE * 2);
+    let content = testing::random_bytes(defaults::CHUNK_MAX_SIZE * 2);
     let d = put(&storage, &Bytes::from(content)).await.unwrap();
 
     let chunk_key = storage.any_key_except(d.as_ref());
@@ -318,7 +323,7 @@ async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
 #[tokio::test]
 async fn get_returns_invalid_data_for_a_tampered_manifest() {
     async fn check(storage: impl Backend) {
-        let content = testing::random_bytes(storage::defaults::CHUNK_MAX_SIZE * 2);
+        let content = testing::random_bytes(defaults::CHUNK_MAX_SIZE * 2);
         let d = put(&storage, &Bytes::from(content)).await.unwrap();
 
         let tampered = encode(Flags::MANIFEST, b"not a valid manifest body".to_vec());
@@ -335,7 +340,7 @@ async fn get_returns_invalid_data_for_a_tampered_manifest() {
 #[tokio::test]
 async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
     async fn check(storage: impl Backend) {
-        let (present_digest, present_raw) = (storage::digest_of(b"present"), b"present".to_vec());
+        let (present_digest, present_raw) = (digest_of(b"present"), b"present".to_vec());
         storage
             .put_blob(
                 present_digest.as_ref(),
@@ -343,7 +348,7 @@ async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
             )
             .await
             .unwrap();
-        let missing_digest = storage::digest_of(b"never written");
+        let missing_digest = digest_of(b"never written");
 
         let mut manifest = Vec::new();
         manifest.put_slice(present_digest.as_ref());
