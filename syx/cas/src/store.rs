@@ -28,205 +28,8 @@ use crate::hash::{
 #[path = "store_test.rs"]
 mod tests;
 
-mod consts {
-    //! Tuning knobs for chunking and compression, and the tradeoffs
-    //! behind them.
-    //!
-    //! # Compression: `COMPRESSION_LEVEL`, `SNIFF_LEN`, `SNIFF_MAX_RATIO`
-    //!
-    //! Safe to change at any time. Each is a pure write-time heuristic:
-    //! every stored chunk records its own compressed-or-not decision,
-    //! so changing these only affects future writes, never how existing
-    //! ones are read back.
-    //!
-    //! `SNIFF_LEN`/`SNIFF_MAX_RATIO` trade CPU against storage savings:
-    //! stricter (a lower `SNIFF_MAX_RATIO`) only bothers compressing
-    //! chunks with a clearly worthwhile payoff, saving CPU but leaving
-    //! some real (if modest) compression on the table; looser values
-    //! capture more of those marginal savings but spend more CPU chasing
-    //! chunks that barely shrink.
-    //!
-    //! # Chunking: `CHUNK_MIN_SIZE`, `CHUNK_AVG_SIZE`, `CHUNK_MAX_SIZE`
-    //!
-    //! NOT safe to change without consequence, unlike the compression
-    //! knobs above. Chunk boundaries depend on these parameters, so
-    //! changing them shifts where cuts fall: even byte-identical
-    //! content gets split into different chunks than before, with
-    //! different digests. Existing chunks and manifests stay perfectly
-    //! readable (a chunk's key is just the hash of its own bytes,
-    //! independent of how it was cut), but new writes no longer dedup
-    //! against what's already stored under the old parameters -- only
-    //! future writes, among themselves, do.
-    //!
-    //! min/avg set the dedup-vs-compression tradeoff: smaller chunks
-    //! dedup more precisely (a small change in content only
-    //! invalidates a small chunk) but compress worse (less context per
-    //! chunk for zstd to find matches in, plus more per-chunk framing
-    //! overhead); larger chunks compress better but dedup more
-    //! coarsely (one changed byte invalidates the whole chunk it falls
-    //! in).
-
-    /// One step above zstd's own default level (3), trading a bit more
-    /// CPU for a bit better ratio. Worth it here because `SNIFF_MAX_RATIO`
-    /// already filters out content that isn't worth compressing in the
-    /// first place, so every chunk that reaches this point already has
-    /// a real payoff to chase.
-    pub(super) const COMPRESSION_LEVEL: i32 = 4;
-
-    /// How many bytes of a chunk to sample before deciding whether
-    /// it's worth compressing.
-    pub(super) const SNIFF_LEN: usize = 16 * 1024;
-
-    /// Skip compression if the sniffed sample doesn't shrink to less
-    /// than this fraction of its own size. Already-compressed content
-    /// typically doesn't shrink further, so this avoids paying to
-    /// compress the rest of it for nothing.
-    pub(super) const SNIFF_MAX_RATIO: f64 = 0.95;
-
-    pub(super) const CHUNK_MIN_SIZE: usize = SNIFF_LEN * 4;
-    pub(super) const CHUNK_AVG_SIZE: usize = CHUNK_MIN_SIZE * 8;
-    pub(super) const CHUNK_MAX_SIZE: usize = CHUNK_AVG_SIZE * 4;
-
-    const _: () = assert!(
-        SNIFF_LEN < CHUNK_MIN_SIZE,
-        "SNIFF_LEN must stay smaller than `CHUNK_MIN_SIZE`: \
-        otherwise every regular chunk would have its whole content \"sampled\" \
-        -- compressed once to decide, then compressed again from scratch."
-    );
-
-    const _: () = assert!(
-        CHUNK_MAX_SIZE <= 4 * 1024 * 1024,
-        "CHUNK_MAX_SIZE has a hard ceiling to respect: \
-        gRPC's default max message size is 4MB, and a chunk is expected to \
-        map to one message on the wire, so this should stay comfortably under that. \
-        Not just below 4MB, leave room for message framing overhead too.",
-    );
-}
-
-mod entry {
-    //! Storing and fetching one entry -- a chunk or a manifest -- as
-    //! opaque, possibly-compressed bytes behind a `Storage`. What the
-    //! bytes actually mean (chunking, manifest structure, digest
-    //! verification) lives one layer up, in `super`.
-    use std::io;
-
-    use bitflags::bitflags;
-    use bytes::Bytes;
-    use tokio::task;
-
-    use super::{
-        Storage,
-        consts,
-        invalid_data,
-    };
-    use crate::hash::Digest;
-
-    bitflags! {
-        /// The trailing byte of every entry's stored payload.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub(super) struct Flags: u8 {
-            /// The payload that follows is compressed by zstd.
-            const COMPRESSED = 1 << 0;
-            /// The payload is a manifest (an ordered list of ChunkRef),
-            /// not content itself.
-            const MANIFEST = 1 << 1;
-        }
-    }
-
-    /// Write one entry under `key`, skipping the encode step entirely
-    /// if `key` is already stored.
-    pub(super) async fn save<S: Storage>(
-        storage: &S,
-        key: Digest,
-        raw: Vec<u8>,
-        flags: Flags,
-    ) -> io::Result<()> {
-        if storage.contains_blob(key.as_ref()).await? {
-            return Ok(());
-        }
-        // Encoding runs in its own `spawn_blocking`, independent of however
-        // the backend chooses to run `put_blob` itself: it's CPU-bound work
-        // that always needs to stay off the async executor, regardless of
-        // which backend `S` is.
-        let encoded = task::spawn_blocking(move || encode(flags, raw))
-            .await
-            .expect("encode should not panic");
-        storage.put_blob(key.as_ref(), Bytes::from(encoded)).await
-    }
-
-    /// Fetch and decode one entry (a chunk or a manifest), without
-    /// verifying it -- callers check the digest themselves, since what it
-    /// should be verified against differs for a manifest's own entry vs.
-    /// one of the chunks it lists.
-    pub(super) async fn load<S: Storage>(
-        storage: &S,
-        digest: Digest,
-    ) -> io::Result<Option<(Flags, Bytes)>> {
-        let Some(stored) = storage.get_blob(digest.as_ref()).await? else {
-            return Ok(None);
-        };
-        task::spawn_blocking(move || decode(stored).map(Some))
-            .await
-            .expect("decode should not panic")
-    }
-
-    /// Compress `raw` with zstd if that's worthwhile, and append a flag
-    /// byte recording whether it was.
-    ///
-    /// Appending (not prepending) lets both branches grow an
-    /// already-owned buffer in place -- `raw` itself in the
-    /// not-worth-compressing case, or zstd's own output buffer (which
-    /// `compress` already over-allocates via `compress_bound`) in the
-    /// compressed case -- instead of allocating a fresh buffer just to
-    /// make room for one more byte.
-    pub(super) fn encode(mut flags: Flags, mut raw: Vec<u8>) -> Vec<u8> {
-        if worth_compressing(&raw[..raw.len().min(consts::SNIFF_LEN)]) {
-            let mut compressed = zstd::bulk::compress(&raw, consts::COMPRESSION_LEVEL)
-                .expect("zstd compression of an in-memory buffer should not fail");
-            flags |= Flags::COMPRESSED;
-            compressed.push(flags.bits());
-            return compressed;
-        }
-        raw.push(flags.bits());
-        raw
-    }
-
-    /// The inverse of `encode`.
-    ///
-    /// Takes and returns `Bytes` rather than `Vec<u8>`/`&[u8]`: the
-    /// not-worth-compressing case is then just a cheap, zero-copy
-    /// sub-slice of the already-owned `stored` buffer (`Bytes::slice`
-    /// shares the same backing allocation), instead of an unconditional
-    /// full copy into a fresh `Vec`.
-    pub(super) fn decode(stored: Bytes) -> io::Result<(Flags, Bytes)> {
-        if stored.is_empty() {
-            return Err(invalid_data("stored content is missing its trailing flag byte"));
-        }
-        let mut bytes = stored.slice(..stored.len() - 1);
-        let mut flags = Flags::from_bits_retain(stored[stored.len() - 1]);
-        if flags.contains(Flags::COMPRESSED) {
-            // `raw` is decompressed from here on -- the returned flags
-            // should describe it, not the on-disk encoding it came from.
-            flags.remove(Flags::COMPRESSED);
-            bytes = Bytes::from(
-                zstd::decode_all(bytes.as_ref())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-            );
-        }
-        Ok((flags, bytes))
-    }
-
-    /// Whether compressing `sample` shrinks it enough to be
-    /// worth compressing the rest of the chunk it was taken from.
-    pub(super) fn worth_compressing(sample: &[u8]) -> bool {
-        if sample.is_empty() {
-            return false;
-        }
-        let compressed_len = zstd::bulk::compress(sample, consts::COMPRESSION_LEVEL)
-            .map_or(sample.len(), |c| c.len());
-        (compressed_len as f64) < (sample.len() as f64) * consts::SNIFF_MAX_RATIO
-    }
-}
+mod consts;
+mod entry;
 
 /// The backend-specific half: moves already-encoded bytes in and out
 /// by a key the caller supplies. Chunking, manifest encoding/decoding,
@@ -289,7 +92,8 @@ where
     S: Storage,
     W: AsyncWrite + Unpin,
 {
-    let Some((flags, decoded)) = entry::load(storage, *digest).await? else {
+    let decoder = entry::Decoder;
+    let Some((flags, decoded)) = decoder.load(storage, *digest).await? else {
         return Ok(false);
     };
 
@@ -312,7 +116,7 @@ where
     }
 
     for entry in manifest {
-        let Some((chunk_flags, raw)) = entry::load(storage, entry.digest).await? else {
+        let Some((chunk_flags, raw)) = decoder.load(storage, entry.digest).await? else {
             return Err(invalid_data(format!(
                 "manifest references missing chunk {:x}",
                 entry.digest
@@ -358,6 +162,7 @@ where
         consts::CHUNK_MAX_SIZE,
     );
     let mut chunks = pin!(cdc.as_stream());
+    let encoder = entry::Encoder::default();
 
     // Only the most recent digest is needed to detect the zero/one/many
     // chunks cases below; the multi-chunk blob digest itself is folded
@@ -378,7 +183,7 @@ where
         manifest.put_u32(chunk.length as u32);
         chunk_digests.part(digest.as_ref());
         last_digest = Some(digest);
-        entry::save(storage, digest, chunk.data, entry::Flags::empty()).await?;
+        encoder.save(storage, digest, chunk.data, entry::Flags::empty()).await?;
     }
 
     if total != len {
@@ -404,7 +209,7 @@ where
         manifest.put_slice(digest.as_ref());
         manifest.put_u32(0);
         last_digest = Some(digest);
-        entry::save(storage, digest, Vec::new(), entry::Flags::empty()).await?;
+        encoder.save(storage, digest, Vec::new(), entry::Flags::empty()).await?;
     }
 
     // Each chunk (real or the synthetic empty one above) appends
@@ -422,7 +227,7 @@ where
         Ok(last_digest.expect("manifest.len() == 36 implies last_digest was set"))
     } else {
         let blob_digest = chunk_digests.digest();
-        entry::save(storage, blob_digest, manifest, entry::Flags::MANIFEST).await?;
+        encoder.save(storage, blob_digest, manifest, entry::Flags::MANIFEST).await?;
         Ok(blob_digest)
     }
 }

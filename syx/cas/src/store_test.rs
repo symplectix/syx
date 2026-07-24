@@ -137,26 +137,39 @@ fn incompressible_bytes(len: usize) -> Vec<u8> {
     out
 }
 
+fn encode(flags: entry::Flags, raw: Vec<u8>) -> Vec<u8> {
+    entry::Encoder::default().encode(flags, raw)
+}
+
 #[test]
 fn worth_compressing_is_true_for_repetitive_content() {
-    assert!(entry::worth_compressing(&[b'a'; 4096]));
+    assert!(entry::Encoder::default().worth_compressing(&[b'a'; 4096]));
 }
 
 #[test]
 fn worth_compressing_is_false_for_random_content() {
-    assert!(!entry::worth_compressing(&incompressible_bytes(4096)));
+    assert!(!entry::Encoder::default().worth_compressing(&incompressible_bytes(4096)));
 }
 
 #[test]
 fn worth_compressing_is_false_for_empty_content() {
-    assert!(!entry::worth_compressing(&[]));
+    assert!(!entry::Encoder::default().worth_compressing(&[]));
+}
+
+#[test]
+fn an_overridden_sniff_max_ratio_leaves_the_rest_at_their_defaults() {
+    let sample = incompressible_bytes(4096);
+    assert!(!entry::Encoder::default().worth_compressing(&sample));
+    // >1.0: zstd's frame overhead makes `compressed_len` a little
+    // *larger* than random data's own length, not just equal to it.
+    assert!(entry::Encoder::default().sniff_max_ratio(2.0).worth_compressing(&sample));
 }
 
 #[test]
 fn encode_entry_round_trips_through_decode_entry() {
     for raw in [b"a".repeat(4096), incompressible_bytes(4096)] {
-        let stored = entry::encode(entry::Flags::empty(), raw.clone());
-        let (flags, decoded) = entry::decode(Bytes::from(stored)).unwrap();
+        let stored = encode(entry::Flags::empty(), raw.clone());
+        let (flags, decoded) = entry::Decoder.decode(Bytes::from(stored)).unwrap();
         assert!(!flags.contains(entry::Flags::MANIFEST));
         // `decoded` is always plain bytes regardless of whether it
         // was compressed on disk, so the returned flags shouldn't
@@ -243,7 +256,7 @@ async fn get_returns_invalid_data_for_tampered_content() {
 
         // Overwrite the stored bytes with content that doesn't hash
         // back to `d`, simulating corruption.
-        let tampered = entry::encode(entry::Flags::empty(), b"not hello".to_vec());
+        let tampered = encode(entry::Flags::empty(), b"not hello".to_vec());
         storage.put_blob(d.as_ref(), Bytes::from(tampered)).await.unwrap();
 
         let err = get::<_, Bytes>(&storage, &d).await.unwrap_err();
@@ -263,7 +276,7 @@ async fn get_returns_invalid_data_for_a_tampered_chunk() {
     let d = put(&storage, &Bytes::from(content)).await.unwrap();
 
     let chunk_key = storage.any_key_except(d.as_ref());
-    let tampered = entry::encode(entry::Flags::empty(), b"tampered chunk content".to_vec());
+    let tampered = encode(entry::Flags::empty(), b"tampered chunk content".to_vec());
     storage.put_blob(&chunk_key, Bytes::from(tampered)).await.unwrap();
 
     let err = get::<_, Bytes>(&storage, &d).await.unwrap_err();
@@ -275,7 +288,7 @@ async fn read_into_returns_invalid_data_for_tampered_content() {
     async fn check(storage: impl Storage) {
         let d = put(&storage, &Bytes::from_static(b"hello")).await.unwrap();
 
-        let tampered = entry::encode(entry::Flags::empty(), b"not hello".to_vec());
+        let tampered = encode(entry::Flags::empty(), b"not hello".to_vec());
         storage.put_blob(d.as_ref(), Bytes::from(tampered)).await.unwrap();
 
         let mut out = Vec::new();
@@ -296,7 +309,7 @@ async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
     let d = put(&storage, &Bytes::from(content)).await.unwrap();
 
     let chunk_key = storage.any_key_except(d.as_ref());
-    let tampered = entry::encode(entry::Flags::empty(), b"tampered chunk content".to_vec());
+    let tampered = encode(entry::Flags::empty(), b"tampered chunk content".to_vec());
     storage.put_blob(&chunk_key, Bytes::from(tampered)).await.unwrap();
 
     let mut out = Vec::new();
@@ -310,7 +323,7 @@ async fn get_returns_invalid_data_for_a_tampered_manifest() {
         let content = incompressible_bytes(consts::CHUNK_MAX_SIZE * 2);
         let d = put(&storage, &Bytes::from(content)).await.unwrap();
 
-        let tampered = entry::encode(entry::Flags::MANIFEST, b"not a valid manifest body".to_vec());
+        let tampered = encode(entry::Flags::MANIFEST, b"not a valid manifest body".to_vec());
         storage.put_blob(d.as_ref(), Bytes::from(tampered)).await.unwrap();
 
         let err = get::<_, Bytes>(&storage, &d).await.unwrap_err();
@@ -328,7 +341,7 @@ async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
         storage
             .put_blob(
                 present_digest.as_ref(),
-                Bytes::from(entry::encode(entry::Flags::empty(), present_raw.clone())),
+                Bytes::from(encode(entry::Flags::empty(), present_raw.clone())),
             )
             .await
             .unwrap();
@@ -346,10 +359,7 @@ async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
             h.digest()
         };
         storage
-            .put_blob(
-                blob_digest.as_ref(),
-                Bytes::from(entry::encode(entry::Flags::MANIFEST, manifest)),
-            )
+            .put_blob(blob_digest.as_ref(), Bytes::from(encode(entry::Flags::MANIFEST, manifest)))
             .await
             .unwrap();
 
