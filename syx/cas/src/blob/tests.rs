@@ -15,6 +15,7 @@ use tokio::{
 };
 
 use super::*;
+use crate::hash::Hasher;
 
 /// An in-memory `Backend`.
 #[derive(Clone, Default)]
@@ -134,7 +135,7 @@ impl CountEntries for TmpBackend {
     }
 }
 
-fn encode(flags: storage::Flags, raw: Vec<u8>) -> Vec<u8> {
+fn encode(flags: Flags, raw: Vec<u8>) -> Vec<u8> {
     storage::Encoding::new().encode(flags, raw)
 }
 
@@ -165,13 +166,13 @@ fn an_overridden_sniff_max_ratio_leaves_the_rest_at_their_defaults() {
 #[test]
 fn encode_entry_round_trips_through_decode_entry() {
     for raw in [b"a".repeat(4096), testing::random_bytes(4096)] {
-        let stored = encode(storage::Flags::empty(), raw.clone());
+        let stored = encode(Flags::empty(), raw.clone());
         let (flags, decoded) = storage::Decoding::new().decode(Bytes::from(stored)).unwrap();
-        assert!(!flags.contains(storage::Flags::MANIFEST));
+        assert!(!flags.contains(Flags::MANIFEST));
         // `decoded` is always plain bytes regardless of whether it
         // was compressed on disk, so the returned flags shouldn't
         // claim it's still compressed.
-        assert!(!flags.contains(storage::Flags::COMPRESSED));
+        assert!(!flags.contains(Flags::COMPRESSED));
         assert_eq!(decoded, raw);
     }
 }
@@ -185,7 +186,7 @@ async fn a_single_chunks_digest_is_the_content_digest_not_a_wrapped_one() {
     // whichever `Backend` happens to be behind it.
     async fn check(storage: impl Backend) {
         let content = testing::random_bytes(4096); // well under CHUNK_MIN_SIZE
-        let content_digest = digest_of(&content);
+        let content_digest = storage::digest_of(&content);
         let d = put(&storage, &Bytes::from(content)).await.unwrap();
         assert_eq!(d, content_digest);
     }
@@ -253,7 +254,7 @@ async fn get_returns_invalid_data_for_tampered_content() {
 
         // Overwrite the stored bytes with content that doesn't hash
         // back to `d`, simulating corruption.
-        let tampered = encode(storage::Flags::empty(), b"not hello".to_vec());
+        let tampered = encode(Flags::empty(), b"not hello".to_vec());
         storage.put_blob(d.as_ref(), Bytes::from(tampered)).await.unwrap();
 
         let err = get::<_, Bytes>(&storage, &d).await.unwrap_err();
@@ -273,7 +274,7 @@ async fn get_returns_invalid_data_for_a_tampered_chunk() {
     let d = put(&storage, &Bytes::from(content)).await.unwrap();
 
     let chunk_key = storage.any_key_except(d.as_ref());
-    let tampered = encode(storage::Flags::empty(), b"tampered chunk content".to_vec());
+    let tampered = encode(Flags::empty(), b"tampered chunk content".to_vec());
     storage.put_blob(&chunk_key, Bytes::from(tampered)).await.unwrap();
 
     let err = get::<_, Bytes>(&storage, &d).await.unwrap_err();
@@ -285,7 +286,7 @@ async fn read_into_returns_invalid_data_for_tampered_content() {
     async fn check(storage: impl Backend) {
         let d = put(&storage, &Bytes::from_static(b"hello")).await.unwrap();
 
-        let tampered = encode(storage::Flags::empty(), b"not hello".to_vec());
+        let tampered = encode(Flags::empty(), b"not hello".to_vec());
         storage.put_blob(d.as_ref(), Bytes::from(tampered)).await.unwrap();
 
         let mut out = Vec::new();
@@ -306,7 +307,7 @@ async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
     let d = put(&storage, &Bytes::from(content)).await.unwrap();
 
     let chunk_key = storage.any_key_except(d.as_ref());
-    let tampered = encode(storage::Flags::empty(), b"tampered chunk content".to_vec());
+    let tampered = encode(Flags::empty(), b"tampered chunk content".to_vec());
     storage.put_blob(&chunk_key, Bytes::from(tampered)).await.unwrap();
 
     let mut out = Vec::new();
@@ -320,7 +321,7 @@ async fn get_returns_invalid_data_for_a_tampered_manifest() {
         let content = testing::random_bytes(storage::defaults::CHUNK_MAX_SIZE * 2);
         let d = put(&storage, &Bytes::from(content)).await.unwrap();
 
-        let tampered = encode(storage::Flags::MANIFEST, b"not a valid manifest body".to_vec());
+        let tampered = encode(Flags::MANIFEST, b"not a valid manifest body".to_vec());
         storage.put_blob(d.as_ref(), Bytes::from(tampered)).await.unwrap();
 
         let err = get::<_, Bytes>(&storage, &d).await.unwrap_err();
@@ -334,15 +335,15 @@ async fn get_returns_invalid_data_for_a_tampered_manifest() {
 #[tokio::test]
 async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
     async fn check(storage: impl Backend) {
-        let (present_digest, present_raw) = (digest_of(b"present"), b"present".to_vec());
+        let (present_digest, present_raw) = (storage::digest_of(b"present"), b"present".to_vec());
         storage
             .put_blob(
                 present_digest.as_ref(),
-                Bytes::from(encode(storage::Flags::empty(), present_raw.clone())),
+                Bytes::from(encode(Flags::empty(), present_raw.clone())),
             )
             .await
             .unwrap();
-        let missing_digest = digest_of(b"never written");
+        let missing_digest = storage::digest_of(b"never written");
 
         let mut manifest = Vec::new();
         manifest.put_slice(present_digest.as_ref());
@@ -356,7 +357,7 @@ async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
             h.digest()
         };
         storage
-            .put_blob(blob_digest.as_ref(), Bytes::from(encode(storage::Flags::MANIFEST, manifest)))
+            .put_blob(blob_digest.as_ref(), Bytes::from(encode(Flags::MANIFEST, manifest)))
             .await
             .unwrap();
 

@@ -1,7 +1,7 @@
 //! A content-addressed blob store.
 use std::io;
 
-use bytes::Buf;
+use bitflags::bitflags;
 use tokio::io::{
     AsyncRead,
     AsyncWrite,
@@ -10,7 +10,6 @@ use tokio::io::{
 use crate::hash::{
     Digest,
     FromBytes,
-    Hasher,
     ToBytes,
 };
 
@@ -65,39 +64,14 @@ where
     Storage::new(backend).copy_from(len, r).await
 }
 
-/// A reference to one chunk from within a manifest: its digest and its
-/// length, so a length mismatch (a cheap check) can be caught before
-/// the more expensive digest comparison.
-struct ChunkRef {
-    digest: Digest,
-    len:    u32,
-}
-
-/// Decode a manifest body into its ordered chunk references.
-///
-/// The format is a flat sequence of 36-byte records (`digest[32] || len: u32 be`).
-fn decode_manifest(bytes: &[u8]) -> io::Result<Vec<ChunkRef>> {
-    if !bytes.len().is_multiple_of(36) {
-        return Err(invalid_data("manifest body length is not a multiple of 36"));
+bitflags! {
+    /// The trailing byte of every entry's stored payload.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Flags: u8 {
+        /// The payload that follows is compressed by zstd.
+        const COMPRESSED = 1 << 0;
+        /// The payload is a manifest (an ordered list of ChunkRef),
+        /// not content itself.
+        const MANIFEST = 1 << 1;
     }
-    let mut manifest = Vec::with_capacity(bytes.len() / 36);
-    let mut buf = bytes;
-    let mut digest = [0u8; 32];
-    while buf.has_remaining() {
-        buf.copy_to_slice(&mut digest);
-        manifest.push(ChunkRef { digest: Digest::new(digest), len: buf.get_u32() });
-    }
-    Ok(manifest)
-}
-
-/// This chunk's digest: the same length-prefixed single-part framing
-/// `Hasher` uses everywhere else.
-fn digest_of(chunk: &[u8]) -> Digest {
-    let mut h = Hasher::new();
-    h.part(chunk);
-    h.digest()
-}
-
-fn invalid_data(msg: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
