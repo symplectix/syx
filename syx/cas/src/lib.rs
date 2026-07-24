@@ -1,8 +1,15 @@
 //! cas: content-addressed storage.
 
+mod blob;
 mod hash;
-mod store;
 
+pub use blob::{
+    Storage,
+    copy_from,
+    get,
+    put,
+    read_into,
+};
 pub use bytes::Bytes;
 pub use hash::{
     Digest,
@@ -10,11 +17,4 @@ pub use hash::{
     Hasher,
     ToBytes,
     digest,
-};
-pub use store::{
-    Storage,
-    copy_from,
-    get,
-    put,
-    read_into,
 };

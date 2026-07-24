@@ -3,7 +3,7 @@
 //! `storage` is bound once here instead of being threaded through
 //! every call, since `get`/`put`/`read_into`/`copy_from` all need it.
 //! The free functions in `super` construct one of these per call; this
-//! type itself stays private to `store`.
+//! type itself stays private to `blob`.
 use std::io;
 use std::pin::pin;
 

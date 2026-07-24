@@ -5,7 +5,10 @@ use std::sync::{
     Mutex,
 };
 
-use bytes::BufMut;
+use bytes::{
+    BufMut,
+    Bytes,
+};
 use tokio::{
     fs,
     task,

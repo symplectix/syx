@@ -3,13 +3,14 @@ load("//bazel:rust.bzl", "rust")
 rust.library(
     name = "cas",
     srcs = [
+        "src/blob.rs",
+        "src/blob/blobs.rs",
+        "src/blob/consts.rs",
+        "src/blob/entry.rs",
+        "src/blob/storage.rs",
+        "src/blob/tests.rs",
         "src/hash.rs",
         "src/lib.rs",
-        "src/store.rs",
-        "src/store/blobs.rs",
-        "src/store/consts.rs",
-        "src/store/entry.rs",
-        "src/store/tests.rs",
     ],
     visibility = ["//visibility:public"],
     deps = [
