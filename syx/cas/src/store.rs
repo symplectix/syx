@@ -25,7 +25,6 @@ use crate::hash::{
 };
 
 #[cfg(test)]
-#[path = "store_test.rs"]
 mod tests;
 
 mod consts;
@@ -92,8 +91,8 @@ where
     S: Storage,
     W: AsyncWrite + Unpin,
 {
-    let decoder = entry::Decoder;
-    let Some((flags, decoded)) = decoder.load(storage, *digest).await? else {
+    let decoder = entry::Decoder::new();
+    let Some((flags, decoded)) = decoder.load(storage, digest).await? else {
         return Ok(false);
     };
 
@@ -116,7 +115,7 @@ where
     }
 
     for entry in manifest {
-        let Some((chunk_flags, raw)) = decoder.load(storage, entry.digest).await? else {
+        let Some((chunk_flags, raw)) = decoder.load(storage, &entry.digest).await? else {
             return Err(invalid_data(format!(
                 "manifest references missing chunk {:x}",
                 entry.digest
@@ -162,7 +161,7 @@ where
         consts::CHUNK_MAX_SIZE,
     );
     let mut chunks = pin!(cdc.as_stream());
-    let encoder = entry::Encoder::default();
+    let encoder = entry::Encoder::new();
 
     // Only the most recent digest is needed to detect the zero/one/many
     // chunks cases below; the multi-chunk blob digest itself is folded

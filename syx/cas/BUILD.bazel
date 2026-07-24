@@ -8,7 +8,7 @@ rust.library(
         "src/store.rs",
         "src/store/consts.rs",
         "src/store/entry.rs",
-        "src/store_test.rs",
+        "src/store/tests.rs",
     ],
     visibility = ["//visibility:public"],
     deps = [

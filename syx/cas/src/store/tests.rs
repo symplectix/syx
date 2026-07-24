@@ -131,38 +131,38 @@ impl CountEntries for TmpStorage {
 }
 
 fn encode(flags: entry::Flags, raw: Vec<u8>) -> Vec<u8> {
-    entry::Encoder::default().encode(flags, raw)
+    entry::Encoder::new().encode(flags, raw)
 }
 
 #[test]
 fn worth_compressing_is_true_for_repetitive_content() {
-    assert!(entry::Encoder::default().worth_compressing(&[b'a'; 4096]));
+    assert!(entry::Encoder::new().worth_compressing(&[b'a'; 4096]));
 }
 
 #[test]
 fn worth_compressing_is_false_for_random_content() {
-    assert!(!entry::Encoder::default().worth_compressing(&testing::random_bytes(4096)));
+    assert!(!entry::Encoder::new().worth_compressing(&testing::random_bytes(4096)));
 }
 
 #[test]
 fn worth_compressing_is_false_for_empty_content() {
-    assert!(!entry::Encoder::default().worth_compressing(&[]));
+    assert!(!entry::Encoder::new().worth_compressing(&[]));
 }
 
 #[test]
 fn an_overridden_sniff_max_ratio_leaves_the_rest_at_their_defaults() {
     let sample = testing::random_bytes(4096);
-    assert!(!entry::Encoder::default().worth_compressing(&sample));
+    assert!(!entry::Encoder::new().worth_compressing(&sample));
     // >1.0: zstd's frame overhead makes `compressed_len` a little
     // *larger* than random data's own length, not just equal to it.
-    assert!(entry::Encoder::default().sniff_max_ratio(2.0).worth_compressing(&sample));
+    assert!(entry::Encoder::new().sniff_max_ratio(2.0).worth_compressing(&sample));
 }
 
 #[test]
 fn encode_entry_round_trips_through_decode_entry() {
     for raw in [b"a".repeat(4096), testing::random_bytes(4096)] {
         let stored = encode(entry::Flags::empty(), raw.clone());
-        let (flags, decoded) = entry::Decoder.decode(Bytes::from(stored)).unwrap();
+        let (flags, decoded) = entry::Decoder::new().decode(Bytes::from(stored)).unwrap();
         assert!(!flags.contains(entry::Flags::MANIFEST));
         // `decoded` is always plain bytes regardless of whether it
         // was compressed on disk, so the returned flags shouldn't

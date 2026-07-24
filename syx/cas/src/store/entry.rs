@@ -1,7 +1,6 @@
 //! Storing and fetching one entry -- a chunk or a manifest -- as
 //! opaque, possibly-compressed bytes behind a `Storage`. What the
-//! bytes actually mean (chunking, manifest structure, digest
-//! verification) lives one layer up, in `super`.
+//! bytes actually mean lives one layer up.
 use std::io;
 
 use bitflags::bitflags;
@@ -41,53 +40,50 @@ pub(super) struct Encoder {
 
 impl Default for Encoder {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Encoder {
+    pub(super) const fn new() -> Self {
         Self {
             compression_level: consts::COMPRESSION_LEVEL,
             sniff_len:         consts::SNIFF_LEN,
             sniff_max_ratio:   consts::SNIFF_MAX_RATIO,
         }
     }
-}
 
-impl Encoder {
     #[allow(dead_code)]
-    pub(super) fn compression_level(mut self, level: i32) -> Self {
+    pub(super) const fn compression_level(mut self, level: i32) -> Self {
         self.compression_level = level;
         self
     }
 
     #[allow(dead_code)]
-    pub(super) fn sniff_len(mut self, len: usize) -> Self {
+    pub(super) const fn sniff_len(mut self, len: usize) -> Self {
         self.sniff_len = len;
         self
     }
 
     #[allow(dead_code)]
-    pub(super) fn sniff_max_ratio(mut self, ratio: f64) -> Self {
+    pub(super) const fn sniff_max_ratio(mut self, ratio: f64) -> Self {
         self.sniff_max_ratio = ratio;
         self
     }
 
-    /// Compress `raw` with zstd if that's worthwhile, and append a
+    /// Compress `bytes` with zstd if that's worthwhile, and append a
     /// flag byte recording whether it was.
-    ///
-    /// Appending (not prepending) lets both branches grow an
-    /// already-owned buffer in place -- `raw` itself in the
-    /// not-worth-compressing case, or zstd's own output buffer
-    /// (which `compress` already over-allocates via
-    /// `compress_bound`) in the compressed case -- instead of
-    /// allocating a fresh buffer just to make room for one more byte.
-    pub(super) fn encode(&self, mut flags: Flags, mut raw: Vec<u8>) -> Vec<u8> {
-        let sample = &raw[..raw.len().min(self.sniff_len)];
+    pub(super) fn encode(&self, mut flags: Flags, mut bytes: Vec<u8>) -> Vec<u8> {
+        let sample = &bytes[..bytes.len().min(self.sniff_len)];
         if self.worth_compressing(sample) {
-            let mut compressed = zstd::bulk::compress(&raw, self.compression_level)
+            let mut compressed = zstd::bulk::compress(&bytes, self.compression_level)
                 .expect("zstd compression of an in-memory buffer should not fail");
             flags |= Flags::COMPRESSED;
             compressed.push(flags.bits());
             return compressed;
         }
-        raw.push(flags.bits());
-        raw
+        bytes.push(flags.bits());
+        bytes
     }
 
     /// Whether compressing `sample` shrinks it enough to be worth
@@ -107,7 +103,7 @@ impl Encoder {
         &self,
         storage: &S,
         key: Digest,
-        raw: Vec<u8>,
+        bytes: Vec<u8>,
         flags: Flags,
     ) -> io::Result<()> {
         if storage.contains_blob(key.as_ref()).await? {
@@ -119,30 +115,61 @@ impl Encoder {
         // the backend chooses to run `put_blob` itself: it's CPU-bound work
         // that always needs to stay off the async executor, regardless of
         // which backend `S` is.
-        let encoded = task::spawn_blocking(move || encoder.encode(flags, raw))
+        let encoded = task::spawn_blocking(move || encoder.encode(flags, bytes))
             .await
             .expect("encode should not panic");
         storage.put_blob(key.as_ref(), Bytes::from(encoded)).await
     }
 }
 
-/// The read-side counterpart to `Encoder`. Empty for now -- unlike
-/// encoding, decoding needs no tunable knobs -- but keeps the read
-/// and write paths symmetric, and gives future config (e.g. a
-/// decompressed-size limit) a home instead of another one-off free
-/// function.
-#[derive(Clone, Copy, Default)]
-pub(super) struct Decoder;
+/// The read-side counterpart to `Encoder`.
+#[derive(Clone, Copy)]
+pub(super) struct Decoder {
+    // Unlike encoding, decoding needs no options for now.
+}
+
+impl Default for Decoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Decoder {
-    /// Fetch and decode one entry (a chunk or a manifest), without
-    /// verifying it -- callers check the digest themselves, since what it
+    pub(super) const fn new() -> Self {
+        Self {}
+    }
+
+    /// The inverse of `Encoder::encode`.
+    ///
+    /// The not-worth-compressing case is just a cheap sub-slice
+    /// of the already-allocated buffer.
+    pub(super) fn decode(&self, stored: Bytes) -> io::Result<(Flags, Bytes)> {
+        if stored.is_empty() {
+            return Err(invalid_data("stored content is missing its trailing flag byte"));
+        }
+        let mut bytes = stored.slice(..stored.len() - 1);
+        let mut flags = Flags::from_bits_retain(stored[stored.len() - 1]);
+        if flags.contains(Flags::COMPRESSED) {
+            // `bytes` is decompressed from here on -- the returned flags
+            // should describe it.
+            flags.remove(Flags::COMPRESSED);
+            bytes = Bytes::from(
+                zstd::decode_all(bytes.as_ref())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            );
+        }
+        Ok((flags, bytes))
+    }
+
+    /// Fetch and decode one entry (a chunk or a manifest).
+    ///
+    /// Callers should check the digest themselves, since what it
     /// should be verified against differs for a manifest's own entry vs.
     /// one of the chunks it lists.
     pub(super) async fn load<S: Storage>(
         &self,
         storage: &S,
-        digest: Digest,
+        digest: &Digest,
     ) -> io::Result<Option<(Flags, Bytes)>> {
         let Some(stored) = storage.get_blob(digest.as_ref()).await? else {
             return Ok(None);
@@ -151,30 +178,5 @@ impl Decoder {
         task::spawn_blocking(move || decoder.decode(stored).map(Some))
             .await
             .expect("decode should not panic")
-    }
-
-    /// The inverse of `Encoder::encode`.
-    ///
-    /// Takes and returns `Bytes` rather than `Vec<u8>`/`&[u8]`: the
-    /// not-worth-compressing case is then just a cheap, zero-copy
-    /// sub-slice of the already-owned `stored` buffer (`Bytes::slice`
-    /// shares the same backing allocation), instead of an unconditional
-    /// full copy into a fresh `Vec`.
-    pub(super) fn decode(&self, stored: Bytes) -> io::Result<(Flags, Bytes)> {
-        if stored.is_empty() {
-            return Err(invalid_data("stored content is missing its trailing flag byte"));
-        }
-        let mut bytes = stored.slice(..stored.len() - 1);
-        let mut flags = Flags::from_bits_retain(stored[stored.len() - 1]);
-        if flags.contains(Flags::COMPRESSED) {
-            // `raw` is decompressed from here on -- the returned flags
-            // should describe it, not the on-disk encoding it came from.
-            flags.remove(Flags::COMPRESSED);
-            bytes = Bytes::from(
-                zstd::decode_all(bytes.as_ref())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-            );
-        }
-        Ok((flags, bytes))
     }
 }
