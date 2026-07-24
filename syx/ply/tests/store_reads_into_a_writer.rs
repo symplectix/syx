@@ -6,7 +6,6 @@ use std::io;
 
 use common::{
     digest_bytes,
-    incompressible_bytes,
     store,
 };
 
@@ -24,7 +23,7 @@ async fn read_into_writes_small_content() {
 #[tokio::test]
 async fn read_into_writes_large_multi_chunk_content() {
     let (_dir, store) = store();
-    let content = incompressible_bytes(600_000);
+    let content = testing::random_bytes(600_000);
     let d = store.put(&cas::Bytes::from(content.clone())).await.unwrap();
 
     let mut out = Vec::new();
@@ -36,7 +35,7 @@ async fn read_into_writes_large_multi_chunk_content() {
 #[tokio::test]
 async fn read_into_matches_get_for_the_same_digest() {
     let (_dir, store) = store();
-    let content = incompressible_bytes(600_000);
+    let content = testing::random_bytes(600_000);
     let d = store.copy_from(content.len() as u64, &mut io::Cursor::new(content)).await.unwrap();
 
     let from_get = store.get::<cas::Bytes>(&d).await.unwrap().unwrap();

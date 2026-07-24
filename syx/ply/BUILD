@@ -40,7 +40,6 @@ rust.test_suite(
         ":ply",
         "//syx/cas",
         "//syx/testing",
-        "@crates//:rand",
         "@crates//:tokio",
     ],
 )

@@ -5,7 +5,6 @@ use std::sync::{
     Mutex,
 };
 
-use rand::RngExt as _;
 use tokio::{
     fs,
     task,
@@ -131,12 +130,6 @@ impl CountEntries for TmpStorage {
     }
 }
 
-fn incompressible_bytes(len: usize) -> Vec<u8> {
-    let mut out = vec![0u8; len];
-    rand::rng().fill(&mut out[..]);
-    out
-}
-
 fn encode(flags: entry::Flags, raw: Vec<u8>) -> Vec<u8> {
     entry::Encoder::default().encode(flags, raw)
 }
@@ -148,7 +141,7 @@ fn worth_compressing_is_true_for_repetitive_content() {
 
 #[test]
 fn worth_compressing_is_false_for_random_content() {
-    assert!(!entry::Encoder::default().worth_compressing(&incompressible_bytes(4096)));
+    assert!(!entry::Encoder::default().worth_compressing(&testing::random_bytes(4096)));
 }
 
 #[test]
@@ -158,7 +151,7 @@ fn worth_compressing_is_false_for_empty_content() {
 
 #[test]
 fn an_overridden_sniff_max_ratio_leaves_the_rest_at_their_defaults() {
-    let sample = incompressible_bytes(4096);
+    let sample = testing::random_bytes(4096);
     assert!(!entry::Encoder::default().worth_compressing(&sample));
     // >1.0: zstd's frame overhead makes `compressed_len` a little
     // *larger* than random data's own length, not just equal to it.
@@ -167,7 +160,7 @@ fn an_overridden_sniff_max_ratio_leaves_the_rest_at_their_defaults() {
 
 #[test]
 fn encode_entry_round_trips_through_decode_entry() {
-    for raw in [b"a".repeat(4096), incompressible_bytes(4096)] {
+    for raw in [b"a".repeat(4096), testing::random_bytes(4096)] {
         let stored = encode(entry::Flags::empty(), raw.clone());
         let (flags, decoded) = entry::Decoder.decode(Bytes::from(stored)).unwrap();
         assert!(!flags.contains(entry::Flags::MANIFEST));
@@ -187,7 +180,7 @@ async fn a_single_chunks_digest_is_the_content_digest_not_a_wrapped_one() {
     // since this is a property of `cas`'s own digest scheme, not of
     // whichever `Storage` happens to be behind it.
     async fn check(storage: impl Storage) {
-        let content = incompressible_bytes(4096); // well under CHUNK_MIN_SIZE
+        let content = testing::random_bytes(4096); // well under CHUNK_MIN_SIZE
         let content_digest = digest_of(&content);
         let d = put(&storage, &Bytes::from(content)).await.unwrap();
         assert_eq!(d, content_digest);
@@ -202,7 +195,7 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
     // Long enough, and shared for long enough, that content-defined
     // chunking is guaranteed to produce at least one identical cut
     // chunk in both blobs before they diverge.
-    let shared = incompressible_bytes(consts::CHUNK_MAX_SIZE * 2);
+    let shared = testing::random_bytes(consts::CHUNK_MAX_SIZE * 2);
     let blob_a = {
         let mut blob_a = shared.clone();
         blob_a.extend_from_slice(b"-a-suffix");
@@ -272,7 +265,7 @@ async fn get_returns_invalid_data_for_a_tampered_chunk() {
     // Needs a real (non-manifest) key to target, so this one stays
     // `MemStorage`-only rather than being generalized over `Storage`.
     let storage = MemStorage::default();
-    let content = incompressible_bytes(consts::CHUNK_MAX_SIZE * 2);
+    let content = testing::random_bytes(consts::CHUNK_MAX_SIZE * 2);
     let d = put(&storage, &Bytes::from(content)).await.unwrap();
 
     let chunk_key = storage.any_key_except(d.as_ref());
@@ -305,7 +298,7 @@ async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
     // Needs a real (non-manifest) key to target, so this one stays
     // `MemStorage`-only rather than being generalized over `Storage`.
     let storage = MemStorage::default();
-    let content = incompressible_bytes(consts::CHUNK_MAX_SIZE * 2);
+    let content = testing::random_bytes(consts::CHUNK_MAX_SIZE * 2);
     let d = put(&storage, &Bytes::from(content)).await.unwrap();
 
     let chunk_key = storage.any_key_except(d.as_ref());
@@ -320,7 +313,7 @@ async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
 #[tokio::test]
 async fn get_returns_invalid_data_for_a_tampered_manifest() {
     async fn check(storage: impl Storage) {
-        let content = incompressible_bytes(consts::CHUNK_MAX_SIZE * 2);
+        let content = testing::random_bytes(consts::CHUNK_MAX_SIZE * 2);
         let d = put(&storage, &Bytes::from(content)).await.unwrap();
 
         let tampered = encode(entry::Flags::MANIFEST, b"not a valid manifest body".to_vec());

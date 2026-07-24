@@ -18,12 +18,3 @@ pub fn store() -> (testing::TempDir, ply::Store) {
 pub fn digest<T: cas::ToBytes>(value: &T) -> cas::Digest {
     cas::digest(value).unwrap()
 }
-
-/// `len` random bytes, which zstd can't meaningfully shrink.
-pub fn incompressible_bytes(len: usize) -> Vec<u8> {
-    use rand::RngExt as _;
-
-    let mut out = vec![0u8; len];
-    rand::rng().fill(&mut out[..]);
-    out
-}

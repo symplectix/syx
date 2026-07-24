@@ -31,7 +31,6 @@ rust.test(
     data = ["//:.rustfmt.toml"],
     deps = [
         "//syx/testing",
-        "@crates//:rand",
         "@crates//:tempfile",
         "@crates//:tokio",
     ],
