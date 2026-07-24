@@ -1,4 +1,4 @@
-//! A fjall-backed `cas::Storage`, and `ply`'s content-addressed store.
+//! A fjall-backed `cas::Backend`, and `ply`'s content-addressed store.
 
 use std::io;
 use std::path::Path;
@@ -32,7 +32,7 @@ pub struct Store {
     cas: fjall::Keyspace,
 }
 
-impl cas::Storage for Store {
+impl cas::Backend for Store {
     // fjall's own API is blocking, so each method hops onto the
     // blocking pool itself -- `cas`'s generic algorithms no longer
     // impose that on every backend.

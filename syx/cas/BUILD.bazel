@@ -5,8 +5,8 @@ rust.library(
     srcs = [
         "src/hash.rs",
         "src/lib.rs",
-        "src/store.rs",
-        "src/store_test.rs",
+        "src/storage.rs",
+        "src/storage_test.rs",
     ],
     visibility = ["//visibility:public"],
     deps = [
@@ -29,7 +29,6 @@ rust.test(
     data = ["//:.rustfmt.toml"],
     deps = [
         "//syx/testing",
-        "@crates//:rand",
         "@crates//:tempfile",
         "@crates//:tokio",
     ],

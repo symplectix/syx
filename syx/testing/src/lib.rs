@@ -12,6 +12,7 @@ use std::{
     io,
 };
 
+use rand::RngExt as _;
 use runfiles::Runfiles;
 pub use tempfile::TempDir;
 
@@ -42,6 +43,13 @@ pub fn tempdir_in<P: AsRef<Path>>(path: P) -> TempDir {
     fs::create_dir_all(&dir)
         .and_then(|_| tempfile::tempdir_in(&dir))
         .expect("creating a temporary directory in testing::TMPDIR")
+}
+
+/// `len` random bytes.
+pub fn random_bytes(len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    rand::rng().fill(&mut out[..]);
+    out
 }
 
 mod private {
