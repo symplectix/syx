@@ -15,12 +15,12 @@ use tokio::{
 };
 
 use super::*;
-use crate::blob::{
+use crate::hash::Hasher;
+use crate::{
     get,
     put,
     read_into,
 };
-use crate::hash::Hasher;
 
 /// An in-memory `Backend`.
 #[derive(Clone, Default)]

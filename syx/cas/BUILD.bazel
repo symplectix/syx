@@ -3,7 +3,6 @@ load("//bazel:rust.bzl", "rust")
 rust.library(
     name = "cas",
     srcs = [
-        "src/blob.rs",
         "src/hash.rs",
         "src/lib.rs",
         "src/storage.rs",
