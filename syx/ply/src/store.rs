@@ -1,4 +1,4 @@
-//! A fjall-backed `cas::Backend`, and `ply`'s content-addressed store.
+//! A fjall-backed `cas::Reader`/`cas::Writer`, and `ply`'s content-addressed store.
 
 use std::io;
 use std::path::Path;
@@ -32,30 +32,33 @@ pub struct Store {
     cas: fjall::Keyspace,
 }
 
-impl cas::Backend for Store {
+impl cas::Reader for Store {
     // fjall's own API is blocking, so each method hops onto the
     // blocking pool itself -- `cas`'s generic algorithms no longer
     // impose that on every backend.
 
-    async fn contains_blob(&self, key: &[u8]) -> io::Result<bool> {
+    async fn contains_blob(&self, key: cas::Digest) -> io::Result<bool> {
         let cas = self.cas.clone();
-        let key = key.to_vec();
         task::spawn_blocking(move || cas.contains_key(key).map_err(fjall_to_io))
             .await
             .expect("blocking task should not panic")
     }
 
-    async fn get_blob(&self, key: &[u8]) -> io::Result<Option<Bytes>> {
+    async fn get_blob(&self, key: cas::Digest) -> io::Result<Option<Bytes>> {
         let cas = self.cas.clone();
-        let key = key.to_vec();
         task::spawn_blocking(move || Ok(cas.get(key).map_err(fjall_to_io)?.map(Bytes::from)))
             .await
             .expect("blocking task should not panic")
     }
+}
 
-    async fn put_blob(&self, key: &[u8], bytes: Bytes) -> io::Result<()> {
+impl cas::Writer for Store {
+    async fn put_blob(&self, key: cas::Digest, bytes: Bytes) -> io::Result<()> {
         let cas = self.cas.clone();
-        let key = key.to_vec();
+        // fjall's `insert` needs an owned key to convert into its own
+        // `Slice`-based key type, unlike `contains_key`/`get` which just
+        // need `AsRef<[u8]>` and so can take `key` directly.
+        let key = key.as_ref().to_vec();
         task::spawn_blocking(move || cas.insert(key, bytes).map_err(fjall_to_io))
             .await
             .expect("blocking task should not panic")
@@ -100,7 +103,7 @@ impl Store {
 
     /// Reads the content at `digest`, if present.
     pub async fn get<T: cas::FromBytes>(&self, digest: &cas::Digest) -> io::Result<Option<T>> {
-        cas::get(self, digest).await
+        cas::Storage::new(self).get(digest).await
     }
 
     /// Reads the content at `digest` if present and write it to `w`.
@@ -110,22 +113,22 @@ impl Store {
     where
         W: AsyncWrite + Unpin,
     {
-        cas::read_into(self, digest, w).await
+        cas::Storage::new(self).read_into(digest, w).await
     }
 
     /// Store `content`, addressed by its own digest, and return that
     /// digest. A thin wrapper over `copy_from`.
     pub async fn put<T: cas::ToBytes>(&self, content: &T) -> io::Result<cas::Digest> {
-        cas::put(self, content).await
+        cas::Storage::new(self).put(content).await
     }
 
     /// Store the content read from `r` of `len` bytes, addressed by its
-    /// own digest. A thin wrapper over the free `cas::copy_from`.
+    /// own digest.
     pub async fn copy_from<R>(&self, len: u64, r: &mut R) -> io::Result<cas::Digest>
     where
         R: AsyncRead + Unpin,
     {
-        cas::copy_from(self, len, r).await
+        cas::Storage::new(self).copy_from(len, r).await
     }
 }
 

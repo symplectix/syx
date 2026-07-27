@@ -16,27 +16,24 @@ use tokio::{
 
 use super::*;
 use crate::hash::Hasher;
-use crate::{
-    get,
-    put,
-    read_into,
-};
 
-/// An in-memory `Backend`.
+/// An in-memory `Reader`/`Writer`.
 #[derive(Clone, Default)]
-struct MemBackend(Arc<Mutex<HashMap<Vec<u8>, Bytes>>>);
+struct MemBackend(Arc<Mutex<HashMap<Digest, Bytes>>>);
 
-impl Backend for MemBackend {
-    async fn contains_blob(&self, key: &[u8]) -> io::Result<bool> {
-        Ok(self.0.lock().unwrap().contains_key(key))
+impl Reader for MemBackend {
+    async fn contains_blob(&self, key: Digest) -> io::Result<bool> {
+        Ok(self.0.lock().unwrap().contains_key(&key))
     }
 
-    async fn get_blob(&self, key: &[u8]) -> io::Result<Option<Bytes>> {
-        Ok(self.0.lock().unwrap().get(key).cloned())
+    async fn get_blob(&self, key: Digest) -> io::Result<Option<Bytes>> {
+        Ok(self.0.lock().unwrap().get(&key).cloned())
     }
+}
 
-    async fn put_blob(&self, key: &[u8], bytes: Bytes) -> io::Result<()> {
-        self.0.lock().unwrap().insert(key.to_vec(), bytes);
+impl Writer for MemBackend {
+    async fn put_blob(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
+        self.0.lock().unwrap().insert(key, bytes);
         Ok(())
     }
 }
@@ -44,18 +41,18 @@ impl Backend for MemBackend {
 impl MemBackend {
     /// Any stored key other than `exclude`, to target for corruption
     /// without needing to independently recompute chunk digests.
-    fn any_key_except(&self, exclude: &[u8]) -> Vec<u8> {
-        self.0
+    fn any_key_except(&self, exclude: Digest) -> Digest {
+        *self
+            .0
             .lock()
             .unwrap()
             .keys()
-            .find(|k| k.as_slice() != exclude)
+            .find(|k| **k != exclude)
             .expect("multi-chunk content should store more than just the manifest")
-            .clone()
     }
 }
 
-/// A filesystem-backed `Backend`.
+/// A filesystem-backed `Reader`/`Writer`.
 /// Owns its own `TempDir` directly, so a test using it
 /// doesn't need to separately keep one alive.
 struct TmpBackend(testing::TempDir);
@@ -65,9 +62,10 @@ impl TmpBackend {
         Self(testing::tempdir())
     }
 
-    fn path(&self, key: &[u8]) -> PathBuf {
+    fn path(&self, key: Digest) -> PathBuf {
         use std::fmt::Write as _;
 
+        let key = key.as_ref();
         let mut hex = String::with_capacity(key.len() * 2 + 1);
         write!(hex, "{:02x}", key[0]).unwrap();
         hex.push('/');
@@ -78,20 +76,22 @@ impl TmpBackend {
     }
 }
 
-impl Backend for TmpBackend {
-    async fn contains_blob(&self, key: &[u8]) -> io::Result<bool> {
+impl Reader for TmpBackend {
+    async fn contains_blob(&self, key: Digest) -> io::Result<bool> {
         fs::try_exists(self.path(key)).await
     }
 
-    async fn get_blob(&self, key: &[u8]) -> io::Result<Option<Bytes>> {
+    async fn get_blob(&self, key: Digest) -> io::Result<Option<Bytes>> {
         match fs::read(self.path(key)).await {
             Ok(bytes) => Ok(Some(Bytes::from(bytes))),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
     }
+}
 
-    async fn put_blob(&self, key: &[u8], bytes: Bytes) -> io::Result<()> {
+impl Writer for TmpBackend {
+    async fn put_blob(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
         let path = self.path(key);
         // Sharding means the shard directory may not exist yet.
         let dir = path.parent().expect("path always has a parent").to_owned();
@@ -188,11 +188,11 @@ async fn a_single_chunks_digest_is_the_content_digest_not_a_wrapped_one() {
     // same content appearing as one chunk inside a larger blob: both
     // are keyed by the exact same digest. Runs against both backends,
     // since this is a property of `cas`'s own digest scheme, not of
-    // whichever `Backend` happens to be behind it.
-    async fn check(storage: impl Backend) {
+    // whichever backend happens to be behind it.
+    async fn check(storage: impl Reader + Writer) {
         let content = testing::random_bytes(4096); // well under CHUNK_MIN_SIZE
         let content_digest = digest_of(&content);
-        let d = put(&storage, &Bytes::from(content)).await.unwrap();
+        let d = Storage::new(&storage).put(&Bytes::from(content)).await.unwrap();
         assert_eq!(d, content_digest);
     }
 
@@ -218,20 +218,21 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
     };
 
     // How many keys after putting `blob`.
-    async fn count_keys(storage: impl Backend + CountEntries, blob: Bytes) -> usize {
-        put(&storage, &blob).await.unwrap();
+    async fn count_keys(storage: impl Reader + Writer + CountEntries, blob: Bytes) -> usize {
+        Storage::new(&storage).put(&blob).await.unwrap();
         storage.count()
     }
 
     async fn check(
-        storage: impl Backend + CountEntries,
+        storage: impl Reader + Writer + CountEntries,
         blob_a: &Bytes,
         blob_b: &Bytes,
         baseline: usize,
     ) {
-        put(&storage, blob_a).await.unwrap();
+        let cas = Storage::new(&storage);
+        cas.put(blob_a).await.unwrap();
         let count_before = storage.count();
-        put(&storage, blob_b).await.unwrap();
+        cas.put(blob_b).await.unwrap();
         let count_after = storage.count();
 
         let new_keys = count_after - count_before;
@@ -245,7 +246,7 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
     let mem_keys = count_keys(MemBackend::default(), blob_b.clone()).await;
     let tmp_keys = count_keys(TmpBackend::new(), blob_b.clone()).await;
     // The baseline is a property of blob_b's content and cas's chunking,
-    // not of which Backend computed it.
+    // not of which backend computed it.
     assert_eq!(mem_keys, tmp_keys);
 
     check(MemBackend::default(), &blob_a, &blob_b, mem_keys).await;
@@ -254,15 +255,16 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
 
 #[tokio::test]
 async fn get_returns_invalid_data_for_tampered_content() {
-    async fn check(storage: impl Backend) {
-        let d = put(&storage, &Bytes::from_static(b"hello")).await.unwrap();
+    async fn check(storage: impl Reader + Writer) {
+        let cas = Storage::new(&storage);
+        let d = cas.put(&Bytes::from_static(b"hello")).await.unwrap();
 
         // Overwrite the stored bytes with content that doesn't hash
         // back to `d`, simulating corruption.
         let tampered = encode(Flags::empty(), b"not hello".to_vec());
-        storage.put_blob(d.as_ref(), Bytes::from(tampered)).await.unwrap();
+        storage.put_blob(d, Bytes::from(tampered)).await.unwrap();
 
-        let err = get::<_, Bytes>(&storage, &d).await.unwrap_err();
+        let err = cas.get::<Bytes>(&d).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -273,29 +275,31 @@ async fn get_returns_invalid_data_for_tampered_content() {
 #[tokio::test]
 async fn get_returns_invalid_data_for_a_tampered_chunk() {
     // Needs a real (non-manifest) key to target, so this one stays
-    // `MemBackend`-only rather than being generalized over `Backend`.
+    // `MemBackend`-only rather than being generalized over the backend.
     let storage = MemBackend::default();
     let content = testing::random_bytes(defaults::CHUNK_MAX_SIZE * 2);
-    let d = put(&storage, &Bytes::from(content)).await.unwrap();
+    let cas = Storage::new(&storage);
+    let d = cas.put(&Bytes::from(content)).await.unwrap();
 
-    let chunk_key = storage.any_key_except(d.as_ref());
+    let chunk_key = storage.any_key_except(d);
     let tampered = encode(Flags::empty(), b"tampered chunk content".to_vec());
-    storage.put_blob(&chunk_key, Bytes::from(tampered)).await.unwrap();
+    storage.put_blob(chunk_key, Bytes::from(tampered)).await.unwrap();
 
-    let err = get::<_, Bytes>(&storage, &d).await.unwrap_err();
+    let err = cas.get::<Bytes>(&d).await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 }
 
 #[tokio::test]
 async fn read_into_returns_invalid_data_for_tampered_content() {
-    async fn check(storage: impl Backend) {
-        let d = put(&storage, &Bytes::from_static(b"hello")).await.unwrap();
+    async fn check(storage: impl Reader + Writer) {
+        let cas = Storage::new(&storage);
+        let d = cas.put(&Bytes::from_static(b"hello")).await.unwrap();
 
         let tampered = encode(Flags::empty(), b"not hello".to_vec());
-        storage.put_blob(d.as_ref(), Bytes::from(tampered)).await.unwrap();
+        storage.put_blob(d, Bytes::from(tampered)).await.unwrap();
 
         let mut out = Vec::new();
-        let err = read_into(&storage, &d, &mut out).await.unwrap_err();
+        let err = cas.read_into(&d, &mut out).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -306,30 +310,32 @@ async fn read_into_returns_invalid_data_for_tampered_content() {
 #[tokio::test]
 async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
     // Needs a real (non-manifest) key to target, so this one stays
-    // `MemBackend`-only rather than being generalized over `Backend`.
+    // `MemBackend`-only rather than being generalized over the backend.
     let storage = MemBackend::default();
     let content = testing::random_bytes(defaults::CHUNK_MAX_SIZE * 2);
-    let d = put(&storage, &Bytes::from(content)).await.unwrap();
+    let cas = Storage::new(&storage);
+    let d = cas.put(&Bytes::from(content)).await.unwrap();
 
-    let chunk_key = storage.any_key_except(d.as_ref());
+    let chunk_key = storage.any_key_except(d);
     let tampered = encode(Flags::empty(), b"tampered chunk content".to_vec());
-    storage.put_blob(&chunk_key, Bytes::from(tampered)).await.unwrap();
+    storage.put_blob(chunk_key, Bytes::from(tampered)).await.unwrap();
 
     let mut out = Vec::new();
-    let err = read_into(&storage, &d, &mut out).await.unwrap_err();
+    let err = cas.read_into(&d, &mut out).await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 }
 
 #[tokio::test]
 async fn get_returns_invalid_data_for_a_tampered_manifest() {
-    async fn check(storage: impl Backend) {
+    async fn check(storage: impl Reader + Writer) {
         let content = testing::random_bytes(defaults::CHUNK_MAX_SIZE * 2);
-        let d = put(&storage, &Bytes::from(content)).await.unwrap();
+        let cas = Storage::new(&storage);
+        let d = cas.put(&Bytes::from(content)).await.unwrap();
 
         let tampered = encode(Flags::MANIFEST, b"not a valid manifest body".to_vec());
-        storage.put_blob(d.as_ref(), Bytes::from(tampered)).await.unwrap();
+        storage.put_blob(d, Bytes::from(tampered)).await.unwrap();
 
-        let err = get::<_, Bytes>(&storage, &d).await.unwrap_err();
+        let err = cas.get::<Bytes>(&d).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -339,13 +345,10 @@ async fn get_returns_invalid_data_for_a_tampered_manifest() {
 
 #[tokio::test]
 async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
-    async fn check(storage: impl Backend) {
+    async fn check(storage: impl Reader + Writer) {
         let (present_digest, present_raw) = (digest_of(b"present"), b"present".to_vec());
         storage
-            .put_blob(
-                present_digest.as_ref(),
-                Bytes::from(encode(Flags::empty(), present_raw.clone())),
-            )
+            .put_blob(present_digest, Bytes::from(encode(Flags::empty(), present_raw.clone())))
             .await
             .unwrap();
         let missing_digest = digest_of(b"never written");
@@ -362,11 +365,11 @@ async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
             h.digest()
         };
         storage
-            .put_blob(blob_digest.as_ref(), Bytes::from(encode(Flags::MANIFEST, manifest)))
+            .put_blob(blob_digest, Bytes::from(encode(Flags::MANIFEST, manifest)))
             .await
             .unwrap();
 
-        let err = get::<_, Bytes>(&storage, &blob_digest).await.unwrap_err();
+        let err = Storage::new(&storage).get::<Bytes>(&blob_digest).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
