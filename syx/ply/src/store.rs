@@ -55,11 +55,7 @@ impl cas::Reader for Store {
 impl cas::Writer for Store {
     async fn put_blob(&self, key: cas::Digest, bytes: Bytes) -> io::Result<()> {
         let cas = self.cas.clone();
-        // fjall's `insert` needs an owned key to convert into its own
-        // `Slice`-based key type, unlike `contains_key`/`get` which just
-        // need `AsRef<[u8]>` and so can take `key` directly.
-        let key = key.as_ref().to_vec();
-        task::spawn_blocking(move || cas.insert(key, bytes).map_err(fjall_to_io))
+        task::spawn_blocking(move || cas.insert(key.as_ref(), bytes).map_err(fjall_to_io))
             .await
             .expect("blocking task should not panic")
     }
