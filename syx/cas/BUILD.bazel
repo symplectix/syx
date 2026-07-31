@@ -3,6 +3,7 @@ load("//bazel:rust.bzl", "rust")
 rust.library(
     name = "cas",
     srcs = [
+        "src/blob.rs",
         "src/hash.rs",
         "src/lib.rs",
         "src/storage.rs",
@@ -46,7 +47,7 @@ rust.test_suite(
     shared_srcs = ["tests/common/mod.rs"],
     deps = [
         ":cas",
-        "//syx/testing",
+        "//syx/cas_testing",
         "@crates//:cbor2",
         "@crates//:serde",
         "@crates//:serde_bytes",

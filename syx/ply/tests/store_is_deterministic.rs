@@ -2,16 +2,13 @@
 //! the content.
 
 mod common;
-use common::{
-    digest_bytes,
-    store,
-};
+use common::store;
 
 #[tokio::test]
 async fn put_returns_the_content_digest() {
     let (_dir, store) = store();
     let d = store.put(&cas::Bytes::from_static(b"hello")).await.unwrap();
-    assert_eq!(d, digest_bytes(b"hello"));
+    assert_eq!(d, cas_testing::digest_bytes(b"hello"));
 }
 
 #[tokio::test]
@@ -34,6 +31,6 @@ async fn copy_from_bytes_produces_the_same_digest_as_put() {
     let content = cas::Bytes::from_static(b"hello");
     let mut cursor = std::io::Cursor::new(&content);
     let d = store.copy_from(content.len() as u64, &mut cursor).await.unwrap();
-    assert_eq!(d, digest_bytes(b"hello"));
+    assert_eq!(d, cas_testing::digest_bytes(b"hello"));
     assert_eq!(store.get(&d).await.unwrap(), Some(content));
 }

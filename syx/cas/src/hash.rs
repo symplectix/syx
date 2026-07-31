@@ -5,14 +5,6 @@ use std::fmt;
 use bytes::Bytes;
 use sha2::Digest as _;
 
-/// Digest of `value`'s canonical byte encoding.
-pub fn digest<T: ToBytes>(value: &T) -> Result<Digest, T::Error> {
-    let bytes = value.to_bytes()?;
-    let mut h = Hasher::new();
-    h.part(bytes);
-    Ok(h.digest())
-}
-
 /// This value's canonical byte encoding.
 ///
 /// Implementations must keep this consistent with `FromBytes`:
@@ -120,8 +112,9 @@ impl Hasher {
         self
     }
 
-    /// Finalize and return the digest's bytes.
-    pub fn digest(self) -> Digest {
-        Digest(self.hasher.finalize().into())
+    /// Finalize and return the digest's bytes, resetting so `self` can
+    /// be reused to build another digest from scratch.
+    pub fn digest(&mut self) -> Digest {
+        Digest(self.hasher.finalize_reset().into())
     }
 }

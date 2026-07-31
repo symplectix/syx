@@ -1,10 +1,7 @@
 //! Content stored in a `Store` is preserved faithfully.
 
 mod common;
-use common::{
-    digest_bytes,
-    store,
-};
+use common::store;
 
 #[tokio::test]
 async fn content_put_is_returned_unchanged_by_get() {
@@ -26,6 +23,6 @@ async fn copy_from_accepts_a_file_and_streams_it_in() {
     let mut file = tokio::fs::File::open(&src).await.unwrap();
     let len = file.metadata().await.unwrap().len();
     let d = store.copy_from(len, &mut file).await.unwrap();
-    assert_eq!(d, digest_bytes(b"hello"));
+    assert_eq!(d, cas_testing::digest_bytes(b"hello"));
     assert_eq!(store.get(&d).await.unwrap(), Some(cas::Bytes::from_static(b"hello")));
 }

@@ -1,5 +1,5 @@
 //! A `Function` and everything it references resolve back out of a
-//! `ply::Store`, using only its own digest.
+//! `ply::Repository`, using only its own digest.
 
 mod common;
 use common::store;

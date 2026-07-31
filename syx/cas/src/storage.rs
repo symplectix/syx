@@ -1,4 +1,4 @@
-//! Operations over blobs, bound to one `Backend`.
+//! Operations over blobs, bound to one backend implementing `blob::{Exists, Get, Put}`.
 use std::io;
 use std::pin::pin;
 
@@ -18,6 +18,7 @@ use tokio::io::{
 };
 use tokio::task;
 
+use crate::blob;
 use crate::hash::{
     Digest,
     FromBytes,
@@ -43,6 +44,7 @@ bitflags! {
 
 /// Chunking and encoding on the way in,
 /// decoding and verifying on the way out.
+#[derive(Clone)]
 pub struct Storage<T> {
     backend:  T,
     chunking: Chunking,
@@ -50,35 +52,25 @@ pub struct Storage<T> {
     decoding: Decoding,
 }
 
-/// Moves bytes in and out by a key the caller supplies.
-/// A `Backend` doesn't interpret `key` or `bytes`,
-/// it just stores bytes under bytes.
-pub trait Backend: Sync {
-    /// Whether `key` is already stored, without fetching its value.
-    fn contains_blob(&self, key: &[u8]) -> impl Future<Output = io::Result<bool>> + Send;
-
-    /// Fetch bytes stored under `key`, if present.
-    fn get_blob(&self, key: &[u8]) -> impl Future<Output = io::Result<Option<Bytes>>> + Send;
-
-    /// Store `bytes` under `key`.
-    fn put_blob(&self, key: &[u8], bytes: Bytes) -> impl Future<Output = io::Result<()>> + Send;
-}
-
-impl<T: Backend> Backend for &T {
-    fn contains_blob(&self, key: &[u8]) -> impl Future<Output = io::Result<bool>> + Send {
+impl<T: blob::Exists> blob::Exists for &T {
+    fn contains_blob(&self, key: Digest) -> impl Future<Output = io::Result<bool>> + Send {
         (*self).contains_blob(key)
     }
+}
 
-    fn get_blob(&self, key: &[u8]) -> impl Future<Output = io::Result<Option<Bytes>>> + Send {
+impl<T: blob::Get> blob::Get for &T {
+    fn get_blob(&self, key: Digest) -> impl Future<Output = io::Result<Option<Bytes>>> + Send {
         (*self).get_blob(key)
     }
+}
 
-    fn put_blob(&self, key: &[u8], bytes: Bytes) -> impl Future<Output = io::Result<()>> + Send {
+impl<T: blob::Put> blob::Put for &T {
+    fn put_blob(&self, key: Digest, bytes: Bytes) -> impl Future<Output = io::Result<()>> + Send {
         (*self).put_blob(key, bytes)
     }
 }
 
-impl<T: Backend> Storage<T> {
+impl<T> Storage<T> {
     /// Wraps `backend`.
     pub const fn new(backend: T) -> Self {
         Self {
@@ -88,32 +80,16 @@ impl<T: Backend> Storage<T> {
             decoding: Decoding::new(),
         }
     }
+}
 
-    /// Write one entry under `key`, skipping the encode step entirely
-    /// if `key` is already stored.
-    async fn save(&self, key: Digest, bytes: Vec<u8>, flags: Flags) -> io::Result<()> {
-        if self.backend.contains_blob(key.as_ref()).await? {
-            return Ok(());
-        }
-        let encoder = self.encoding;
-
-        // Encoding runs in its own `spawn_blocking`, independent of however
-        // the backend chooses to run `put_blob` itself: it's CPU-bound work
-        // that always needs to stay off the async executor, regardless of
-        // which backend `S` is.
-        let encoded = task::spawn_blocking(move || encoder.encode(flags, bytes))
-            .await
-            .expect("encode should not panic");
-        self.backend.put_blob(key.as_ref(), Bytes::from(encoded)).await
-    }
-
+impl<T: blob::Exists + blob::Get> Storage<T> {
     /// Fetch and decode one entry (a chunk or a manifest).
     ///
     /// Callers should check the digest themselves, since what it
     /// should be verified against differs for a manifest's own entry vs.
     /// one of the chunks it lists.
     async fn load(&self, digest: &Digest) -> io::Result<Option<(Flags, Bytes)>> {
-        let Some(stored) = self.backend.get_blob(digest.as_ref()).await? else {
+        let Some(stored) = self.backend.get_blob(*digest).await? else {
             return Ok(None);
         };
         let decoder = self.decoding;
@@ -135,16 +111,6 @@ impl<T: Backend> Storage<T> {
         Ok(Some(content))
     }
 
-    /// Store `content`, addressed by its own digest, and return that
-    /// digest. A thin wrapper over `copy_from`, over the already
-    /// in-memory bytes.
-    pub async fn put<B: ToBytes>(&self, content: &B) -> io::Result<Digest> {
-        let bytes =
-            content.to_bytes().unwrap_or_else(|_| panic!("serializing to bytes should not fail"));
-        let len = bytes.len() as u64;
-        self.copy_from(len, &mut io::Cursor::new(bytes)).await
-    }
-
     /// Reads the content at `digest` if present and write it to `w`.
     ///
     /// `get` is the better choice for values small enough that this doesn't matter.
@@ -157,7 +123,7 @@ impl<T: Backend> Storage<T> {
         };
 
         if !flags.contains(Flags::MANIFEST) {
-            if digest_of(&decoded) != *digest {
+            if Hasher::new().part(&decoded).digest() != *digest {
                 return Err(invalid_data("direct content digest mismatch"));
             }
             w.write_all(&decoded).await?;
@@ -190,7 +156,7 @@ impl<T: Backend> Storage<T> {
             if raw.len() as u32 != entry.len {
                 return Err(invalid_data(format!("chunk {:x} length mismatch", entry.digest)));
             }
-            if digest_of(&raw) != entry.digest {
+            if Hasher::new().part(&raw).digest() != entry.digest {
                 return Err(invalid_data(format!(
                     "chunk {:x} content digest mismatch",
                     entry.digest
@@ -199,6 +165,36 @@ impl<T: Backend> Storage<T> {
             w.write_all(&raw).await?;
         }
         Ok(true)
+    }
+}
+
+impl<T: blob::Exists + blob::Get + blob::Put> Storage<T> {
+    /// Write one entry under `key`, skipping the encode step entirely
+    /// if `key` is already stored.
+    async fn save(&self, key: Digest, bytes: Vec<u8>, flags: Flags) -> io::Result<()> {
+        if self.backend.contains_blob(key).await? {
+            return Ok(());
+        }
+        let encoder = self.encoding;
+
+        // Encoding runs in its own `spawn_blocking`, independent of however
+        // the backend chooses to run `put_blob` itself: it's CPU-bound work
+        // that always needs to stay off the async executor, regardless of
+        // which backend `S` is.
+        let encoded = task::spawn_blocking(move || encoder.encode(flags, bytes))
+            .await
+            .expect("encode should not panic");
+        self.backend.put_blob(key, Bytes::from(encoded)).await
+    }
+
+    /// Store `content`, addressed by its own digest, and return that
+    /// digest. A thin wrapper over `copy_from`, over the already
+    /// in-memory bytes.
+    pub async fn put<B: ToBytes>(&self, content: &B) -> io::Result<Digest> {
+        let bytes =
+            content.to_bytes().unwrap_or_else(|_| panic!("serializing to bytes should not fail"));
+        let len = bytes.len() as u64;
+        self.copy_from(len, &mut io::Cursor::new(bytes)).await
     }
 
     /// Store the content read from `r` of `len` bytes, addressed by its own
@@ -238,7 +234,7 @@ impl<T: Backend> Storage<T> {
         while let Some(chunk) = chunks.next().await {
             let chunk = chunk?;
             total += chunk.length as u64;
-            let digest = digest_of(&chunk.data);
+            let digest = Hasher::new().part(&chunk.data).digest();
             manifest.put_slice(digest.as_ref());
             manifest.put_u32(chunk.length as u32);
             chunk_digests.part(digest.as_ref());
@@ -265,7 +261,7 @@ impl<T: Backend> Storage<T> {
             // A blob digest always needs at least one chunk digest to hash
             // over, so treat empty content as exactly one (empty) chunk instead.
             // Falls through to the single-chunk shortcut below.
-            let digest = digest_of(&[]);
+            let digest = Hasher::new().part([]).digest();
             manifest.put_slice(digest.as_ref());
             manifest.put_u32(0);
             last_digest = Some(digest);
@@ -518,14 +514,6 @@ fn decode_manifest(bytes: &[u8]) -> io::Result<Vec<ChunkRef>> {
         manifest.push(ChunkRef { digest: Digest::new(digest), len: buf.get_u32() });
     }
     Ok(manifest)
-}
-
-/// This chunk's digest: the same length-prefixed single-part framing
-/// `Hasher` uses everywhere else.
-pub(super) fn digest_of(chunk: &[u8]) -> Digest {
-    let mut h = Hasher::new();
-    h.part(chunk);
-    h.digest()
 }
 
 fn invalid_data(msg: impl Into<String>) -> io::Error {
