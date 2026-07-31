@@ -7,9 +7,9 @@ pub fn digest_bytes(bytes: &[u8]) -> cas::Digest {
     h.digest()
 }
 
-pub fn store() -> (testing::TempDir, ply::Store) {
+pub fn store() -> (testing::TempDir, ply::Repository) {
     let dir = testing::tempdir();
-    let store = ply::Store::open(dir.path(), 16 * 1024 * 1024).unwrap();
+    let store = ply::Repository::open(dir.path(), 16 * 1024 * 1024).unwrap();
     (dir, store)
 }
 

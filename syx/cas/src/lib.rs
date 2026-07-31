@@ -8,11 +8,8 @@ pub use hash::{
     ToBytes,
     digest,
 };
-pub use storage::{
-    Reader,
-    Storage,
-    Writer,
-};
+pub use storage::Storage;
 
+pub mod blob;
 mod hash;
 mod storage;

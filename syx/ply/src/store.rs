@@ -1,16 +1,12 @@
-//! A fjall-backed `cas::Reader`/`cas::Writer`, and `ply`'s content-addressed store.
+//! A fjall-backed `cas::blob::{Exists, Get, Put}`.
 
 use std::io;
 use std::path::Path;
 
 use cas::Bytes;
-use tokio::io::{
-    AsyncRead,
-    AsyncWrite,
-};
 use tokio::task;
 
-/// A content-addressed store mapping `Digest` keys to blob content.
+/// The fjall-backed blob backend behind `Repository`.
 ///
 /// TODO: no GC yet. A blob's manifest is always written after all the
 /// chunks it references, so the only state a crash (or a reader racing
@@ -26,13 +22,13 @@ use tokio::task;
 // - groupcache-style cache sync between `Store` peers.
 // - Durability sync to a remote backend (e.g. S3).
 #[derive(Clone)]
-pub struct Store {
+pub(crate) struct Store {
     // Not read after construction for now.
     _db: fjall::Database,
     cas: fjall::Keyspace,
 }
 
-impl cas::Reader for Store {
+impl cas::blob::Exists for Store {
     // fjall's own API is blocking, so each method hops onto the
     // blocking pool itself -- `cas`'s generic algorithms no longer
     // impose that on every backend.
@@ -43,7 +39,9 @@ impl cas::Reader for Store {
             .await
             .expect("blocking task should not panic")
     }
+}
 
+impl cas::blob::Get for Store {
     async fn get_blob(&self, key: cas::Digest) -> io::Result<Option<Bytes>> {
         let cas = self.cas.clone();
         task::spawn_blocking(move || Ok(cas.get(key).map_err(fjall_to_io)?.map(Bytes::from)))
@@ -52,7 +50,7 @@ impl cas::Reader for Store {
     }
 }
 
-impl cas::Writer for Store {
+impl cas::blob::Put for Store {
     async fn put_blob(&self, key: cas::Digest, bytes: Bytes) -> io::Result<()> {
         let cas = self.cas.clone();
         task::spawn_blocking(move || cas.insert(key.as_ref(), bytes).map_err(fjall_to_io))
@@ -65,7 +63,7 @@ impl Store {
     const CAS_KEYSPACE: &str = "cas";
 
     /// Open a store at `root`, creating it if it doesn't already exist.
-    pub fn open(root: impl AsRef<Path>, cache_bytes: u64) -> io::Result<Self> {
+    pub(crate) fn open(root: impl AsRef<Path>, cache_bytes: u64) -> io::Result<Self> {
         let db = fjall::Database::builder(root)
             // The block cache capacity should be ~20-25% of the available memory
             // - or more if the data set fully fits into memory.
@@ -95,36 +93,6 @@ impl Store {
             })
             .map_err(fjall_to_io)?;
         Ok(Store { _db: db, cas })
-    }
-
-    /// Reads the content at `digest`, if present.
-    pub async fn get<T: cas::FromBytes>(&self, digest: &cas::Digest) -> io::Result<Option<T>> {
-        cas::Storage::new(self).get(digest).await
-    }
-
-    /// Reads the content at `digest` if present and write it to `w`.
-    ///
-    /// `get` is the better choice for values small enough that this doesn't matter.
-    pub async fn read_into<W>(&self, digest: &cas::Digest, w: &mut W) -> io::Result<bool>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        cas::Storage::new(self).read_into(digest, w).await
-    }
-
-    /// Store `content`, addressed by its own digest, and return that
-    /// digest. A thin wrapper over `copy_from`.
-    pub async fn put<T: cas::ToBytes>(&self, content: &T) -> io::Result<cas::Digest> {
-        cas::Storage::new(self).put(content).await
-    }
-
-    /// Store the content read from `r` of `len` bytes, addressed by its
-    /// own digest.
-    pub async fn copy_from<R>(&self, len: u64, r: &mut R) -> io::Result<cas::Digest>
-    where
-        R: AsyncRead + Unpin,
-    {
-        cas::Storage::new(self).copy_from(len, r).await
     }
 }
 

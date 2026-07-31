@@ -14,24 +14,27 @@ use tokio::{
     task,
 };
 
+use super::blob::Put as _;
 use super::*;
 use crate::hash::Hasher;
 
-/// An in-memory `Reader`/`Writer`.
+/// An in-memory backend.
 #[derive(Clone, Default)]
 struct MemBackend(Arc<Mutex<HashMap<Digest, Bytes>>>);
 
-impl Reader for MemBackend {
+impl blob::Exists for MemBackend {
     async fn contains_blob(&self, key: Digest) -> io::Result<bool> {
         Ok(self.0.lock().unwrap().contains_key(&key))
     }
+}
 
+impl blob::Get for MemBackend {
     async fn get_blob(&self, key: Digest) -> io::Result<Option<Bytes>> {
         Ok(self.0.lock().unwrap().get(&key).cloned())
     }
 }
 
-impl Writer for MemBackend {
+impl blob::Put for MemBackend {
     async fn put_blob(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
         self.0.lock().unwrap().insert(key, bytes);
         Ok(())
@@ -52,7 +55,7 @@ impl MemBackend {
     }
 }
 
-/// A filesystem-backed `Reader`/`Writer`.
+/// A filesystem-backed backend.
 /// Owns its own `TempDir` directly, so a test using it
 /// doesn't need to separately keep one alive.
 struct TmpBackend(testing::TempDir);
@@ -76,11 +79,13 @@ impl TmpBackend {
     }
 }
 
-impl Reader for TmpBackend {
+impl blob::Exists for TmpBackend {
     async fn contains_blob(&self, key: Digest) -> io::Result<bool> {
         fs::try_exists(self.path(key)).await
     }
+}
 
+impl blob::Get for TmpBackend {
     async fn get_blob(&self, key: Digest) -> io::Result<Option<Bytes>> {
         match fs::read(self.path(key)).await {
             Ok(bytes) => Ok(Some(Bytes::from(bytes))),
@@ -90,7 +95,7 @@ impl Reader for TmpBackend {
     }
 }
 
-impl Writer for TmpBackend {
+impl blob::Put for TmpBackend {
     async fn put_blob(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
         let path = self.path(key);
         // Sharding means the shard directory may not exist yet.
@@ -189,7 +194,7 @@ async fn a_single_chunks_digest_is_the_content_digest_not_a_wrapped_one() {
     // are keyed by the exact same digest. Runs against both backends,
     // since this is a property of `cas`'s own digest scheme, not of
     // whichever backend happens to be behind it.
-    async fn check(storage: impl Reader + Writer) {
+    async fn check(storage: impl blob::Exists + blob::Get + blob::Put) {
         let content = testing::random_bytes(4096); // well under CHUNK_MIN_SIZE
         let content_digest = digest_of(&content);
         let d = Storage::new(&storage).put(&Bytes::from(content)).await.unwrap();
@@ -218,13 +223,16 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
     };
 
     // How many keys after putting `blob`.
-    async fn count_keys(storage: impl Reader + Writer + CountEntries, blob: Bytes) -> usize {
+    async fn count_keys(
+        storage: impl blob::Exists + blob::Get + blob::Put + CountEntries,
+        blob: Bytes,
+    ) -> usize {
         Storage::new(&storage).put(&blob).await.unwrap();
         storage.count()
     }
 
     async fn check(
-        storage: impl Reader + Writer + CountEntries,
+        storage: impl blob::Exists + blob::Get + blob::Put + CountEntries,
         blob_a: &Bytes,
         blob_b: &Bytes,
         baseline: usize,
@@ -255,7 +263,7 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
 
 #[tokio::test]
 async fn get_returns_invalid_data_for_tampered_content() {
-    async fn check(storage: impl Reader + Writer) {
+    async fn check(storage: impl blob::Exists + blob::Get + blob::Put) {
         let cas = Storage::new(&storage);
         let d = cas.put(&Bytes::from_static(b"hello")).await.unwrap();
 
@@ -291,7 +299,7 @@ async fn get_returns_invalid_data_for_a_tampered_chunk() {
 
 #[tokio::test]
 async fn read_into_returns_invalid_data_for_tampered_content() {
-    async fn check(storage: impl Reader + Writer) {
+    async fn check(storage: impl blob::Exists + blob::Get + blob::Put) {
         let cas = Storage::new(&storage);
         let d = cas.put(&Bytes::from_static(b"hello")).await.unwrap();
 
@@ -327,7 +335,7 @@ async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
 
 #[tokio::test]
 async fn get_returns_invalid_data_for_a_tampered_manifest() {
-    async fn check(storage: impl Reader + Writer) {
+    async fn check(storage: impl blob::Exists + blob::Get + blob::Put) {
         let content = testing::random_bytes(defaults::CHUNK_MAX_SIZE * 2);
         let cas = Storage::new(&storage);
         let d = cas.put(&Bytes::from(content)).await.unwrap();
@@ -345,7 +353,7 @@ async fn get_returns_invalid_data_for_a_tampered_manifest() {
 
 #[tokio::test]
 async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
-    async fn check(storage: impl Reader + Writer) {
+    async fn check(storage: impl blob::Exists + blob::Get + blob::Put) {
         let (present_digest, present_raw) = (digest_of(b"present"), b"present".to_vec());
         storage
             .put_blob(present_digest, Bytes::from(encode(Flags::empty(), present_raw.clone())))

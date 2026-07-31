@@ -1,4 +1,4 @@
-//! Operations over blobs, bound to one `Reader`/`Writer` pair.
+//! Operations over blobs, bound to one backend implementing `blob::{Exists, Get, Put}`.
 use std::io;
 use std::pin::pin;
 
@@ -18,6 +18,7 @@ use tokio::io::{
 };
 use tokio::task;
 
+use crate::blob;
 use crate::hash::{
     Digest,
     FromBytes,
@@ -43,6 +44,7 @@ bitflags! {
 
 /// Chunking and encoding on the way in,
 /// decoding and verifying on the way out.
+#[derive(Clone)]
 pub struct Storage<T> {
     backend:  T,
     chunking: Chunking,
@@ -50,32 +52,19 @@ pub struct Storage<T> {
     decoding: Decoding,
 }
 
-/// Fetch bytes by their key, or check whether one is stored.
-pub trait Reader: Sync {
-    /// Whether `key` is already stored, without fetching its value.
-    fn contains_blob(&self, key: Digest) -> impl Future<Output = io::Result<bool>> + Send;
-
-    /// Fetch bytes stored under `key`, if present.
-    fn get_blob(&self, key: Digest) -> impl Future<Output = io::Result<Option<Bytes>>> + Send;
-}
-
-/// Store bytes under a key.
-pub trait Writer: Sync {
-    /// Store `bytes` under `key`.
-    fn put_blob(&self, key: Digest, bytes: Bytes) -> impl Future<Output = io::Result<()>> + Send;
-}
-
-impl<T: Reader> Reader for &T {
+impl<T: blob::Exists> blob::Exists for &T {
     fn contains_blob(&self, key: Digest) -> impl Future<Output = io::Result<bool>> + Send {
         (*self).contains_blob(key)
     }
+}
 
+impl<T: blob::Get> blob::Get for &T {
     fn get_blob(&self, key: Digest) -> impl Future<Output = io::Result<Option<Bytes>>> + Send {
         (*self).get_blob(key)
     }
 }
 
-impl<T: Writer> Writer for &T {
+impl<T: blob::Put> blob::Put for &T {
     fn put_blob(&self, key: Digest, bytes: Bytes) -> impl Future<Output = io::Result<()>> + Send {
         (*self).put_blob(key, bytes)
     }
@@ -93,7 +82,7 @@ impl<T> Storage<T> {
     }
 }
 
-impl<T: Reader> Storage<T> {
+impl<T: blob::Exists + blob::Get> Storage<T> {
     /// Fetch and decode one entry (a chunk or a manifest).
     ///
     /// Callers should check the digest themselves, since what it
@@ -179,7 +168,7 @@ impl<T: Reader> Storage<T> {
     }
 }
 
-impl<T: Reader + Writer> Storage<T> {
+impl<T: blob::Exists + blob::Get + blob::Put> Storage<T> {
     /// Write one entry under `key`, skipping the encode step entirely
     /// if `key` is already stored.
     async fn save(&self, key: Digest, bytes: Vec<u8>, flags: Flags) -> io::Result<()> {
