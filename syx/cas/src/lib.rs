@@ -6,7 +6,6 @@ pub use hash::{
     FromBytes,
     Hasher,
     ToBytes,
-    digest,
 };
 pub use storage::Storage;
 

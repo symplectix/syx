@@ -4,10 +4,7 @@
 mod common;
 use std::io;
 
-use common::{
-    digest_bytes,
-    store,
-};
+use common::store;
 
 #[tokio::test]
 async fn read_into_writes_small_content() {
@@ -48,7 +45,7 @@ async fn read_into_matches_get_for_the_same_digest() {
 #[tokio::test]
 async fn read_into_returns_false_for_a_missing_digest() {
     let (_dir, store) = store();
-    let missing = digest_bytes(b"never stored");
+    let missing = cas_testing::digest_bytes(b"never stored");
 
     let mut out = Vec::new();
     let found = store.read_into(&missing, &mut out).await.unwrap();

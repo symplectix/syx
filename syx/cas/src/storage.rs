@@ -123,7 +123,7 @@ impl<T: blob::Exists + blob::Get> Storage<T> {
         };
 
         if !flags.contains(Flags::MANIFEST) {
-            if digest_of(&decoded) != *digest {
+            if Hasher::new().part(&decoded).digest() != *digest {
                 return Err(invalid_data("direct content digest mismatch"));
             }
             w.write_all(&decoded).await?;
@@ -156,7 +156,7 @@ impl<T: blob::Exists + blob::Get> Storage<T> {
             if raw.len() as u32 != entry.len {
                 return Err(invalid_data(format!("chunk {:x} length mismatch", entry.digest)));
             }
-            if digest_of(&raw) != entry.digest {
+            if Hasher::new().part(&raw).digest() != entry.digest {
                 return Err(invalid_data(format!(
                     "chunk {:x} content digest mismatch",
                     entry.digest
@@ -234,7 +234,7 @@ impl<T: blob::Exists + blob::Get + blob::Put> Storage<T> {
         while let Some(chunk) = chunks.next().await {
             let chunk = chunk?;
             total += chunk.length as u64;
-            let digest = digest_of(&chunk.data);
+            let digest = Hasher::new().part(&chunk.data).digest();
             manifest.put_slice(digest.as_ref());
             manifest.put_u32(chunk.length as u32);
             chunk_digests.part(digest.as_ref());
@@ -261,7 +261,7 @@ impl<T: blob::Exists + blob::Get + blob::Put> Storage<T> {
             // A blob digest always needs at least one chunk digest to hash
             // over, so treat empty content as exactly one (empty) chunk instead.
             // Falls through to the single-chunk shortcut below.
-            let digest = digest_of(&[]);
+            let digest = Hasher::new().part([]).digest();
             manifest.put_slice(digest.as_ref());
             manifest.put_u32(0);
             last_digest = Some(digest);
@@ -514,14 +514,6 @@ fn decode_manifest(bytes: &[u8]) -> io::Result<Vec<ChunkRef>> {
         manifest.push(ChunkRef { digest: Digest::new(digest), len: buf.get_u32() });
     }
     Ok(manifest)
-}
-
-/// This chunk's digest: the same length-prefixed single-part framing
-/// `Hasher` uses everywhere else.
-pub(super) fn digest_of(chunk: &[u8]) -> Digest {
-    let mut h = Hasher::new();
-    h.part(chunk);
-    h.digest()
 }
 
 fn invalid_data(msg: impl Into<String>) -> io::Error {

@@ -30,6 +30,7 @@ rust.test_suite(
     deps = [
         ":func",
         "//syx/cas",
+        "//syx/cas_testing",
         "//syx/ply",
         "//syx/testing",
         "@crates//:tokio",

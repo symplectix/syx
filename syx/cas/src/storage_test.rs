@@ -196,7 +196,7 @@ async fn a_single_chunks_digest_is_the_content_digest_not_a_wrapped_one() {
     // whichever backend happens to be behind it.
     async fn check(storage: impl blob::Exists + blob::Get + blob::Put) {
         let content = testing::random_bytes(4096); // well under CHUNK_MIN_SIZE
-        let content_digest = digest_of(&content);
+        let content_digest = Hasher::new().part(&content).digest();
         let d = Storage::new(&storage).put(&Bytes::from(content)).await.unwrap();
         assert_eq!(d, content_digest);
     }
@@ -354,12 +354,13 @@ async fn get_returns_invalid_data_for_a_tampered_manifest() {
 #[tokio::test]
 async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
     async fn check(storage: impl blob::Exists + blob::Get + blob::Put) {
-        let (present_digest, present_raw) = (digest_of(b"present"), b"present".to_vec());
+        let (present_digest, present_raw) =
+            (Hasher::new().part(b"present").digest(), b"present".to_vec());
         storage
             .put_blob(present_digest, Bytes::from(encode(Flags::empty(), present_raw.clone())))
             .await
             .unwrap();
-        let missing_digest = digest_of(b"never written");
+        let missing_digest = Hasher::new().part(b"never written").digest();
 
         let mut manifest = Vec::new();
         manifest.put_slice(present_digest.as_ref());
