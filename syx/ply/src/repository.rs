@@ -8,18 +8,16 @@ use tokio::io::{
     AsyncWrite,
 };
 
-use crate::store::Store;
-
 /// ply's content-addressed store.
 #[derive(Clone)]
 pub struct Repository {
-    cas: cas::Storage<Store>,
+    cas: cas::Storage<cas_fjall::Store>,
 }
 
 impl Repository {
     /// Open a store at `root`, creating it if it doesn't already exist.
     pub fn open(root: impl AsRef<Path>, cache_bytes: u64) -> io::Result<Self> {
-        Ok(Self { cas: cas::Storage::new(Store::open(root, cache_bytes)?) })
+        Ok(Self { cas: cas::Storage::new(cas_fjall::Store::open(root, cache_bytes)?) })
     }
 
     /// Reads the content at `digest`, if present.

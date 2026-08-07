@@ -1,0 +1,28 @@
+load("//bazel:rust.bzl", "rust")
+
+rust.library(
+    name = "cas_object_store",
+    srcs = [
+        "src/adapter.rs",
+        "src/lib.rs",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//syx/cas",
+        "@crates//:object_store",
+    ],
+)
+
+rust.test_suite(
+    name = "cas_object_store_test_suite",
+    size = "small",
+    srcs = ["tests/adapter.rs"],
+    data = ["//:.rustfmt.toml"],
+    deps = [
+        ":cas_object_store",
+        "//syx/cas",
+        "//syx/cas_testing",
+        "@crates//:object_store",
+        "@crates//:tokio",
+    ],
+)

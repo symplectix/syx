@@ -6,7 +6,7 @@ use std::path::Path;
 use cas::Bytes;
 use tokio::task;
 
-/// The fjall-backed blob backend behind `Repository`.
+/// A fjall-backed blob store.
 ///
 /// TODO: no GC yet. A blob's manifest is always written after all the
 /// chunks it references, so the only state a crash (or a reader racing
@@ -14,15 +14,8 @@ use tokio::task;
 /// any manifest -- safe to eventually sweep, never a manifest pointing
 /// at missing data. GC roots are expected to come from outside this
 /// crate (e.g. a log of which digests are still in use).
-// TODO: support more operations
-// - A gRPC service exposing `Store` via REAPI protos like:
-//   - `bytestream.ByteStream.Read` for ranged blob reads
-//   - `ContentAddressableStorage.GetTree` for tree structure
-// - Explicit CLI-driven blob handling.
-// - groupcache-style cache sync between `Store` peers.
-// - Durability sync to a remote backend (e.g. S3).
 #[derive(Clone)]
-pub(crate) struct Store {
+pub struct Store {
     // Not read after construction for now.
     _db: fjall::Database,
     cas: fjall::Keyspace,
@@ -63,7 +56,7 @@ impl Store {
     const CAS_KEYSPACE: &str = "cas";
 
     /// Open a store at `root`, creating it if it doesn't already exist.
-    pub(crate) fn open(root: impl AsRef<Path>, cache_bytes: u64) -> io::Result<Self> {
+    pub fn open(root: impl AsRef<Path>, cache_bytes: u64) -> io::Result<Self> {
         let db = fjall::Database::builder(root)
             // The block cache capacity should be ~20-25% of the available memory
             // - or more if the data set fully fits into memory.
