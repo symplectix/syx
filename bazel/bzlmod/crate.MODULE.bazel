@@ -121,6 +121,27 @@ crate.spec(
     version = "3.1",
 )
 
+# LSM-tree storage engine built directly on object storage (S3 etc).
+# "foyer" (a default feature) is excluded: its build.rs reads
+# CARGO_MANIFEST_DIR via the compile-time env!() macro instead of
+# std::env::var(), so the path it bakes in doesn't match the sandbox
+# a Bazel cargo_build_script actually runs in. Fixed upstream
+# (foyer-rs/foyer#1274, merged 2026-02-19) but not yet in a release
+# (last release 0.22.3 predates the merge). Revisit once foyer cuts
+# a new version.
+crate.spec(
+    default_features = False,
+    features = ["aws"],
+    package = "slatedb",
+    version = "0.15",
+)
+
+# Unified async API over object storage backends (S3, GCS, Azure, local fs).
+crate.spec(
+    package = "object_store",
+    version = "0.14",
+)
+
 # Content-defined chunking (variable-size, dedup-friendly).
 crate.spec(
     features = ["tokio"],

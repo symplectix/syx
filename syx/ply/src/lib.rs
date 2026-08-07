@@ -2,7 +2,6 @@
 
 mod blob;
 mod repository;
-mod store;
 
 pub use blob::{
     Node,
