@@ -135,6 +135,12 @@ crate.spec(
     version = "0.14",
 )
 
+# AWS S3 client.
+crate.spec(
+    package = "aws-sdk-s3",
+    version = "1.141",
+)
+
 # Content-defined chunking (variable-size, dedup-friendly).
 crate.spec(
     features = ["tokio"],

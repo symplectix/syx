@@ -80,3 +80,12 @@ http_file(
     sha256 = "b3072c50c3638ec36bcbb32ec3c733f204a314e2578c13630b3f2c79dbe35667",
     urls = ["https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260617-a093a70f7979-0/x86_64/ubuntu-24.04.squashfs"],
 )
+
+# S3-compatible object store server, spawned as a subprocess in tests that
+# need a real remote ObjectStore rather than InMemory/LocalFileSystem.
+http_file(
+    name = "minio_static",
+    executable = True,
+    sha256 = "7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f",
+    urls = ["https://dl.min.io/server/minio/release/linux-amd64/archive/minio.RELEASE.2025-09-07T16-13-09Z"],
+)
