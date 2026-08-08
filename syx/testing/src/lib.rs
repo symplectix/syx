@@ -16,6 +16,8 @@ use rand::RngExt as _;
 use runfiles::Runfiles;
 pub use tempfile::TempDir;
 
+pub mod s3;
+
 /// Absolute path to a private writable directory.
 pub static TMPDIR: Lazy<PathBuf> = Lazy::new(|| {
     env::var("TEST_TMPDIR").map(PathBuf::from).unwrap_or_else(|_var_err| env::temp_dir())

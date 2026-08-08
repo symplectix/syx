@@ -114,13 +114,6 @@ crate.spec(
     version = "0.11",
 )
 
-# Embedded LSM-tree key-value store.
-crate.spec(
-    features = ["bytes_1"],
-    package = "fjall",
-    version = "3.1",
-)
-
 # LSM-tree storage engine built directly on object storage (S3 etc).
 # "foyer" (a default feature) is excluded: its build.rs reads
 # CARGO_MANIFEST_DIR via the compile-time env!() macro instead of
@@ -140,6 +133,12 @@ crate.spec(
 crate.spec(
     package = "object_store",
     version = "0.14",
+)
+
+# AWS S3 client.
+crate.spec(
+    package = "aws-sdk-s3",
+    version = "1.141",
 )
 
 # Content-defined chunking (variable-size, dedup-friendly).

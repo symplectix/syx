@@ -3,7 +3,6 @@ load("//bazel:rust.bzl", "rust")
 rust.library(
     name = "cas",
     srcs = [
-        "src/blob.rs",
         "src/hash.rs",
         "src/lib.rs",
         "src/storage.rs",
@@ -15,6 +14,7 @@ rust.library(
         "@crates//:bytes",
         "@crates//:fastcdc",
         "@crates//:futures",
+        "@crates//:object_store",
         "@crates//:serde",
         "@crates//:serde_bytes",
         "@crates//:sha2",
@@ -27,10 +27,29 @@ rust.test(
     name = "cas_test",
     size = "small",
     crate = ":cas",
-    data = ["//:.rustfmt.toml"],
     deps = [
         "//syx/testing",
+        "@crates//:object_store",
         "@crates//:tempfile",
+        "@crates//:tokio",
+    ],
+)
+
+rust.test(
+    name = "cas_remote_object_store_test",
+    size = "small",
+    srcs = ["tests/remote_object_store.rs"],
+    data = ["@minio_static//file"],
+    # The minio_static runfile is a static Linux/amd64 binary.
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    deps = [
+        ":cas",
+        "//syx/testing",
+        "@crates//:aws-sdk-s3",
+        "@crates//:object_store",
         "@crates//:tokio",
     ],
 )
@@ -43,7 +62,6 @@ rust.test_suite(
         "tests/digest_is_deterministic.rs",
         "tests/digest_is_sensitive.rs",
     ],
-    data = ["//:.rustfmt.toml"],
     shared_srcs = ["tests/common/mod.rs"],
     deps = [
         ":cas",

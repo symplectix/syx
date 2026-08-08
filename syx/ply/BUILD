@@ -11,7 +11,6 @@ rust.library(
     visibility = ["//visibility:public"],
     deps = [
         "//syx/cas",
-        "//syx/cas_fjall",
         "@crates//:cbor2",
         "@crates//:serde",
         "@crates//:tokio",
@@ -41,6 +40,7 @@ rust.test_suite(
         "//syx/cas",
         "//syx/cas_testing",
         "//syx/testing",
+        "@crates//:object_store",
         "@crates//:tokio",
     ],
 )

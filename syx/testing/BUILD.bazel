@@ -3,7 +3,10 @@ load("//bazel:rust.bzl", "rust")
 rust.library(
     name = "testing",
     testonly = True,
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/lib.rs",
+        "src/s3.rs",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         "@crates//:rand",
