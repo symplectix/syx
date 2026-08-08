@@ -3,7 +3,6 @@ load("//bazel:rust.bzl", "rust")
 rust.library(
     name = "cas",
     srcs = [
-        "src/blob.rs",
         "src/hash.rs",
         "src/lib.rs",
         "src/storage.rs",
@@ -15,6 +14,7 @@ rust.library(
         "@crates//:bytes",
         "@crates//:fastcdc",
         "@crates//:futures",
+        "@crates//:object_store",
         "@crates//:serde",
         "@crates//:serde_bytes",
         "@crates//:sha2",
@@ -30,6 +30,7 @@ rust.test(
     data = ["//:.rustfmt.toml"],
     deps = [
         "//syx/testing",
+        "@crates//:object_store",
         "@crates//:tempfile",
         "@crates//:tokio",
     ],

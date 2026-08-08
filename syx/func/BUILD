@@ -33,6 +33,7 @@ rust.test_suite(
         "//syx/cas_testing",
         "//syx/ply",
         "//syx/testing",
+        "@crates//:object_store",
         "@crates//:tokio",
     ],
 )

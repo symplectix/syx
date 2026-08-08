@@ -9,6 +9,5 @@ pub use hash::{
 };
 pub use storage::Storage;
 
-pub mod blob;
 mod hash;
 mod storage;

@@ -1,7 +1,6 @@
 //! `Repository`: ply's content-addressed store.
 
 use std::io;
-use std::path::Path;
 
 use tokio::io::{
     AsyncRead,
@@ -11,13 +10,13 @@ use tokio::io::{
 /// ply's content-addressed store.
 #[derive(Clone)]
 pub struct Repository {
-    cas: cas::Storage<cas_fjall::Store>,
+    cas: cas::Storage,
 }
 
 impl Repository {
-    /// Open a store at `root`, creating it if it doesn't already exist.
-    pub fn open(root: impl AsRef<Path>, cache_bytes: u64) -> io::Result<Self> {
-        Ok(Self { cas: cas::Storage::new(cas_fjall::Store::open(root, cache_bytes)?) })
+    /// Wraps `cas`.
+    pub const fn new(cas: cas::Storage) -> Self {
+        Self { cas }
     }
 
     /// Reads the content at `digest`, if present.
