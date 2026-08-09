@@ -18,6 +18,7 @@ rust.library(
         "@crates//:serde",
         "@crates//:serde_bytes",
         "@crates//:sha2",
+        "@crates//:slatedb",
         "@crates//:tokio",
         "@crates//:zstd",
     ],
@@ -30,6 +31,7 @@ rust.test(
     deps = [
         "//syx/testing",
         "@crates//:object_store",
+        "@crates//:slatedb",
         "@crates//:tempfile",
         "@crates//:tokio",
     ],
@@ -50,6 +52,21 @@ rust.test(
         "//syx/testing",
         "@crates//:aws-sdk-s3",
         "@crates//:object_store",
+        "@crates//:slatedb",
+        "@crates//:tokio",
+    ],
+)
+
+rust.test(
+    name = "cas_packing_storage_test",
+    size = "small",
+    srcs = ["tests/packing_storage.rs"],
+    deps = [
+        ":cas",
+        "//syx/testing",
+        "@crates//:futures",
+        "@crates//:object_store",
+        "@crates//:slatedb",
         "@crates//:tokio",
     ],
 )

@@ -5,7 +5,7 @@ use common::store;
 
 #[tokio::test]
 async fn get_missing_digest_is_none() {
-    let (_dir, store) = store();
+    let (_dir, store) = store().await;
     assert_eq!(
         store.get::<cas::Bytes>(&cas_testing::digest_bytes(b"missing")).await.unwrap(),
         None

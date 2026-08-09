@@ -3,13 +3,22 @@
 
 use std::sync::Arc;
 
+use object_store::ObjectStore;
+use slatedb::Db;
+
 pub fn command(program: &str, args: &[&str]) -> func::Command {
     func::Command::new(program).args(args)
 }
 
-pub fn store() -> (testing::TempDir, ply::Repository) {
+pub async fn store() -> (testing::TempDir, ply::Repository) {
     let dir = testing::tempdir();
-    let backend = object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap();
-    let store = ply::Repository::new(cas::Storage::new(Arc::new(backend)));
+    let backend: Arc<dyn ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let db = Db::builder("test", backend.clone())
+        .with_merge_operator(cas::Storage::merge_operator())
+        .build()
+        .await
+        .unwrap();
+    let store = ply::Repository::new(cas::Storage::new(db, "p/", backend, 1024 * 1024));
     (dir, store)
 }

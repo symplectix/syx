@@ -4,10 +4,10 @@ use bytes::{
     BufMut,
     Bytes,
 };
-use futures::StreamExt as _;
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
+use slatedb::Db;
 
 use super::*;
 use crate::hash::Hasher;
@@ -24,9 +24,16 @@ fn local_fs() -> (testing::TempDir, Arc<dyn ObjectStore>) {
     (tmp, backend)
 }
 
-/// How many objects `backend` currently stores.
-async fn count_entries(backend: &Arc<dyn ObjectStore>) -> usize {
-    backend.list(None).count().await
+/// A `Storage` writing packs to `inner`, staged in its own in-memory
+/// `slatedb` (staging durability isn't what these tests are about;
+/// `inner` is the backend variety under test).
+async fn packing(inner: Arc<dyn ObjectStore>) -> Storage {
+    let db = Db::builder("test", Arc::new(InMemory::new()) as Arc<dyn ObjectStore>)
+        .with_merge_operator(Storage::merge_operator())
+        .build()
+        .await
+        .unwrap();
+    Storage::new(db, "p/", inner, 1024 * 1024)
 }
 
 /// Some chunk digest referenced by `exclude`'s own manifest, other than
@@ -88,19 +95,19 @@ fn encode_entry_round_trips_through_decode_entry() {
 async fn a_single_chunks_digest_is_the_content_digest_not_a_wrapped_one() {
     // This is what makes a small standalone blob dedup against the
     // same content appearing as one chunk inside a larger blob: both
-    // are keyed by the exact same digest. Runs against both backends,
-    // since this is a property of `cas`'s own digest scheme, not of
-    // whichever backend happens to be behind it.
-    async fn check(backend: Arc<dyn ObjectStore>) {
+    // are keyed by the exact same digest. Runs against both inner
+    // object stores, since this is a property of `cas`'s own digest
+    // scheme, not of whichever store happens to be holding the packs.
+    async fn check(cas: Storage) {
         let content = testing::random_bytes(4096); // well under CHUNK_MIN_SIZE
         let content_digest = Hasher::new().part(&content).digest();
-        let d = Storage::new(backend).put(&Bytes::from(content)).await.unwrap();
+        let d = cas.put(&Bytes::from(content)).await.unwrap();
         assert_eq!(d, content_digest);
     }
 
-    check(in_memory()).await;
-    let (_tmp, backend) = local_fs();
-    check(backend).await;
+    check(packing(in_memory()).await).await;
+    let (_tmp, inner) = local_fs();
+    check(packing(inner).await).await;
 }
 
 #[tokio::test]
@@ -121,17 +128,16 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
     };
 
     // How many keys after putting `blob`.
-    async fn count_keys(backend: Arc<dyn ObjectStore>, blob: Bytes) -> usize {
-        Storage::new(backend.clone()).put(&blob).await.unwrap();
-        count_entries(&backend).await
+    async fn count_keys(cas: Storage, blob: Bytes) -> usize {
+        cas.put(&blob).await.unwrap();
+        cas.entry_count().await.unwrap()
     }
 
-    async fn check(backend: Arc<dyn ObjectStore>, blob_a: &Bytes, blob_b: &Bytes, baseline: usize) {
-        let cas = Storage::new(backend.clone());
+    async fn check(cas: Storage, blob_a: &Bytes, blob_b: &Bytes, baseline: usize) {
         cas.put(blob_a).await.unwrap();
-        let count_before = count_entries(&backend).await;
+        let count_before = cas.entry_count().await.unwrap();
         cas.put(blob_b).await.unwrap();
-        let count_after = count_entries(&backend).await;
+        let count_after = cas.entry_count().await.unwrap();
 
         let new_keys = count_after - count_before;
         assert!(
@@ -141,50 +147,48 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
         );
     }
 
-    let mem_keys = count_keys(in_memory(), blob_b.clone()).await;
-    let (_tmp, tmp_backend) = local_fs();
-    let tmp_keys = count_keys(tmp_backend, blob_b.clone()).await;
+    let mem_keys = count_keys(packing(in_memory()).await, blob_b.clone()).await;
+    let (_tmp, inner) = local_fs();
+    let tmp_keys = count_keys(packing(inner).await, blob_b.clone()).await;
     // The baseline is a property of blob_b's content and cas's chunking,
     // not of which backend computed it.
     assert_eq!(mem_keys, tmp_keys);
 
-    check(in_memory(), &blob_a, &blob_b, mem_keys).await;
-    let (_tmp, tmp_backend) = local_fs();
-    check(tmp_backend, &blob_a, &blob_b, tmp_keys).await;
+    check(packing(in_memory()).await, &blob_a, &blob_b, mem_keys).await;
+    let (_tmp, inner) = local_fs();
+    check(packing(inner).await, &blob_a, &blob_b, tmp_keys).await;
 }
 
 #[tokio::test]
 async fn get_returns_invalid_data_for_tampered_content() {
-    async fn check(backend: Arc<dyn ObjectStore>) {
-        let cas = Storage::new(backend.clone());
+    async fn check(cas: Storage) {
         let d = cas.put(&Bytes::from_static(b"hello")).await.unwrap();
 
         // Overwrite the stored bytes with content that doesn't hash
         // back to `d`, simulating corruption.
         let tampered = encode(Flags::empty(), b"not hello".to_vec());
-        backend.put(&path(d), Bytes::from(tampered).into()).await.unwrap();
+        cas.put_blob(d, Bytes::from(tampered)).await.unwrap();
 
         let err = cas.get::<Bytes>(&d).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    check(in_memory()).await;
-    let (_tmp, backend) = local_fs();
-    check(backend).await;
+    check(packing(in_memory()).await).await;
+    let (_tmp, inner) = local_fs();
+    check(packing(inner).await).await;
 }
 
 #[tokio::test]
 async fn get_returns_invalid_data_for_a_tampered_chunk() {
     // Needs a real (non-manifest) key to target, so this one stays
     // `in_memory`-only rather than being generalized over the backend.
-    let backend = in_memory();
+    let cas = packing(in_memory()).await;
     let content = testing::random_bytes(defaults::CHUNK_MAX_SIZE * 2);
-    let cas = Storage::new(backend.clone());
     let d = cas.put(&Bytes::from(content)).await.unwrap();
 
     let chunk_key = any_key_except(&cas, d).await;
     let tampered = encode(Flags::empty(), b"tampered chunk content".to_vec());
-    backend.put(&path(chunk_key), Bytes::from(tampered).into()).await.unwrap();
+    cas.put_blob(chunk_key, Bytes::from(tampered)).await.unwrap();
 
     let err = cas.get::<Bytes>(&d).await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -192,35 +196,33 @@ async fn get_returns_invalid_data_for_a_tampered_chunk() {
 
 #[tokio::test]
 async fn read_into_returns_invalid_data_for_tampered_content() {
-    async fn check(backend: Arc<dyn ObjectStore>) {
-        let cas = Storage::new(backend.clone());
+    async fn check(cas: Storage) {
         let d = cas.put(&Bytes::from_static(b"hello")).await.unwrap();
 
         let tampered = encode(Flags::empty(), b"not hello".to_vec());
-        backend.put(&path(d), Bytes::from(tampered).into()).await.unwrap();
+        cas.put_blob(d, Bytes::from(tampered)).await.unwrap();
 
         let mut out = Vec::new();
         let err = cas.read_into(&d, &mut out).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    check(in_memory()).await;
-    let (_tmp, backend) = local_fs();
-    check(backend).await;
+    check(packing(in_memory()).await).await;
+    let (_tmp, inner) = local_fs();
+    check(packing(inner).await).await;
 }
 
 #[tokio::test]
 async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
     // Needs a real (non-manifest) key to target, so this one stays
     // `in_memory`-only rather than being generalized over the backend.
-    let backend = in_memory();
+    let cas = packing(in_memory()).await;
     let content = testing::random_bytes(defaults::CHUNK_MAX_SIZE * 2);
-    let cas = Storage::new(backend.clone());
     let d = cas.put(&Bytes::from(content)).await.unwrap();
 
     let chunk_key = any_key_except(&cas, d).await;
     let tampered = encode(Flags::empty(), b"tampered chunk content".to_vec());
-    backend.put(&path(chunk_key), Bytes::from(tampered).into()).await.unwrap();
+    cas.put_blob(chunk_key, Bytes::from(tampered)).await.unwrap();
 
     let mut out = Vec::new();
     let err = cas.read_into(&d, &mut out).await.unwrap_err();
@@ -229,33 +231,28 @@ async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
 
 #[tokio::test]
 async fn get_returns_invalid_data_for_a_tampered_manifest() {
-    async fn check(backend: Arc<dyn ObjectStore>) {
+    async fn check(cas: Storage) {
         let content = testing::random_bytes(defaults::CHUNK_MAX_SIZE * 2);
-        let cas = Storage::new(backend.clone());
         let d = cas.put(&Bytes::from(content)).await.unwrap();
 
         let tampered = encode(Flags::MANIFEST, b"not a valid manifest body".to_vec());
-        backend.put(&path(d), Bytes::from(tampered).into()).await.unwrap();
+        cas.put_blob(d, Bytes::from(tampered)).await.unwrap();
 
         let err = cas.get::<Bytes>(&d).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    check(in_memory()).await;
-    let (_tmp, backend) = local_fs();
-    check(backend).await;
+    check(packing(in_memory()).await).await;
+    let (_tmp, inner) = local_fs();
+    check(packing(inner).await).await;
 }
 
 #[tokio::test]
 async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
-    async fn check(backend: Arc<dyn ObjectStore>) {
+    async fn check(cas: Storage) {
         let (present_digest, present_raw) =
             (Hasher::new().part(b"present").digest(), b"present".to_vec());
-        backend
-            .put(
-                &path(present_digest),
-                Bytes::from(encode(Flags::empty(), present_raw.clone())).into(),
-            )
+        cas.put_blob(present_digest, Bytes::from(encode(Flags::empty(), present_raw.clone())))
             .await
             .unwrap();
         let missing_digest = Hasher::new().part(b"never written").digest();
@@ -271,16 +268,13 @@ async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
             h.parts([present_digest.as_ref(), missing_digest.as_ref()]);
             h.digest()
         };
-        backend
-            .put(&path(blob_digest), Bytes::from(encode(Flags::MANIFEST, manifest)).into())
-            .await
-            .unwrap();
+        cas.put_blob(blob_digest, Bytes::from(encode(Flags::MANIFEST, manifest))).await.unwrap();
 
-        let err = Storage::new(backend.clone()).get::<Bytes>(&blob_digest).await.unwrap_err();
+        let err = cas.get::<Bytes>(&blob_digest).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    check(in_memory()).await;
-    let (_tmp, backend) = local_fs();
-    check(backend).await;
+    check(packing(in_memory()).await).await;
+    let (_tmp, inner) = local_fs();
+    check(packing(inner).await).await;
 }

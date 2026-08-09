@@ -11,7 +11,7 @@ const LARGE: usize = 5_000_000;
 
 #[tokio::test]
 async fn large_content_via_put_round_trips() {
-    let (_dir, store) = store();
+    let (_dir, store) = store().await;
     let content = testing::random_bytes(LARGE);
     let d = store.put(&cas::Bytes::from(content.clone())).await.unwrap();
     assert_eq!(store.get(&d).await.unwrap(), Some(cas::Bytes::from(content)));
@@ -19,7 +19,7 @@ async fn large_content_via_put_round_trips() {
 
 #[tokio::test]
 async fn large_content_via_copy_from_round_trips() {
-    let (_dir, store) = store();
+    let (_dir, store) = store().await;
     let content = testing::random_bytes(LARGE);
     let mut cursor = std::io::Cursor::new(content.clone());
     let d = store.copy_from(content.len() as u64, &mut cursor).await.unwrap();
@@ -28,7 +28,7 @@ async fn large_content_via_copy_from_round_trips() {
 
 #[tokio::test]
 async fn put_and_copy_from_agree_on_digest_for_large_content() {
-    let (_dir, store) = store();
+    let (_dir, store) = store().await;
     let content = testing::random_bytes(LARGE);
 
     let from_put = store.put(&cas::Bytes::from(content.clone())).await.unwrap();

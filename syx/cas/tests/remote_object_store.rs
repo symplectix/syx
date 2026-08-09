@@ -10,6 +10,8 @@ use aws_sdk_s3::config::{
     Region,
 };
 use object_store::aws::AmazonS3Builder;
+use object_store::memory::InMemory;
+use slatedb::Db;
 use testing::s3;
 
 const BUCKET: &str = "cas-test";
@@ -49,7 +51,13 @@ async fn s3_cas(s3_server: &s3::Server) -> cas::Storage {
         .build()
         .unwrap();
 
-    cas::Storage::new(Arc::new(remote))
+    let db = Db::builder("test", Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>)
+        .with_merge_operator(cas::Storage::merge_operator())
+        .build()
+        .await
+        .unwrap();
+
+    cas::Storage::new(db, "p/", Arc::new(remote), 1024 * 1024)
 }
 
 #[tokio::test]

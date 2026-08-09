@@ -1,5 +1,10 @@
-//! Operations over blobs, backed by an `object_store::ObjectStore`.
+//! Content-addressed blob storage: chunking, encoding and digest framing
+//! on the way in, decoding and verifying on the way out. Blobs are
+//! staged in `slatedb` before being consolidated into pack objects in a
+//! wrapped `object_store::ObjectStore`. See tmp/packfile_c.md for the
+//! packing design rationale.
 use std::io;
+use std::ops::Range;
 use std::pin::pin;
 use std::sync::Arc;
 
@@ -8,16 +13,20 @@ use bytes::{
     Buf,
     BufMut,
     Bytes,
+    BytesMut,
 };
 use fastcdc::v2020;
 use futures::StreamExt as _;
-use object_store::path::{
-    Path as ObjectStorePath,
-    PathPart,
-};
+use object_store::path::Path;
 use object_store::{
+    GetOptions,
     ObjectStore,
     ObjectStoreExt as _,
+};
+use slatedb::{
+    MergeOperator,
+    MergeOperatorError,
+    WriteBatch,
 };
 use tokio::io::{
     AsyncRead,
@@ -50,52 +59,234 @@ bitflags! {
     }
 }
 
-/// Chunking and encoding on the way in,
-/// decoding and verifying on the way out.
+/// Where an entry currently lives.
+enum PackEntry {
+    /// Still staged: the raw bytes themselves.
+    Inline(Bytes),
+    /// Migrated: where to find it in an already-durable pack.
+    Packed { pack_id: Digest, offset: u64, length: u64 },
+}
+
+impl PackEntry {
+    /// The tag byte trails the payload rather than leading it, so the
+    /// common `Inline` case can append in place -- via `try_into_mut`,
+    /// reusing `bytes`' own allocation -- instead of copying a chunk's
+    /// entire content (up to a few MiB) just to prepend one byte.
+    fn encode(self) -> Bytes {
+        match self {
+            PackEntry::Inline(bytes) => {
+                let mut buf =
+                    bytes.try_into_mut().unwrap_or_else(|bytes| BytesMut::from(&bytes[..]));
+                buf.extend_from_slice(&[0u8]);
+                buf.freeze()
+            }
+            PackEntry::Packed { pack_id, offset, length } => {
+                let mut buf = BytesMut::with_capacity(32 + 8 + 8 + 1);
+                buf.extend_from_slice(pack_id.as_ref());
+                buf.extend_from_slice(&offset.to_be_bytes());
+                buf.extend_from_slice(&length.to_be_bytes());
+                buf.extend_from_slice(&[1u8]);
+                buf.freeze()
+            }
+        }
+    }
+
+    fn decode(bytes: &Bytes) -> io::Result<Self> {
+        match bytes.last() {
+            Some(0) => Ok(PackEntry::Inline(bytes.slice(..bytes.len() - 1))),
+            Some(1) if bytes.len() == 32 + 8 + 8 + 1 => {
+                let mut pack_id = [0u8; 32];
+                pack_id.copy_from_slice(&bytes[0..32]);
+                let offset = u64::from_be_bytes(bytes[32..40].try_into().unwrap());
+                let length = u64::from_be_bytes(bytes[40..48].try_into().unwrap());
+                Ok(PackEntry::Packed { pack_id: Digest::new(pack_id), offset, length })
+            }
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "malformed PackEntry")),
+        }
+    }
+}
+
+/// Sums `u64` operands -- used for the per-prefix pending-bytes counter.
+/// Associative, as `MergeOperator` requires: addition trivially is.
+struct SumU64;
+
+impl MergeOperator for SumU64 {
+    fn merge(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operand: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        let existing = existing_value
+            .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap_or_default()))
+            .unwrap_or(0);
+        let delta = u64::from_be_bytes(operand.as_ref().try_into().unwrap_or_default());
+        Ok(Bytes::copy_from_slice(&existing.saturating_add(delta).to_be_bytes()))
+    }
+}
+
+/// Chunking, encoding, and the physical storage of blobs, staged in
+/// `slatedb` and packed into `inner` over time.
 #[derive(Clone)]
 pub struct Storage {
-    backend:  Arc<dyn ObjectStore>,
+    db: slatedb::Db,
+    inner: Arc<dyn ObjectStore>,
+    prefix: String,
+    target_pack_bytes: u64,
+
     chunking: Chunking,
     encoding: Encoding,
     decoding: Decoding,
 }
 
 impl Storage {
-    /// Wraps `backend`.
-    pub const fn new(backend: Arc<dyn ObjectStore>) -> Self {
+    /// Stages blobs under `prefix` in `db` (already open, with a
+    /// `SumU64` merge operator registered -- see
+    /// [`Storage::merge_operator`]) until `target_pack_bytes`
+    /// accumulates, at which point they're consolidated into one pack
+    /// object written to `inner`.
+    pub fn new(
+        db: slatedb::Db,
+        prefix: impl Into<String>,
+        inner: Arc<dyn ObjectStore>,
+        target_pack_bytes: u64,
+    ) -> Self {
         Self {
-            backend,
+            db,
+            inner,
+            prefix: prefix.into(),
+            target_pack_bytes,
             chunking: Chunking::new(),
             encoding: Encoding::new(),
             decoding: Decoding::new(),
         }
     }
 
+    /// The merge operator `db` must be opened with for `Storage`'s
+    /// pending-bytes counter to work.
+    pub fn merge_operator() -> Arc<dyn MergeOperator + Send + Sync> {
+        Arc::new(SumU64)
+    }
+
+    fn entry_key(&self, key: Digest) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.prefix.len() + 2 + 32);
+        buf.extend_from_slice(self.prefix.as_bytes());
+        buf.extend_from_slice(b"e/");
+        buf.extend_from_slice(key.as_ref());
+        buf
+    }
+
+    fn pending_bytes_key(&self) -> Vec<u8> {
+        format!("{}pending_bytes", self.prefix).into_bytes()
+    }
+
+    fn entry_prefix(&self) -> Vec<u8> {
+        format!("{}e/", self.prefix).into_bytes()
+    }
+
+    fn pack_path(&self, pack_id: Digest) -> Path {
+        Path::from(format!("{}packs/{pack_id:x}", self.prefix))
+    }
+
+    async fn pending_bytes(&self) -> io::Result<u64> {
+        match self.db.get(self.pending_bytes_key()).await.map_err(other)? {
+            Some(bytes) => Ok(u64::from_be_bytes(bytes.as_ref().try_into().unwrap_or_default())),
+            None => Ok(0),
+        }
+    }
+
     /// Whether `key` is already stored, without fetching its value.
     async fn contains_blob(&self, key: Digest) -> io::Result<bool> {
-        match self.backend.head(&path(key)).await {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                let e = io::Error::from(e);
-                if e.kind() == io::ErrorKind::NotFound { Ok(false) } else { Err(e) }
-            }
-        }
+        Ok(self.db.get(self.entry_key(key)).await.map_err(other)?.is_some())
     }
 
     /// Fetch bytes stored under `key`, if present.
     async fn get_blob(&self, key: Digest) -> io::Result<Option<Bytes>> {
-        match self.backend.get(&path(key)).await {
-            Ok(result) => Ok(Some(result.bytes().await?)),
-            Err(e) => {
-                let e = io::Error::from(e);
-                if e.kind() == io::ErrorKind::NotFound { Ok(None) } else { Err(e) }
+        let Some(raw) = self.db.get(self.entry_key(key)).await.map_err(other)? else {
+            return Ok(None);
+        };
+        match PackEntry::decode(&raw)? {
+            PackEntry::Inline(bytes) => Ok(Some(bytes)),
+            PackEntry::Packed { pack_id, offset, length } => {
+                let range: Range<u64> = offset..offset + length;
+                let opts = GetOptions { range: Some(range.into()), ..Default::default() };
+                let result = self
+                    .inner
+                    .get_opts(&self.pack_path(pack_id), opts)
+                    .await
+                    .map_err(io::Error::from)?;
+                Ok(Some(result.bytes().await?))
             }
         }
     }
 
-    /// Store `bytes` under `key`.
+    /// Store `bytes` under `key`, flushing to a pack if that crosses
+    /// `target_pack_bytes`.
     async fn put_blob(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
-        self.backend.put(&path(key), bytes.into()).await?;
+        let len = bytes.len() as u64;
+        let entry = PackEntry::Inline(bytes);
+        self.db.put(self.entry_key(key), entry.encode()).await.map_err(other)?;
+        self.db.merge(self.pending_bytes_key(), len.to_be_bytes()).await.map_err(other)?;
+
+        if self.pending_bytes().await? >= self.target_pack_bytes {
+            self.flush_pending().await?;
+        }
+        Ok(())
+    }
+
+    /// How many distinct keys have ever been stored (staged or packed)
+    /// under this store's prefix. Test-only.
+    #[cfg(test)]
+    pub(crate) async fn entry_count(&self) -> io::Result<usize> {
+        let mut iter = self.db.scan_prefix(self.entry_prefix(), ..).await.map_err(other)?;
+        let mut n = 0;
+        while iter.next().await.map_err(other)?.is_some() {
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Consolidates all currently-staged entries under this store's
+    /// prefix into one new pack object, written to `inner`, then flips
+    /// each entry's `slatedb` value to `Packed` via one atomic
+    /// `WriteBatch`. The pack object write completes before the
+    /// `WriteBatch` is attempted (bytes durable before metadata).
+    pub async fn flush_pending(&self) -> io::Result<()> {
+        let mut iter = self.db.scan_prefix(self.entry_prefix(), ..).await.map_err(other)?;
+
+        let mut concatenated = Vec::new();
+        let mut placements: Vec<(Vec<u8>, u64, u64)> = Vec::new();
+        while let Some(kv) = iter.next().await.map_err(other)? {
+            let PackEntry::Inline(bytes) = PackEntry::decode(&kv.value)? else {
+                // Already packed; nothing to do for this entry.
+                continue;
+            };
+            let offset = concatenated.len() as u64;
+            concatenated.extend_from_slice(&bytes);
+            placements.push((kv.key.to_vec(), offset, bytes.len() as u64));
+        }
+
+        if placements.is_empty() {
+            return Ok(());
+        }
+
+        let pack_id = Hasher::new().part(&concatenated).digest();
+        self.inner
+            .put(&self.pack_path(pack_id), Bytes::from(concatenated).into())
+            .await
+            .map_err(io::Error::from)?;
+
+        let mut batch = WriteBatch::new();
+        for (key, offset, length) in &placements {
+            let entry = PackEntry::Packed { pack_id, offset: *offset, length: *length };
+            batch.put_bytes(Bytes::from(key.clone()), entry.encode());
+        }
+        batch.put_bytes(
+            Bytes::from(self.pending_bytes_key()),
+            Bytes::copy_from_slice(&0u64.to_be_bytes()),
+        );
+        self.db.write(batch).await.map_err(other)?;
+
         Ok(())
     }
 
@@ -302,27 +493,8 @@ impl Storage {
     }
 }
 
-/// Leading two-character segments to shard blob paths by, before the rest
-/// of the hex digest as a final segment.
-const SHARD_DEPTH: usize = 1;
-
-fn path(key: Digest) -> ObjectStorePath {
-    let hex = format!("{key:x}");
-    ObjectStorePath::from_iter(hex_parts(&hex, SHARD_DEPTH))
-}
-
-/// `depth` leading two-character segments of `hex`, then the rest, as
-/// `PathPart`s. For example, depth=3 yields "ab", "cd", "ef", "<remaining
-/// 58 hex chars>". `depth` must be less than half of `hex`'s length.
-///
-/// Every part here is plain hex (`0-9a-f`), none of which needs percent
-/// escaping, so `PathPart::from(&str)` borrows straight from `hex` --
-/// this doesn't allocate beyond `hex` itself.
-fn hex_parts(hex: &str, depth: usize) -> impl Iterator<Item = PathPart<'_>> {
-    assert!(depth * 2 < hex.len(), "depth must be less than half of hex's length");
-    (0..depth)
-        .map(|i| PathPart::from(&hex[i * 2..i * 2 + 2]))
-        .chain([PathPart::from(&hex[depth * 2..])])
+fn other(e: impl std::error::Error + Send + Sync + 'static) -> io::Error {
+    io::Error::other(e)
 }
 
 pub(crate) mod defaults {
