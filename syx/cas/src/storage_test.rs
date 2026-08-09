@@ -41,7 +41,7 @@ async fn packing(inner: Arc<dyn ObjectStore>) -> Storage {
 /// target for corruption without independently recomputing chunk digests.
 async fn any_key_except(cas: &Storage, exclude: Digest) -> Digest {
     let (_, manifest_bytes) = cas.load(&exclude).await.unwrap().expect("manifest present");
-    let manifest = decode_manifest(&manifest_bytes).unwrap();
+    let manifest = decode_chunks(&manifest_bytes).unwrap();
     manifest
         .iter()
         .map(|e| e.digest)
@@ -49,7 +49,7 @@ async fn any_key_except(cas: &Storage, exclude: Digest) -> Digest {
         .expect("multi-chunk content should store more than just the manifest")
 }
 
-fn encode(flags: Flags, raw: Vec<u8>) -> Vec<u8> {
+fn encode(flags: ContentFlags, raw: Vec<u8>) -> Vec<u8> {
     Encoding::new().encode(flags, raw)
 }
 
@@ -80,13 +80,13 @@ fn an_overridden_sniff_max_ratio_leaves_the_rest_at_their_defaults() {
 #[test]
 fn encode_entry_round_trips_through_decode_entry() {
     for raw in [b"a".repeat(4096), testing::random_bytes(4096)] {
-        let stored = encode(Flags::empty(), raw.clone());
+        let stored = encode(ContentFlags::empty(), raw.clone());
         let (flags, decoded) = Decoding::new().decode(Bytes::from(stored)).unwrap();
-        assert!(!flags.contains(Flags::MANIFEST));
+        assert!(!flags.contains(ContentFlags::CHUNKED));
         // `decoded` is always plain bytes regardless of whether it
         // was compressed on disk, so the returned flags shouldn't
         // claim it's still compressed.
-        assert!(!flags.contains(Flags::COMPRESSED));
+        assert!(!flags.contains(ContentFlags::COMPRESSED));
         assert_eq!(decoded, raw);
     }
 }
@@ -166,7 +166,7 @@ async fn get_returns_invalid_data_for_tampered_content() {
 
         // Overwrite the stored bytes with content that doesn't hash
         // back to `d`, simulating corruption.
-        let tampered = encode(Flags::empty(), b"not hello".to_vec());
+        let tampered = encode(ContentFlags::empty(), b"not hello".to_vec());
         cas.put_blob(d, Bytes::from(tampered)).await.unwrap();
 
         let err = cas.get::<Bytes>(&d).await.unwrap_err();
@@ -187,7 +187,7 @@ async fn get_returns_invalid_data_for_a_tampered_chunk() {
     let d = cas.put(&Bytes::from(content)).await.unwrap();
 
     let chunk_key = any_key_except(&cas, d).await;
-    let tampered = encode(Flags::empty(), b"tampered chunk content".to_vec());
+    let tampered = encode(ContentFlags::empty(), b"tampered chunk content".to_vec());
     cas.put_blob(chunk_key, Bytes::from(tampered)).await.unwrap();
 
     let err = cas.get::<Bytes>(&d).await.unwrap_err();
@@ -199,7 +199,7 @@ async fn read_into_returns_invalid_data_for_tampered_content() {
     async fn check(cas: Storage) {
         let d = cas.put(&Bytes::from_static(b"hello")).await.unwrap();
 
-        let tampered = encode(Flags::empty(), b"not hello".to_vec());
+        let tampered = encode(ContentFlags::empty(), b"not hello".to_vec());
         cas.put_blob(d, Bytes::from(tampered)).await.unwrap();
 
         let mut out = Vec::new();
@@ -221,7 +221,7 @@ async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
     let d = cas.put(&Bytes::from(content)).await.unwrap();
 
     let chunk_key = any_key_except(&cas, d).await;
-    let tampered = encode(Flags::empty(), b"tampered chunk content".to_vec());
+    let tampered = encode(ContentFlags::empty(), b"tampered chunk content".to_vec());
     cas.put_blob(chunk_key, Bytes::from(tampered)).await.unwrap();
 
     let mut out = Vec::new();
@@ -235,7 +235,7 @@ async fn get_returns_invalid_data_for_a_tampered_manifest() {
         let content = testing::random_bytes(defaults::CHUNK_MAX_SIZE * 2);
         let d = cas.put(&Bytes::from(content)).await.unwrap();
 
-        let tampered = encode(Flags::MANIFEST, b"not a valid manifest body".to_vec());
+        let tampered = encode(ContentFlags::CHUNKED, b"not a valid manifest body".to_vec());
         cas.put_blob(d, Bytes::from(tampered)).await.unwrap();
 
         let err = cas.get::<Bytes>(&d).await.unwrap_err();
@@ -252,9 +252,12 @@ async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
     async fn check(cas: Storage) {
         let (present_digest, present_raw) =
             (Hasher::new().part(b"present").digest(), b"present".to_vec());
-        cas.put_blob(present_digest, Bytes::from(encode(Flags::empty(), present_raw.clone())))
-            .await
-            .unwrap();
+        cas.put_blob(
+            present_digest,
+            Bytes::from(encode(ContentFlags::empty(), present_raw.clone())),
+        )
+        .await
+        .unwrap();
         let missing_digest = Hasher::new().part(b"never written").digest();
 
         let mut manifest = Vec::new();
@@ -268,7 +271,9 @@ async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
             h.parts([present_digest.as_ref(), missing_digest.as_ref()]);
             h.digest()
         };
-        cas.put_blob(blob_digest, Bytes::from(encode(Flags::MANIFEST, manifest))).await.unwrap();
+        cas.put_blob(blob_digest, Bytes::from(encode(ContentFlags::CHUNKED, manifest)))
+            .await
+            .unwrap();
 
         let err = cas.get::<Bytes>(&blob_digest).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

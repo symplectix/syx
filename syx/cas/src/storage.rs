@@ -49,61 +49,81 @@ use crate::hash::{
 mod tests;
 
 bitflags! {
-    /// The trailing byte of every entry's stored payload.
+    /// The trailing byte of a blob's own encoded content -- set once,
+    /// at write time, and unchanged from then on regardless of where
+    /// that content ends up physically living.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) struct Flags: u8 {
+    pub(crate) struct ContentFlags: u8 {
         /// The payload that follows is compressed by zstd.
         const COMPRESSED = 1 << 0;
         /// The payload is a manifest (an ordered list of ChunkRef),
         /// not content itself.
-        const MANIFEST = 1 << 1;
+        const CHUNKED = 1 << 1;
+    }
+}
+
+bitflags! {
+    /// The trailing byte of `slatedb` value. Never seen by anything
+    /// above `Entry`: it says whether that value *is* the content
+    /// or a pointer to where the content currently lives instead.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct EntryFlags: u8 {
+        /// This entry isn't content -- it's a pointer to where the
+        /// content lives instead.
+        const PACKED = 1 << 0;
     }
 }
 
 /// Where an entry currently lives.
-enum PackEntry {
-    /// Still staged: the raw bytes themselves.
+enum Entry {
+    /// Still staged: the raw bytes themselves -- opaque here, but
+    /// really `[payload][ContentFlags]`, as `Encoding::encode`
+    /// produced it.
     Inline(Bytes),
     /// Migrated: where to find it in an already-durable pack.
     Packed { pack_id: Digest, offset: u64, length: u64 },
 }
 
-impl PackEntry {
+impl Entry {
     /// The tag byte trails the payload rather than leading it, so the
     /// common `Inline` case can append in place -- via `try_into_mut`,
     /// reusing `bytes`' own allocation -- instead of copying a chunk's
     /// entire content (up to a few MiB) just to prepend one byte.
     fn encode(self) -> Bytes {
         match self {
-            PackEntry::Inline(bytes) => {
+            Entry::Inline(bytes) => {
                 let mut buf =
                     bytes.try_into_mut().unwrap_or_else(|bytes| BytesMut::from(&bytes[..]));
-                buf.extend_from_slice(&[0u8]);
+                buf.extend_from_slice(&[EntryFlags::empty().bits()]);
                 buf.freeze()
             }
-            PackEntry::Packed { pack_id, offset, length } => {
+            Entry::Packed { pack_id, offset, length } => {
                 let mut buf = BytesMut::with_capacity(32 + 8 + 8 + 1);
                 buf.extend_from_slice(pack_id.as_ref());
                 buf.extend_from_slice(&offset.to_be_bytes());
                 buf.extend_from_slice(&length.to_be_bytes());
-                buf.extend_from_slice(&[1u8]);
+                buf.extend_from_slice(&[EntryFlags::PACKED.bits()]);
                 buf.freeze()
             }
         }
     }
 
     fn decode(bytes: &Bytes) -> io::Result<Self> {
-        match bytes.last() {
-            Some(0) => Ok(PackEntry::Inline(bytes.slice(..bytes.len() - 1))),
-            Some(1) if bytes.len() == 32 + 8 + 8 + 1 => {
-                let mut pack_id = [0u8; 32];
-                pack_id.copy_from_slice(&bytes[0..32]);
-                let offset = u64::from_be_bytes(bytes[32..40].try_into().unwrap());
-                let length = u64::from_be_bytes(bytes[40..48].try_into().unwrap());
-                Ok(PackEntry::Packed { pack_id: Digest::new(pack_id), offset, length })
-            }
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "malformed PackEntry")),
+        let Some(&tag) = bytes.last() else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed Entry"));
+        };
+        let tag = EntryFlags::from_bits_retain(tag);
+        if !tag.contains(EntryFlags::PACKED) {
+            return Ok(Entry::Inline(bytes.slice(..bytes.len() - 1)));
         }
+        if bytes.len() != 32 + 8 + 8 + 1 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed Entry"));
+        }
+        let mut pack_id = [0u8; 32];
+        pack_id.copy_from_slice(&bytes[0..32]);
+        let offset = u64::from_be_bytes(bytes[32..40].try_into().unwrap());
+        let length = u64::from_be_bytes(bytes[40..48].try_into().unwrap());
+        Ok(Entry::Packed { pack_id: Digest::new(pack_id), offset, length })
     }
 }
 
@@ -121,25 +141,25 @@ impl MergeOperator for StorageMergeOperator {
     fn merge(
         &self,
         key: &Bytes,
-        existing_value: Option<Bytes>,
-        operand: Bytes,
+        existing: Option<Bytes>,
+        op: Bytes,
     ) -> Result<Bytes, MergeOperatorError> {
         if key.ends_with(b"pending_bytes") {
-            let existing = existing_value
+            let existing = existing
                 .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap_or_default()))
                 .unwrap_or(0);
-            let delta = u64::from_be_bytes(operand.as_ref().try_into().unwrap_or_default());
+            let delta = u64::from_be_bytes(op.as_ref().try_into().unwrap_or_default());
             return Ok(Bytes::copy_from_slice(&existing.saturating_add(delta).to_be_bytes()));
         }
 
-        match existing_value {
+        match existing {
             Some(existing) => {
-                let mut buf = BytesMut::with_capacity(existing.len() + operand.len());
-                buf.extend_from_slice(&existing);
-                buf.extend_from_slice(&operand);
+                // Grow `existing` in place when uniquely owned.
+                let mut buf = existing.try_into_mut().unwrap_or_else(|b| BytesMut::from(&b[..]));
+                buf.extend_from_slice(&op);
                 Ok(buf.freeze())
             }
-            None => Ok(operand),
+            None => Ok(op),
         }
     }
 }
@@ -271,9 +291,9 @@ impl Storage {
         let Some(raw) = self.db.get(self.entry_key(key)).await.map_err(other)? else {
             return Ok(None);
         };
-        match PackEntry::decode(&raw)? {
-            PackEntry::Inline(bytes) => Ok(Some(bytes)),
-            PackEntry::Packed { pack_id, offset, length } => {
+        match Entry::decode(&raw)? {
+            Entry::Inline(bytes) => Ok(Some(bytes)),
+            Entry::Packed { pack_id, offset, length } => {
                 let range: Range<u64> = offset..offset + length;
                 let opts = GetOptions { range: Some(range.into()), ..Default::default() };
                 let result = self
@@ -290,7 +310,7 @@ impl Storage {
     /// `target_pack_bytes`.
     async fn put_blob(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
         let len = bytes.len() as u64;
-        let entry = PackEntry::Inline(bytes);
+        let entry = Entry::Inline(bytes);
         self.db.put(self.entry_key(key), entry.encode()).await.map_err(other)?;
         self.db.merge(self.pending_bytes_key(), len.to_be_bytes()).await.map_err(other)?;
         self.db
@@ -336,7 +356,7 @@ impl Storage {
                 // shouldn't normally happen, but nothing to pack either way.
                 continue;
             };
-            let PackEntry::Inline(bytes) = PackEntry::decode(&raw)? else {
+            let Entry::Inline(bytes) = Entry::decode(&raw)? else {
                 // Already packed; nothing to do for this entry.
                 continue;
             };
@@ -350,7 +370,7 @@ impl Storage {
         let pack_id = Hasher::new().parts(chunks.iter().map(|b| b.as_ref())).digest();
         let mut batch = WriteBatch::new();
         for (key, offset, length) in &placements {
-            let entry = PackEntry::Packed { pack_id, offset: *offset, length: *length };
+            let entry = Entry::Packed { pack_id, offset: *offset, length: *length };
             batch.put_bytes(key.clone(), entry.encode());
         }
 
@@ -378,7 +398,7 @@ impl Storage {
     /// Callers should check the digest themselves, since what it
     /// should be verified against differs for a manifest's own entry vs.
     /// one of the chunks it lists.
-    async fn load(&self, digest: &Digest) -> io::Result<Option<(Flags, Bytes)>> {
+    async fn load(&self, digest: &Digest) -> io::Result<Option<(ContentFlags, Bytes)>> {
         let Some(stored) = self.get_blob(*digest).await? else {
             return Ok(None);
         };
@@ -390,7 +410,7 @@ impl Storage {
 
     /// Write one entry under `key`, skipping the encode step entirely
     /// if `key` is already stored.
-    async fn save(&self, key: Digest, bytes: Vec<u8>, flags: Flags) -> io::Result<()> {
+    async fn save(&self, key: Digest, bytes: Vec<u8>, flags: ContentFlags) -> io::Result<()> {
         if self.contains_blob(key).await? {
             return Ok(());
         }
@@ -439,7 +459,7 @@ impl Storage {
             return Ok(false);
         };
 
-        if !flags.contains(Flags::MANIFEST) {
+        if !flags.contains(ContentFlags::CHUNKED) {
             if Hasher::new().part(&decoded).digest() != *digest {
                 return Err(invalid_data("direct content digest mismatch"));
             }
@@ -447,7 +467,7 @@ impl Storage {
             return Ok(true);
         }
 
-        let manifest = decode_manifest(&decoded)?;
+        let manifest = decode_chunks(&decoded)?;
         let recomputed = {
             let mut h = Hasher::new();
             h.parts(manifest.iter().map(|e| e.digest.as_ref()));
@@ -464,7 +484,7 @@ impl Storage {
                     entry.digest
                 )));
             };
-            if chunk_flags.contains(Flags::MANIFEST) {
+            if chunk_flags.contains(ContentFlags::CHUNKED) {
                 return Err(invalid_data(format!(
                     "chunk {:x} entry is itself a manifest",
                     entry.digest
@@ -526,7 +546,7 @@ impl Storage {
             manifest.put_u32(chunk.length as u32);
             chunk_digests.part(digest.as_ref());
             last_digest = Some(digest);
-            self.save(digest, chunk.data, Flags::empty()).await?;
+            self.save(digest, chunk.data, ContentFlags::empty()).await?;
         }
 
         if total != len {
@@ -552,7 +572,7 @@ impl Storage {
             manifest.put_slice(digest.as_ref());
             manifest.put_u32(0);
             last_digest = Some(digest);
-            self.save(digest, Vec::new(), Flags::empty()).await?;
+            self.save(digest, Vec::new(), ContentFlags::empty()).await?;
         }
 
         // Each chunk (real or the synthetic empty one above) appends
@@ -570,7 +590,7 @@ impl Storage {
             Ok(last_digest.expect("manifest.len() == 36 implies last_digest was set"))
         } else {
             let blob_digest = chunk_digests.digest();
-            self.save(blob_digest, manifest, Flags::MANIFEST).await?;
+            self.save(blob_digest, manifest, ContentFlags::CHUNKED).await?;
             Ok(blob_digest)
         }
     }
@@ -718,12 +738,12 @@ impl Encoding {
 
     /// Compress `bytes` with zstd if that's worthwhile, and append a
     /// flag byte recording whether it was.
-    pub(super) fn encode(&self, mut flags: Flags, mut bytes: Vec<u8>) -> Vec<u8> {
+    pub(super) fn encode(&self, mut flags: ContentFlags, mut bytes: Vec<u8>) -> Vec<u8> {
         let sample = &bytes[..bytes.len().min(self.sniff_len)];
         if self.worth_compressing(sample) {
             let mut compressed = zstd::bulk::compress(&bytes, self.compression_level)
                 .expect("zstd compression of an in-memory buffer should not fail");
-            flags |= Flags::COMPRESSED;
+            flags |= ContentFlags::COMPRESSED;
             compressed.push(flags.bits());
             return compressed;
         }
@@ -763,16 +783,16 @@ impl Decoding {
 
     /// The not-worth-compressing case is just a cheap sub-slice
     /// of the already-allocated buffer.
-    pub(super) fn decode(&self, stored: Bytes) -> io::Result<(Flags, Bytes)> {
+    pub(super) fn decode(&self, stored: Bytes) -> io::Result<(ContentFlags, Bytes)> {
         if stored.is_empty() {
             return Err(invalid_data("stored content is missing its trailing flag byte"));
         }
         let mut bytes = stored.slice(..stored.len() - 1);
-        let mut flags = Flags::from_bits_retain(stored[stored.len() - 1]);
-        if flags.contains(Flags::COMPRESSED) {
+        let mut flags = ContentFlags::from_bits_retain(stored[stored.len() - 1]);
+        if flags.contains(ContentFlags::COMPRESSED) {
             // `bytes` is decompressed from here on -- the returned flags
             // should describe it.
-            flags.remove(Flags::COMPRESSED);
+            flags.remove(ContentFlags::COMPRESSED);
             bytes = Bytes::from(
                 zstd::decode_all(bytes.as_ref())
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
@@ -793,7 +813,7 @@ struct ChunkRef {
 /// Decode a manifest body into its ordered chunk references.
 ///
 /// The format is a flat sequence of 36-byte records (`digest[32] || len: u32 be`).
-fn decode_manifest(bytes: &[u8]) -> io::Result<Vec<ChunkRef>> {
+fn decode_chunks(bytes: &[u8]) -> io::Result<Vec<ChunkRef>> {
     if !bytes.len().is_multiple_of(36) {
         return Err(invalid_data("manifest body length is not a multiple of 36"));
     }
