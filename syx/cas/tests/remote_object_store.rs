@@ -57,7 +57,7 @@ async fn s3_cas(s3_server: &s3::Server) -> cas::Storage {
         .await
         .unwrap();
 
-    cas::Storage::new(db, "p/", Arc::new(remote), 1024 * 1024)
+    cas::Storage::builder(db, Arc::new(remote), 1024 * 1024).build()
 }
 
 #[tokio::test]

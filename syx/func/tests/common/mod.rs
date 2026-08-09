@@ -19,6 +19,7 @@ pub async fn store() -> (testing::TempDir, ply::Repository) {
         .build()
         .await
         .unwrap();
-    let store = ply::Repository::new(cas::Storage::new(db, "p/", backend, 1024 * 1024));
+    let cas = cas::Storage::builder(db, backend, 1024 * 1024).build();
+    let store = ply::Repository::new(cas);
     (dir, store)
 }

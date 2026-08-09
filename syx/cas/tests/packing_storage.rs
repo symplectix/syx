@@ -16,7 +16,8 @@ async fn packing_cas(target_pack_bytes: u64) -> (cas::Storage, Arc<dyn object_st
         .await
         .unwrap();
     let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    (cas::Storage::new(db, "p/", inner.clone(), target_pack_bytes), inner)
+    let cas = cas::Storage::builder(db, inner.clone(), target_pack_bytes).build();
+    (cas, inner)
 }
 
 #[tokio::test]

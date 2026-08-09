@@ -33,7 +33,7 @@ async fn packing(inner: Arc<dyn ObjectStore>) -> Storage {
         .build()
         .await
         .unwrap();
-    Storage::new(db, "p/", inner, 1024 * 1024)
+    Storage::builder(db, inner, 1024 * 1024).build()
 }
 
 /// Some chunk digest referenced by `exclude`'s own manifest, other than

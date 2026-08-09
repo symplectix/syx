@@ -22,6 +22,7 @@ use object_store::{
     GetOptions,
     ObjectStore,
     ObjectStoreExt as _,
+    PutPayload,
 };
 use slatedb::{
     MergeOperator,
@@ -106,22 +107,40 @@ impl PackEntry {
     }
 }
 
-/// Sums `u64` operands -- used for the per-prefix pending-bytes counter.
-/// Associative, as `MergeOperator` requires: addition trivially is.
-struct SumU64;
+/// `db`'s merge operator. Dispatches on which of `Storage`'s own
+/// mergeable values `key` names:
+///
+/// - `pending_bytes`: sums `u64` operands. Associative, as `MergeOperator` requires: addition
+///   trivially is.
+/// - anything else (`pending_keys`): appends operands. Also associative -- each operand is a
+///   fixed-width 32-byte digest, so concatenation never needs to look at existing content to stay
+///   unambiguous.
+struct StorageMergeOperator;
 
-impl MergeOperator for SumU64 {
+impl MergeOperator for StorageMergeOperator {
     fn merge(
         &self,
-        _key: &Bytes,
+        key: &Bytes,
         existing_value: Option<Bytes>,
         operand: Bytes,
     ) -> Result<Bytes, MergeOperatorError> {
-        let existing = existing_value
-            .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap_or_default()))
-            .unwrap_or(0);
-        let delta = u64::from_be_bytes(operand.as_ref().try_into().unwrap_or_default());
-        Ok(Bytes::copy_from_slice(&existing.saturating_add(delta).to_be_bytes()))
+        if key.ends_with(b"pending_bytes") {
+            let existing = existing_value
+                .map(|v| u64::from_be_bytes(v.as_ref().try_into().unwrap_or_default()))
+                .unwrap_or(0);
+            let delta = u64::from_be_bytes(operand.as_ref().try_into().unwrap_or_default());
+            return Ok(Bytes::copy_from_slice(&existing.saturating_add(delta).to_be_bytes()));
+        }
+
+        match existing_value {
+            Some(existing) => {
+                let mut buf = BytesMut::with_capacity(existing.len() + operand.len());
+                buf.extend_from_slice(&existing);
+                buf.extend_from_slice(&operand);
+                Ok(buf.freeze())
+            }
+            None => Ok(operand),
+        }
     }
 }
 
@@ -139,33 +158,61 @@ pub struct Storage {
     decoding: Decoding,
 }
 
-impl Storage {
-    /// Stages blobs under `prefix` in `db` (already open, with a
-    /// `SumU64` merge operator registered -- see
-    /// [`Storage::merge_operator`]) until `target_pack_bytes`
-    /// accumulates, at which point they're consolidated into one pack
-    /// object written to `inner`.
-    pub fn new(
-        db: slatedb::Db,
-        prefix: impl Into<String>,
-        inner: Arc<dyn ObjectStore>,
-        target_pack_bytes: u64,
-    ) -> Self {
-        Self {
-            db,
-            inner,
-            prefix: prefix.into(),
-            target_pack_bytes,
+/// `StorageBuilder`'s default `prefix`, for the common case of `db`
+/// and `inner` existing solely for this `Storage`'s own sake.
+const DEFAULT_PREFIX: &str = "p/";
+
+/// Builds a `Storage`. `db` and `inner` are already open, with a
+/// `SumU64` merge operator registered on `db` -- see
+/// [`Storage::merge_operator`] -- and blobs accumulate under `prefix`
+/// (defaults to [`DEFAULT_PREFIX`]; override only when sharing `db`
+/// and/or `inner` with something else that needs its own namespace)
+/// until `target_pack_bytes` accumulates, at which point they're
+/// consolidated into one pack object written to `inner`.
+pub struct StorageBuilder {
+    db: slatedb::Db,
+    inner: Arc<dyn ObjectStore>,
+    prefix: String,
+    target_pack_bytes: u64,
+}
+
+impl StorageBuilder {
+    /// The key prefix blobs are staged and packed under. Only needed
+    /// when `db` (and/or `inner`) is shared with something else that
+    /// needs its own namespace.
+    pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = prefix.into();
+        self
+    }
+
+    pub fn build(self) -> Storage {
+        Storage {
+            db: self.db,
+            inner: self.inner,
+            prefix: self.prefix,
+            target_pack_bytes: self.target_pack_bytes,
             chunking: Chunking::new(),
             encoding: Encoding::new(),
             decoding: Decoding::new(),
         }
     }
+}
+
+impl Storage {
+    /// Starts building a `Storage` over `db` and `inner`. See
+    /// [`StorageBuilder`].
+    pub fn builder(
+        db: slatedb::Db,
+        inner: Arc<dyn ObjectStore>,
+        target_pack_bytes: u64,
+    ) -> StorageBuilder {
+        StorageBuilder { db, inner, prefix: DEFAULT_PREFIX.to_string(), target_pack_bytes }
+    }
 
     /// The merge operator `db` must be opened with for `Storage`'s
-    /// pending-bytes counter to work.
+    /// pending-bytes counter (and pending-keys list) to work.
     pub fn merge_operator() -> Arc<dyn MergeOperator + Send + Sync> {
-        Arc::new(SumU64)
+        Arc::new(StorageMergeOperator)
     }
 
     fn entry_key(&self, key: Digest) -> Vec<u8> {
@@ -180,12 +227,19 @@ impl Storage {
         format!("{}pending_bytes", self.prefix).into_bytes()
     }
 
+    fn pending_keys_key(&self) -> Vec<u8> {
+        format!("{}pending_keys", self.prefix).into_bytes()
+    }
+
+    /// Test-only: `flush_pending` finds pending entries via
+    /// `pending_keys_key`, not by scanning this range.
+    #[cfg(test)]
     fn entry_prefix(&self) -> Vec<u8> {
         format!("{}e/", self.prefix).into_bytes()
     }
 
     fn pack_path(&self, pack_id: Digest) -> Path {
-        Path::from(format!("{}packs/{pack_id:x}", self.prefix))
+        Path::from(self.prefix.as_str()).join("packs").join(format!("{pack_id:x}"))
     }
 
     async fn pending_bytes(&self) -> io::Result<u64> {
@@ -193,6 +247,18 @@ impl Storage {
             Some(bytes) => Ok(u64::from_be_bytes(bytes.as_ref().try_into().unwrap_or_default())),
             None => Ok(0),
         }
+    }
+
+    /// Digests currently staged (not yet packed), in the order they
+    /// were merged into `pending_keys_key`.
+    async fn pending_keys(&self) -> io::Result<Vec<Digest>> {
+        let Some(bytes) = self.db.get(self.pending_keys_key()).await.map_err(other)? else {
+            return Ok(Vec::new());
+        };
+        if !bytes.len().is_multiple_of(32) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed pending key list"));
+        }
+        Ok(bytes.chunks_exact(32).map(|c| Digest::new(c.try_into().unwrap())).collect())
     }
 
     /// Whether `key` is already stored, without fetching its value.
@@ -227,6 +293,10 @@ impl Storage {
         let entry = PackEntry::Inline(bytes);
         self.db.put(self.entry_key(key), entry.encode()).await.map_err(other)?;
         self.db.merge(self.pending_bytes_key(), len.to_be_bytes()).await.map_err(other)?;
+        self.db
+            .merge(self.pending_keys_key(), Bytes::copy_from_slice(key.as_ref()))
+            .await
+            .map_err(other)?;
 
         if self.pending_bytes().await? >= self.target_pack_bytes {
             self.flush_pending().await?;
@@ -246,45 +316,58 @@ impl Storage {
         Ok(n)
     }
 
-    /// Consolidates all currently-staged entries under this store's
-    /// prefix into one new pack object, written to `inner`, then flips
+    /// Consolidates all currently-staged entries (per `pending_keys_key`
+    /// -- not a scan over every entry this store has ever held, packed
+    /// or not) into one new pack object, written to `inner`, then flips
     /// each entry's `slatedb` value to `Packed` via one atomic
     /// `WriteBatch`. The pack object write completes before the
     /// `WriteBatch` is attempted (bytes durable before metadata).
     pub async fn flush_pending(&self) -> io::Result<()> {
-        let mut iter = self.db.scan_prefix(self.entry_prefix(), ..).await.map_err(other)?;
-
-        let mut concatenated = Vec::new();
-        let mut placements: Vec<(Vec<u8>, u64, u64)> = Vec::new();
-        while let Some(kv) = iter.next().await.map_err(other)? {
-            let PackEntry::Inline(bytes) = PackEntry::decode(&kv.value)? else {
+        // Each `Inline` value is kept as its own `Bytes`, not copied into
+        // one contiguous buffer -- `PutPayload` is a cheaply cloneable
+        // sequence of `Bytes` (`Arc<[Bytes]>`), so `inner.put` below
+        // takes them as-is.
+        let mut chunks = Vec::new();
+        let mut total: u64 = 0;
+        let mut placements: Vec<(Bytes, u64, u64)> = Vec::new();
+        for digest in self.pending_keys().await? {
+            let Some(raw) = self.db.get(self.entry_key(digest)).await.map_err(other)? else {
+                // Merged into pending_keys_key but no longer present --
+                // shouldn't normally happen, but nothing to pack either way.
+                continue;
+            };
+            let PackEntry::Inline(bytes) = PackEntry::decode(&raw)? else {
                 // Already packed; nothing to do for this entry.
                 continue;
             };
-            let offset = concatenated.len() as u64;
-            concatenated.extend_from_slice(&bytes);
-            placements.push((kv.key.to_vec(), offset, bytes.len() as u64));
+            let offset = total;
+            let length = bytes.len() as u64;
+            total += length;
+            placements.push((Bytes::from(self.entry_key(digest)), offset, length));
+            chunks.push(bytes);
         }
 
-        if placements.is_empty() {
-            return Ok(());
-        }
-
-        let pack_id = Hasher::new().part(&concatenated).digest();
-        self.inner
-            .put(&self.pack_path(pack_id), Bytes::from(concatenated).into())
-            .await
-            .map_err(io::Error::from)?;
-
+        let pack_id = Hasher::new().parts(chunks.iter().map(|b| b.as_ref())).digest();
         let mut batch = WriteBatch::new();
         for (key, offset, length) in &placements {
             let entry = PackEntry::Packed { pack_id, offset: *offset, length: *length };
-            batch.put_bytes(Bytes::from(key.clone()), entry.encode());
+            batch.put_bytes(key.clone(), entry.encode());
         }
+
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        self.inner
+            .put(&self.pack_path(pack_id), PutPayload::from_iter(chunks))
+            .await
+            .map_err(io::Error::from)?;
+
         batch.put_bytes(
             Bytes::from(self.pending_bytes_key()),
             Bytes::copy_from_slice(&0u64.to_be_bytes()),
         );
+        batch.put_bytes(Bytes::from(self.pending_keys_key()), Bytes::new());
         self.db.write(batch).await.map_err(other)?;
 
         Ok(())
