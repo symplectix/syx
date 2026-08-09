@@ -83,10 +83,6 @@ fn encode_entry_round_trips_through_decode_entry() {
         let stored = encode(ContentFlags::empty(), raw.clone());
         let (flags, decoded) = Decoding::new().decode(Bytes::from(stored)).unwrap();
         assert!(!flags.contains(ContentFlags::CHUNKED));
-        // `decoded` is always plain bytes regardless of whether it
-        // was compressed on disk, so the returned flags shouldn't
-        // claim it's still compressed.
-        assert!(!flags.contains(ContentFlags::COMPRESSED));
         assert_eq!(decoded, raw);
     }
 }

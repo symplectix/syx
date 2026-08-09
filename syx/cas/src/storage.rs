@@ -56,7 +56,7 @@ bitflags! {
     pub(crate) struct ContentFlags: u8 {
         /// The payload that follows is compressed by zstd.
         const COMPRESSED = 1 << 0;
-        /// The payload is a manifest (an ordered list of ChunkRef),
+        /// The payload is chunked, contains an ordered list of Chunk,
         /// not content itself.
         const CHUNKED = 1 << 1;
     }
@@ -393,11 +393,7 @@ impl Storage {
         Ok(())
     }
 
-    /// Fetch and decode one entry (a chunk or a manifest).
-    ///
-    /// Callers should check the digest themselves, since what it
-    /// should be verified against differs for a manifest's own entry vs.
-    /// one of the chunks it lists.
+    /// Fetch and decode chunk(s).
     async fn load(&self, digest: &Digest) -> io::Result<Option<(ContentFlags, Bytes)>> {
         let Some(stored) = self.get_blob(*digest).await? else {
             return Ok(None);
@@ -408,7 +404,7 @@ impl Storage {
             .expect("decode should not panic")
     }
 
-    /// Write one entry under `key`, skipping the encode step entirely
+    /// Write one chunk(s) under `key`, skipping the encode step entirely
     /// if `key` is already stored.
     async fn save(&self, key: Digest, bytes: Vec<u8>, flags: ContentFlags) -> io::Result<()> {
         if self.contains_blob(key).await? {
@@ -467,50 +463,36 @@ impl Storage {
             return Ok(true);
         }
 
-        let manifest = decode_chunks(&decoded)?;
+        let chunks = decode_chunks(&decoded)?;
         let recomputed = {
             let mut h = Hasher::new();
-            h.parts(manifest.iter().map(|e| e.digest.as_ref()));
+            h.parts(chunks.iter().map(|c| c.digest.as_ref()));
             h.digest()
         };
         if recomputed != *digest {
-            return Err(invalid_data("manifest digest mismatch"));
+            return Err(invalid_data("chunks digest mismatch"));
         }
 
-        for entry in manifest {
-            let Some((chunk_flags, raw)) = self.load(&entry.digest).await? else {
-                return Err(invalid_data(format!(
-                    "manifest references missing chunk {:x}",
-                    entry.digest
-                )));
+        for chunk in chunks {
+            let Some((chunk_flags, bytes)) = self.load(&chunk.digest).await? else {
+                return Err(invalid_data(format!("missing chunk {:x}", chunk.digest)));
             };
             if chunk_flags.contains(ContentFlags::CHUNKED) {
-                return Err(invalid_data(format!(
-                    "chunk {:x} entry is itself a manifest",
-                    entry.digest
-                )));
+                return Err(invalid_data(format!("nested chunk {:x}", chunk.digest)));
             }
-            if raw.len() as u32 != entry.len {
-                return Err(invalid_data(format!("chunk {:x} length mismatch", entry.digest)));
+            if bytes.len() as u32 != chunk.len {
+                return Err(invalid_data(format!("chunk length mismatch {:x}", chunk.digest)));
             }
-            if Hasher::new().part(&raw).digest() != entry.digest {
-                return Err(invalid_data(format!(
-                    "chunk {:x} content digest mismatch",
-                    entry.digest
-                )));
+            if Hasher::new().part(&bytes).digest() != chunk.digest {
+                return Err(invalid_data(format!("chunk digest mismatch {:x}", chunk.digest)));
             }
-            w.write_all(&raw).await?;
+            w.write_all(&bytes).await?;
         }
         Ok(true)
     }
 
     /// Store the content read from `r` of `len` bytes, addressed by its own
     /// digest.
-    ///
-    /// Each chunk is written as soon as it's produced, not buffered in
-    /// memory: only the manifest -- an ordered list of chunk digests and
-    /// lengths, far smaller than the content itself -- accumulates here, so
-    /// peak memory stays bounded regardless of `len`.
     pub async fn copy_from<R>(&self, len: u64, r: &mut R) -> io::Result<Digest>
     where
         R: AsyncRead + Unpin,
@@ -527,25 +509,18 @@ impl Storage {
         );
         let mut chunks = pin!(cdc.as_stream());
 
-        // Only the most recent digest is needed to detect the zero/one/many
-        // chunks cases below; the multi-chunk blob digest itself is folded
-        // in incrementally, so there's no need to collect every chunk
-        // digest into a `Vec` just to hash over it afterward. `manifest`
-        // already grows by exactly 36 bytes per chunk, so its length alone
-        // (rather than a separate counter) tells us how many chunks there
-        // were.
-        let mut chunk_digests = Hasher::new();
-        let mut last_digest = None;
-        let mut manifest = Vec::new();
+        let mut chunks_hasher = Hasher::new();
+        let mut chunks_bytes = Vec::new();
+        let mut last_chunk_digest = None;
         let mut total: u64 = 0;
         while let Some(chunk) = chunks.next().await {
             let chunk = chunk?;
             total += chunk.length as u64;
             let digest = Hasher::new().part(&chunk.data).digest();
-            manifest.put_slice(digest.as_ref());
-            manifest.put_u32(chunk.length as u32);
-            chunk_digests.part(digest.as_ref());
-            last_digest = Some(digest);
+            chunks_bytes.put_slice(digest.as_ref());
+            chunks_bytes.put_u32(chunk.length as u32);
+            chunks_hasher.part(digest.as_ref());
+            last_chunk_digest = Some(digest);
             self.save(digest, chunk.data, ContentFlags::empty()).await?;
         }
 
@@ -554,14 +529,14 @@ impl Storage {
             //
             // `Take` silently short-reads on early EOF instead of erroring,
             // so this has to be checked explicitly. The chunks already written
-            // above are (harmless) orphans -- no manifest ever points at them.
+            // above are (harmless) orphans.
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!("reader ended {} bytes short of the declared length {len}", len - total),
             ));
         }
 
-        if manifest.is_empty() {
+        if chunks_bytes.is_empty() {
             // No chunks were emitted. The length check above already
             // guarantees `total == len`, so this can only mean `len` was 0.
             //
@@ -569,35 +544,30 @@ impl Storage {
             // over, so treat empty content as exactly one (empty) chunk instead.
             // Falls through to the single-chunk shortcut below.
             let digest = Hasher::new().part([]).digest();
-            manifest.put_slice(digest.as_ref());
-            manifest.put_u32(0);
-            last_digest = Some(digest);
+            chunks_bytes.put_slice(digest.as_ref());
+            chunks_bytes.put_u32(0);
+            last_chunk_digest = Some(digest);
             self.save(digest, Vec::new(), ContentFlags::empty()).await?;
         }
 
-        // Each chunk (real or the synthetic empty one above) appends
-        // exactly one 36-byte record, so this always holds. This is what
-        // makes `manifest.len() == 36` below a reliable way to detect
+        // Each chunk appends exactly one 36-byte record, so this always holds.
+        // This is what makes `len() == 36` below a reliable way to detect
         // "exactly one chunk" without a separate counter.
-        debug_assert!(manifest.len().is_multiple_of(36));
+        debug_assert!(chunks_bytes.len().is_multiple_of(36));
 
-        if manifest.len() == 36 {
-            // Exactly one chunk (one 36-byte manifest record) was emitted,
-            // so its own digest is already the blob digest -- already
-            // written above under that key, so there's nothing left to do.
-            // This also means a small blob and the same content appearing
-            // as one chunk inside a larger blob dedup against each other.
-            Ok(last_digest.expect("manifest.len() == 36 implies last_digest was set"))
+        if chunks_bytes.len() == 36 {
+            // Exactly one chunk was emitted, so its own digest is already
+            // the blob digest -- already written above under that key,
+            // so there's nothing left to do. This also means a small blob
+            // and the same content appearing as one chunk inside a larger
+            // blob dedup against each other.
+            Ok(last_chunk_digest.expect("len() == 36 implies last_digest was set"))
         } else {
-            let blob_digest = chunk_digests.digest();
-            self.save(blob_digest, manifest, ContentFlags::CHUNKED).await?;
-            Ok(blob_digest)
+            let chunks_digest = chunks_hasher.digest();
+            self.save(chunks_digest, chunks_bytes, ContentFlags::CHUNKED).await?;
+            Ok(chunks_digest)
         }
     }
-}
-
-fn other(e: impl std::error::Error + Send + Sync + 'static) -> io::Error {
-    io::Error::other(e)
 }
 
 pub(crate) mod defaults {
@@ -669,9 +639,8 @@ pub(crate) mod defaults {
 /// These aren't safe to change carelessly. Chunk boundaries depend on
 /// these parameters, so changing them shifts where cuts fall:
 /// even byte-identical content gets split into different chunks than
-/// before, with different digests. Existing chunks and manifests stay
-/// perfectly readable, but new writes no longer dedup against what's
-/// already stored under the old parameters.
+/// before, with different digests. Existing chunks stay perfectly readable,
+/// but new writes no longer dedup against what's already stored.
 #[derive(Clone, Copy)]
 pub(super) struct Chunking {
     min_size: usize,
@@ -788,11 +757,8 @@ impl Decoding {
             return Err(invalid_data("stored content is missing its trailing flag byte"));
         }
         let mut bytes = stored.slice(..stored.len() - 1);
-        let mut flags = ContentFlags::from_bits_retain(stored[stored.len() - 1]);
+        let flags = ContentFlags::from_bits_retain(stored[stored.len() - 1]);
         if flags.contains(ContentFlags::COMPRESSED) {
-            // `bytes` is decompressed from here on -- the returned flags
-            // should describe it.
-            flags.remove(ContentFlags::COMPRESSED);
             bytes = Bytes::from(
                 zstd::decode_all(bytes.as_ref())
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
@@ -802,31 +768,33 @@ impl Decoding {
     }
 }
 
-/// A reference to one chunk from within a manifest: its digest and its
-/// length, so a length mismatch (a cheap check) can be caught before
-/// the more expensive digest comparison.
-struct ChunkRef {
+/// A reference to one chunk: its digest and its length.
+struct Chunk {
     digest: Digest,
     len:    u32,
 }
 
-/// Decode a manifest body into its ordered chunk references.
+/// Decode chunks into its ordered chunk references.
 ///
 /// The format is a flat sequence of 36-byte records (`digest[32] || len: u32 be`).
-fn decode_chunks(bytes: &[u8]) -> io::Result<Vec<ChunkRef>> {
+fn decode_chunks(bytes: &[u8]) -> io::Result<Vec<Chunk>> {
     if !bytes.len().is_multiple_of(36) {
-        return Err(invalid_data("manifest body length is not a multiple of 36"));
+        return Err(invalid_data("chunks body length is not a multiple of 36"));
     }
-    let mut manifest = Vec::with_capacity(bytes.len() / 36);
+    let mut chunks = Vec::with_capacity(bytes.len() / 36);
     let mut buf = bytes;
     let mut digest = [0u8; 32];
     while buf.has_remaining() {
         buf.copy_to_slice(&mut digest);
-        manifest.push(ChunkRef { digest: Digest::new(digest), len: buf.get_u32() });
+        chunks.push(Chunk { digest: Digest::new(digest), len: buf.get_u32() });
     }
-    Ok(manifest)
+    Ok(chunks)
 }
 
 fn invalid_data(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
+}
+
+fn other(e: impl std::error::Error + Send + Sync + 'static) -> io::Error {
+    io::Error::other(e)
 }
