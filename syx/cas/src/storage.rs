@@ -409,18 +409,14 @@ pub struct Storage {
 
 /// Builds a `Storage`, opening `db` along the way with the merge
 /// operator `Storage` needs already registered.
-/// Blobs accumulate under `prefix` (defaults to
-/// [`StorageBuilder::DEFAULT_PREFIX`]; override only when sharing `db` and/or
-/// `packs` with something else that needs its own namespace) until
-/// `packs_threshold` (defaults to
-/// [`StorageBuilder::DEFAULT_PACKS_THRESHOLD`]) accumulates, at which
-/// point they're consolidated into one pack object written to `packs`.
 pub struct StorageBuilder {
     db_prefix:       String,
     db_backend:      Arc<dyn ObjectStore>,
     prefix:          String,
     packs_backend:   Option<Arc<dyn ObjectStore>>,
     packs_threshold: u64,
+    chunking:        Chunking,
+    encoding:        Encoding,
 }
 
 impl StorageBuilder {
@@ -456,6 +452,20 @@ impl StorageBuilder {
         self
     }
 
+    /// Overrides chunking behavior (defaults to [`Chunking::new`]). See
+    /// `Chunking`'s own doc -- not safe to change carelessly.
+    pub fn chunking(mut self, chunking: Chunking) -> Self {
+        self.chunking = chunking;
+        self
+    }
+
+    /// Overrides encoding behavior (defaults to [`Encoding::new`]). Safe
+    /// to change at any time -- see `Encoding`'s own doc.
+    pub fn encoding(mut self, encoding: Encoding) -> Self {
+        self.encoding = encoding;
+        self
+    }
+
     /// Fails if `packs` was never set and `db_prefix`/`prefix` collide.
     pub async fn build(self) -> io::Result<Storage> {
         if self.packs_backend.is_none()
@@ -480,20 +490,19 @@ impl StorageBuilder {
             .await
             .map_err(other)?;
         Ok(Storage {
-            stage: Stage {
+            stage:    Stage {
                 db,
                 prefix: self.prefix.clone(),
                 flushing: Arc::new(tokio::sync::Mutex::new(())),
                 flush_failures: Arc::new(AtomicU32::new(0)),
             },
-            packs: Packs {
+            packs:    Packs {
                 store:     packs_store,
                 prefix:    self.prefix,
                 threshold: self.packs_threshold,
             },
-
-            chunking: Chunking::new(),
-            encoding: Encoding::new(),
+            chunking: self.chunking,
+            encoding: self.encoding,
             decoding: Decoding::new(),
         })
     }
@@ -514,6 +523,8 @@ impl Storage {
             packs_backend: None,
             prefix: StorageBuilder::DEFAULT_PREFIX.to_string(),
             packs_threshold: StorageBuilder::DEFAULT_PACKS_THRESHOLD,
+            chunking: Chunking::new(),
+            encoding: Encoding::new(),
         }
     }
 
@@ -790,7 +801,7 @@ impl Storage {
 /// before, with different digests. Existing chunks stay perfectly readable,
 /// but new writes no longer dedup against what's already stored.
 #[derive(Clone, Copy)]
-pub(super) struct Chunking {
+pub struct Chunking {
     min_size: usize,
     avg_size: usize,
     max_size: usize,
@@ -807,7 +818,7 @@ impl Chunking {
     /// content is never "sampled": compressed once to decide, then
     /// compressed again from scratch. Enforced at compile time in
     /// `storage_test.rs`.
-    pub(super) const MIN_SIZE: usize = Encoding::SNIFF_LEN * 4;
+    pub const MIN_SIZE: usize = Encoding::SNIFF_LEN * 4;
 
     /// `MIN_SIZE`/`AVG_SIZE` set the dedup-vs-compression tradeoff:
     /// smaller chunks dedup more precisely (a small change in content
@@ -816,16 +827,37 @@ impl Chunking {
     /// framing overhead); larger chunks compress better but dedup more
     /// coarsely (one changed byte invalidates the whole chunk it falls
     /// in).
-    pub(super) const AVG_SIZE: usize = Self::MIN_SIZE * 8;
+    pub const AVG_SIZE: usize = Self::MIN_SIZE * 8;
 
     /// gRPC's default max message size is 4MB, and a chunk is expected
     /// to map to one message on the wire, so this stays comfortably
     /// under that -- not just below 4MB, leave room for message framing
     /// overhead too. Enforced at compile time in `storage_test.rs`.
-    pub(super) const MAX_SIZE: usize = Self::AVG_SIZE * 4;
+    pub const MAX_SIZE: usize = Self::AVG_SIZE * 4;
 
-    pub(super) const fn new() -> Self {
+    /// Builds `Chunking` with the default `MIN_SIZE`/`AVG_SIZE`/`MAX_SIZE`.
+    pub const fn new() -> Self {
         Self { min_size: Self::MIN_SIZE, avg_size: Self::AVG_SIZE, max_size: Self::MAX_SIZE }
+    }
+
+    /// Overrides the minimum chunk size. See this type's own doc before
+    /// changing it -- existing chunks stay readable, but new writes stop
+    /// deduping against what's already stored under the old size.
+    pub const fn min_size(mut self, min_size: usize) -> Self {
+        self.min_size = min_size;
+        self
+    }
+
+    /// Overrides the average chunk size. See [`Chunking::min_size`].
+    pub const fn avg_size(mut self, avg_size: usize) -> Self {
+        self.avg_size = avg_size;
+        self
+    }
+
+    /// Overrides the maximum chunk size. See [`Chunking::min_size`].
+    pub const fn max_size(mut self, max_size: usize) -> Self {
+        self.max_size = max_size;
+        self
     }
 }
 
@@ -834,7 +866,7 @@ impl Chunking {
 /// its own compressed-or-not decision, so changing these only affects
 /// future writes, never how existing ones are read back.
 #[derive(Clone, Copy)]
-pub(super) struct Encoding {
+pub struct Encoding {
     compression_level: i32,
     sniff_len:         usize,
     sniff_max_ratio:   f64,
@@ -852,11 +884,11 @@ impl Encoding {
     /// already filters out content that isn't worth compressing in the
     /// first place, so every chunk that reaches this point already has
     /// a real payoff to chase.
-    pub(super) const COMPRESSION_LEVEL: i32 = 4;
+    pub const COMPRESSION_LEVEL: i32 = 4;
 
     /// How many bytes of a chunk to sample before deciding whether
     /// it's worth compressing.
-    pub(super) const SNIFF_LEN: usize = 16 * 1024;
+    pub const SNIFF_LEN: usize = 16 * 1024;
 
     /// Skip compression if the sniffed sample doesn't shrink to less
     /// than this fraction of its own size. Already-compressed content
@@ -867,9 +899,10 @@ impl Encoding {
     /// modest) compression on the table; looser values capture more of
     /// those marginal savings but spend more CPU chasing chunks that
     /// barely shrink.
-    pub(super) const SNIFF_MAX_RATIO: f64 = 0.95;
+    pub const SNIFF_MAX_RATIO: f64 = 0.95;
 
-    pub(super) const fn new() -> Self {
+    /// Builds `Encoding` with the default `COMPRESSION_LEVEL`/`SNIFF_LEN`/`SNIFF_MAX_RATIO`.
+    pub const fn new() -> Self {
         Self {
             compression_level: Self::COMPRESSION_LEVEL,
             sniff_len:         Self::SNIFF_LEN,
@@ -877,20 +910,20 @@ impl Encoding {
         }
     }
 
-    #[allow(dead_code)]
-    pub(super) const fn compression_level(mut self, level: i32) -> Self {
+    /// Overrides the zstd compression level. Safe to change at any time.
+    pub const fn compression_level(mut self, level: i32) -> Self {
         self.compression_level = level;
         self
     }
 
-    #[allow(dead_code)]
-    pub(super) const fn sniff_len(mut self, len: usize) -> Self {
+    /// Overrides `SNIFF_LEN`. Safe to change at any time.
+    pub const fn sniff_len(mut self, len: usize) -> Self {
         self.sniff_len = len;
         self
     }
 
-    #[allow(dead_code)]
-    pub(super) const fn sniff_max_ratio(mut self, ratio: f64) -> Self {
+    /// Overrides `SNIFF_MAX_RATIO`. Safe to change at any time.
+    pub const fn sniff_max_ratio(mut self, ratio: f64) -> Self {
         self.sniff_max_ratio = ratio;
         self
     }

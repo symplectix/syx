@@ -7,7 +7,11 @@ pub use hash::{
     Hasher,
     ToBytes,
 };
-pub use storage::Storage;
+pub use storage::{
+    Chunking,
+    Encoding,
+    Storage,
+};
 
 mod hash;
 mod storage;
