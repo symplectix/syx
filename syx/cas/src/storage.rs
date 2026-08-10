@@ -57,9 +57,9 @@
 //!
 //! ## `Packs` layout
 //!
-//! - `cas/sha256/{pack_id:x}`: one object per `flush_pending` run, hex-encoded.  A pack object's
+//! - `cas/sha256/{pack_id:x}`: one object per `flush_pending` run, hex-encoded. A pack object's
 //!   bytes are just its packed entries' concatenated bytes, each one dropping its trailing
-//!   `EntryFlags` byte first . A `Packed` entry's `offset`/`length` say where its bytes start and
+//!   `EntryFlags` byte first. A `Packed` entry's `offset`/`length` say where its bytes start and
 //!   how long they run within that concatenation.
 use std::io;
 use std::ops::Range;
@@ -189,14 +189,10 @@ impl Entry {
     }
 }
 
-/// `db`'s merge operator. Dispatches on which of `Storage`'s own
-/// mergeable values `key` names:
-///
-/// - `pending_bytes`: sums `u64` operands. Associative, as `MergeOperator` requires: addition
-///   trivially is.
-/// - anything else (`pending_keys`): appends operands. Also associative -- each operand is a
-///   fixed-width 32-byte digest, so concatenation never needs to look at existing content to stay
-///   unambiguous.
+/// `Stage`'s merge operator.
+// TODO: assumes it's the only `MergeOperator` registered on `db`. If `db`
+// ever gets shared with another user that needs its own merge behavior,
+// this needs to compose with that instead of being the sole dispatcher.
 struct StorageMergeOperator;
 
 impl MergeOperator for StorageMergeOperator {
@@ -227,9 +223,7 @@ impl MergeOperator for StorageMergeOperator {
 }
 
 /// `cas::Storage`'s own staging area within `db` -- entries land here
-/// first, staged, before being consolidated into `Packs`. `db` may be
-/// shared with other users under their own key prefixes; this only
-/// describes this crate's own use of it.
+/// first, before being consolidated into `Packs`.
 #[derive(Clone)]
 struct Stage {
     db: slatedb::Db,
@@ -434,13 +428,9 @@ impl StorageBuilder {
     /// existing solely for this `Storage`'s own sake.
     const DEFAULT_PREFIX: &str = "cas/";
 
-    /// The default `packs_threshold`: `Chunking::AVG_SIZE * 32` (16 MiB)
-    /// -- enough to consolidate several dozen chunks per pack, in the
-    /// same ballpark as restic's own default pack target size (see
-    /// tmp/packfile_c.md), not just a handful. Well above `Chunking`'s
-    /// own knobs on purpose, so an average chunk alone never crosses
-    /// this by itself.
-    const DEFAULT_PACKS_THRESHOLD: u64 = Chunking::AVG_SIZE as u64 * 32;
+    /// The default `packs_threshold`: 32 MiB -- enough to consolidate
+    /// several dozen chunks per pack.
+    const DEFAULT_PACKS_THRESHOLD: u64 = Chunking::AVG_SIZE as u64 * 64;
 
     /// The key prefix blobs are staged and packed under. Only needed
     /// when `db` (and/or `packs`) is shared with something else that
@@ -466,15 +456,7 @@ impl StorageBuilder {
         self
     }
 
-    /// Fails if `packs` was never set (so it defaults to `db`'s own
-    /// backend, guaranteeing they share physical storage) and
-    /// `db_prefix` and `prefix` collide once normalized as
-    /// `object_store::path::Path`s (e.g. `"cas"` and `"cas/"` are the same
-    /// path) -- that's the one thing standing between `db`'s own files
-    /// and `Storage`'s pack objects landing in the same namespace. Once
-    /// `packs` is set explicitly, there's no way to tell from here
-    /// whether it shares physical storage with `db`'s backend, so this
-    /// is skipped -- the caller's call.
+    /// Fails if `packs` was never set and `db_prefix`/`prefix` collide.
     pub async fn build(self) -> io::Result<Storage> {
         if self.packs_backend.is_none()
             && Path::from(self.db_prefix.as_str()) == Path::from(self.prefix.as_str())
@@ -489,6 +471,9 @@ impl StorageBuilder {
             ));
         }
         let packs_store = self.packs_backend.unwrap_or_else(|| self.db_backend.clone());
+        // TODO: `db` is always opened with only `Stage::merge_operator()`.
+        // No way yet for a caller to supply/combine an additional merge
+        // operator for another component sharing this same `db`.
         let db = slatedb::Db::builder(self.db_prefix, self.db_backend)
             .with_merge_operator(Stage::merge_operator())
             .build()
@@ -515,16 +500,10 @@ impl StorageBuilder {
 }
 
 impl Storage {
-    /// How many consecutive `flush_pending` failures `put_blob` tolerates
-    /// (returning `Ok` regardless, since its own write already durably
-    /// succeeded) before propagating the error instead -- see
-    /// `Storage::put_blob`.
+    /// How many consecutive `flush_pending` failures `put_blob` tolerates.
     const MAX_CONSECUTIVE_FLUSH_FAILURES: u32 = 3;
 
-    /// Starts building a `Storage`: `db` (opened under `db_prefix`)
-    /// persists to `backend`, and pack objects go there too by default
-    /// -- call [`StorageBuilder::packs`] to write them elsewhere
-    /// instead. See [`StorageBuilder`].
+    /// Starts building a `Storage`.
     pub fn builder(
         db_prefix: impl Into<String>,
         db_backend: Arc<dyn ObjectStore>,
@@ -556,14 +535,14 @@ impl Storage {
         }
     }
 
-    /// Store `bytes` under `key`. If enough is already staged to cross
-    /// `packs.threshold`, flushes first -- before staging `bytes` itself,
-    /// so a flush failure never makes this write look like it failed when
-    /// it didn't: on error, `bytes` was never staged, so the error is
-    /// honest. Tolerates up to `MAX_CONSECUTIVE_FLUSH_FAILURES`
-    /// consecutive flush failures this way (`flush_pending` tracks the
-    /// streak); past that, propagates the error instead of continuing to
-    /// accept writes that would never get packed.
+    /// Store `bytes` under `key`.
+    ///
+    /// If enough is already staged to cross `packs.threshold`,
+    /// flushes first before staging `bytes` itself.
+    ///
+    /// Tolerates up to `MAX_CONSECUTIVE_FLUSH_FAILURES` consecutive
+    /// flush failures this way; past that, propagates the error
+    /// instead of continuing to accept writes that would never get packed.
     async fn put_blob(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
         if self.stage.pending_bytes().await? >= self.packs.threshold
             && let Err(e) = self.flush_pending().await
@@ -576,7 +555,7 @@ impl Storage {
         self.stage.put(key, bytes).await
     }
 
-    /// How many distinct keys have ever been stored (staged or packed)
+    /// How many distinct keys have ever been staged or packed
     /// under this store's prefix. Test-only.
     #[cfg(test)]
     pub(crate) async fn entry_count(&self) -> io::Result<usize> {
@@ -586,17 +565,7 @@ impl Storage {
     /// Consolidates all currently-staged entries into one new pack object.
     ///
     /// If another call is already in progress, this returns immediately
-    /// without doing anything, rather than waiting its turn: nothing is
-    /// lost either way (staged entries are already durable and
-    /// readable), the next `put_blob` that crosses `packs.threshold`
-    /// will try again, and serializing this way means only one
-    /// execution ever reads `pending_keys_key` at a time, so no other
-    /// entry it fetches can already be `Packed`.
-    ///
-    /// Also maintains `flush_failures` -- reset to 0 on success,
-    /// incremented on failure -- regardless of who called this, so
-    /// `put_blob`'s own tolerance for consecutive failures reflects
-    /// every attempt, not just its own.
+    /// without doing anything, rather than waiting its turn.
     pub async fn flush_pending(&self) -> io::Result<()> {
         let Ok(_guard) = self.stage.flushing.try_lock() else {
             return Ok(());
