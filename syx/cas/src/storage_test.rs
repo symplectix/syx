@@ -7,7 +7,6 @@ use bytes::{
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
-use slatedb::Db;
 
 use super::*;
 use crate::hash::Hasher;
@@ -24,16 +23,11 @@ fn local_fs() -> (testing::TempDir, Arc<dyn ObjectStore>) {
     (tmp, backend)
 }
 
-/// A `Storage` writing packs to `inner`, staged in its own in-memory
+/// A `Storage` writing packs to `packs`, staged in its own in-memory
 /// `slatedb` (staging durability isn't what these tests are about;
-/// `inner` is the backend variety under test).
-async fn packing(inner: Arc<dyn ObjectStore>) -> Storage {
-    let db = Db::builder("test", Arc::new(InMemory::new()) as Arc<dyn ObjectStore>)
-        .with_merge_operator(Storage::merge_operator())
-        .build()
-        .await
-        .unwrap();
-    Storage::builder(db, inner, 1024 * 1024).build()
+/// `packs` is the backend variety under test).
+async fn packing(packs: Arc<dyn ObjectStore>) -> Storage {
+    Storage::builder("test", in_memory()).packs(packs).build().await.unwrap()
 }
 
 /// Some chunk digest referenced by `exclude`'s own manifest, other than
@@ -77,6 +71,17 @@ fn an_overridden_sniff_max_ratio_leaves_the_rest_at_their_defaults() {
     assert!(Encoding::new().sniff_max_ratio(2.0).worth_compressing(&sample));
 }
 
+// SNIFF_LEN must stay smaller than CHUNK_MIN_SIZE: otherwise every
+// regular chunk would have its whole content "sampled" -- compressed
+// once to decide, then compressed again from scratch.
+const _: () = assert!(Encoding::SNIFF_LEN < Chunking::MIN_SIZE);
+
+// CHUNK_MAX_SIZE has a hard ceiling to respect: gRPC's default max
+// message size is 4MB, and a chunk is expected to map to one message
+// on the wire, so this should stay comfortably under that. Not just
+// below 4MB, leave room for message framing overhead too.
+const _: () = assert!(Chunking::MAX_SIZE <= 4 * 1024 * 1024);
+
 #[test]
 fn encode_entry_round_trips_through_decode_entry() {
     for raw in [b"a".repeat(4096), testing::random_bytes(4096)] {
@@ -111,7 +116,7 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
     // Long enough, and shared for long enough, that content-defined
     // chunking is guaranteed to produce at least one identical cut
     // chunk in both blobs before they diverge.
-    let shared = testing::random_bytes(defaults::CHUNK_MAX_SIZE * 2);
+    let shared = testing::random_bytes(Chunking::MAX_SIZE * 2);
     let blob_a = {
         let mut blob_a = shared.clone();
         blob_a.extend_from_slice(b"-a-suffix");
@@ -179,7 +184,7 @@ async fn get_returns_invalid_data_for_a_tampered_chunk() {
     // Needs a real (non-manifest) key to target, so this one stays
     // `in_memory`-only rather than being generalized over the backend.
     let cas = packing(in_memory()).await;
-    let content = testing::random_bytes(defaults::CHUNK_MAX_SIZE * 2);
+    let content = testing::random_bytes(Chunking::MAX_SIZE * 2);
     let d = cas.put(&Bytes::from(content)).await.unwrap();
 
     let chunk_key = any_key_except(&cas, d).await;
@@ -213,7 +218,7 @@ async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
     // Needs a real (non-manifest) key to target, so this one stays
     // `in_memory`-only rather than being generalized over the backend.
     let cas = packing(in_memory()).await;
-    let content = testing::random_bytes(defaults::CHUNK_MAX_SIZE * 2);
+    let content = testing::random_bytes(Chunking::MAX_SIZE * 2);
     let d = cas.put(&Bytes::from(content)).await.unwrap();
 
     let chunk_key = any_key_except(&cas, d).await;
@@ -228,7 +233,7 @@ async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
 #[tokio::test]
 async fn get_returns_invalid_data_for_a_tampered_manifest() {
     async fn check(cas: Storage) {
-        let content = testing::random_bytes(defaults::CHUNK_MAX_SIZE * 2);
+        let content = testing::random_bytes(Chunking::MAX_SIZE * 2);
         let d = cas.put(&Bytes::from(content)).await.unwrap();
 
         let tampered = encode(ContentFlags::CHUNKED, b"not a valid manifest body".to_vec());
@@ -278,4 +283,24 @@ async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
     check(packing(in_memory()).await).await;
     let (_tmp, inner) = local_fs();
     check(packing(inner).await).await;
+}
+
+#[tokio::test]
+async fn build_rejects_a_db_prefix_that_collides_with_prefix() {
+    // Not `.prefix(...)`-ed: exercises the default ("cas/"), which
+    // normalizes to the same `Path` as db_prefix "cas". `packs` is also
+    // left unset, so it defaults to sharing `backend` -- the check
+    // only applies in that case.
+    let err = Storage::builder("cas", in_memory()).build().await.err().unwrap();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+}
+
+#[tokio::test]
+async fn build_allows_a_colliding_db_prefix_and_prefix_once_packs_is_set_explicitly() {
+    // Same colliding db_prefix/prefix as above, but `packs` is
+    // set explicitly (even to the very same backend) -- the check
+    // can't tell whether that's physically shared storage, so it's
+    // the caller's call, not rejected here.
+    let backend = in_memory();
+    Storage::builder("cas", backend.clone()).packs(backend).build().await.unwrap();
 }

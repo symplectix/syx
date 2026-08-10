@@ -1,12 +1,74 @@
-//! Content-addressed blob storage: chunking, encoding and digest framing
-//! on the way in, decoding and verifying on the way out. Blobs are
-//! staged in `slatedb` before being consolidated into pack objects in a
-//! wrapped `object_store::ObjectStore`. See tmp/packfile_c.md for the
-//! packing design rationale.
+//! Content-addressed blob storage: chunking, encoding on the way in,
+//! decoding and verifying on the way out. Blobs are staged in `slatedb`
+//! before being consolidated into pack objects in a wrapped `ObjectStore`.
+//!
+//! # Why pack at all
+//!
+//! One object per chunk means one backend API call per chunk, which
+//! gets expensive (S3 request pricing, rate limits) as blob count
+//! grows. Consolidating many small objects into fewer, larger packs
+//! cuts that down, the same way `git`/`restic` pack loose objects.
+//!
+//! # Why stage in `slatedb` rather than pack directly
+//!
+//! Two simpler alternatives were considered and rejected:
+//!
+//! - Write each chunk as its own object immediately, then repack later: still pays one API call per
+//!   chunk up front, plus a GET, a PUT, and a DELETE per chunk to consolidate afterward -- strictly
+//!   more calls, not fewer.
+//!
+//! - Buffer writes in memory and flush a pack once enough accumulates: a crash before the flush
+//!   silently loses writes that already returned `Ok` to the caller.
+//!
+//! Staging in `slatedb` first avoids both: no per-chunk backend object
+//! is ever created, and nothing is acknowledged before it's durable.
+//! Once enough accumulates, concatenates the staged bytes into one pack
+//! object and flips each entry to `Entry::Packed`.
+//!
+//! # Data layout
+//!
+//! Two separate namespaces share the name "prefix": `db_prefix`, an `object_store::path::Path`
+//! passed straight through to `slatedb::Db::builder` and never touched again here (everything
+//! under it -- manifest, WAL, SST files -- is `slatedb`'s own concern), and `prefix`
+//! (`Stage`/`Packs`'s own `prefix` field, default `cas/`, see [`StorageBuilder::DEFAULT_PREFIX`]),
+//! covered below. Both exist so `db` and/or `packs` can be shared with something else that carves
+//! out its own namespace without colliding -- see `StorageBuilder::build`'s collision check.
+//!
+//! ## `Stage` layout
+//!
+//! With `prefix` as `"cas/"`:
+//!
+//! - `cas/pending_bytes`: `u64` big-endian, how many `Inline` bytes are currently staged.
+//! - `cas/pending_keys`: a flat concatenation of 32-byte digests, still staged.
+//! - `cas/sha256/{digest}`: one entry per blob/chunk, keyed by its own 32-byte digest (raw bytes,
+//!   not hex; `sha256` names the hashing scheme so a future switch to a different one, e.g.
+//!   `blake3`, can live alongside these keys instead of colliding with them). The value is
+//!   [`Entry::encode`]'s output, either `Inline` or `Packed` below.
+//!
+//! `Inline`: `[payload][ContentFlags][EntryFlags]`
+//! The content exactly as [`Encoding::encode`] produced it (`[payload][ContentFlags]`), plus one
+//! more trailing tag byte recording that this value *is* the content, not a pointer to it.
+//!
+//! `Packed`: `[pack_id: 32 bytes][offset: u64][length: u64][EntryFlags]`
+//! This entry has moved out of `db` and into a pack object. `pack_id` names which one
+//! (`cas/sha256/{pack_id:x}`, see `Packs` layout below); `offset`/`length` say where within it.
+//! Written once, when `flush_pending` consolidates staged entries into a pack and flips each one
+//! from `Inline` to `Packed` in the same `WriteBatch` that makes the flip durable.
+//!
+//! ## `Packs` layout
+//!
+//! - `cas/sha256/{pack_id:x}`: one object per `flush_pending` run, hex-encoded.  A pack object's
+//!   bytes are just its packed entries' concatenated bytes, each one dropping its trailing
+//!   `EntryFlags` byte first . A `Packed` entry's `offset`/`length` say where its bytes start and
+//!   how long they run within that concatenation.
 use std::io;
 use std::ops::Range;
 use std::pin::pin;
 use std::sync::Arc;
+use std::sync::atomic::{
+    AtomicU32,
+    Ordering,
+};
 
 use bitflags::bitflags;
 use bytes::{
@@ -94,7 +156,7 @@ impl Entry {
             Entry::Inline(bytes) => {
                 let mut buf =
                     bytes.try_into_mut().unwrap_or_else(|bytes| BytesMut::from(&bytes[..]));
-                buf.extend_from_slice(&[EntryFlags::empty().bits()]);
+                buf.put_u8(EntryFlags::empty().bits());
                 buf.freeze()
             }
             Entry::Packed { pack_id, offset, length } => {
@@ -102,7 +164,7 @@ impl Entry {
                 buf.extend_from_slice(pack_id.as_ref());
                 buf.extend_from_slice(&offset.to_be_bytes());
                 buf.extend_from_slice(&length.to_be_bytes());
-                buf.extend_from_slice(&[EntryFlags::PACKED.bits()]);
+                buf.put_u8(EntryFlags::PACKED.bits());
                 buf.freeze()
             }
         }
@@ -164,81 +226,34 @@ impl MergeOperator for StorageMergeOperator {
     }
 }
 
-/// Chunking, encoding, and the physical storage of blobs, staged in
-/// `slatedb` and packed into `inner` over time.
+/// `cas::Storage`'s own staging area within `db` -- entries land here
+/// first, staged, before being consolidated into `Packs`. `db` may be
+/// shared with other users under their own key prefixes; this only
+/// describes this crate's own use of it.
 #[derive(Clone)]
-pub struct Storage {
+struct Stage {
     db: slatedb::Db,
-    inner: Arc<dyn ObjectStore>,
+    /// This stage's own namespace within `db`.
     prefix: String,
-    target_pack_bytes: u64,
-
-    chunking: Chunking,
-    encoding: Encoding,
-    decoding: Decoding,
+    /// Serializes `flush_pending`.
+    flushing: Arc<tokio::sync::Mutex<()>>,
+    /// Consecutive `flush_pending` failures, reset to 0 on success.
+    /// `put_blob`'s opportunistic call reads this to decide whether to
+    /// swallow an error or propagate it.
+    flush_failures: Arc<AtomicU32>,
 }
 
-/// `StorageBuilder`'s default `prefix`, for the common case of `db`
-/// and `inner` existing solely for this `Storage`'s own sake.
-const DEFAULT_PREFIX: &str = "p/";
-
-/// Builds a `Storage`. `db` and `inner` are already open, with a
-/// `SumU64` merge operator registered on `db` -- see
-/// [`Storage::merge_operator`] -- and blobs accumulate under `prefix`
-/// (defaults to [`DEFAULT_PREFIX`]; override only when sharing `db`
-/// and/or `inner` with something else that needs its own namespace)
-/// until `target_pack_bytes` accumulates, at which point they're
-/// consolidated into one pack object written to `inner`.
-pub struct StorageBuilder {
-    db: slatedb::Db,
-    inner: Arc<dyn ObjectStore>,
-    prefix: String,
-    target_pack_bytes: u64,
-}
-
-impl StorageBuilder {
-    /// The key prefix blobs are staged and packed under. Only needed
-    /// when `db` (and/or `inner`) is shared with something else that
-    /// needs its own namespace.
-    pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.prefix = prefix.into();
-        self
-    }
-
-    pub fn build(self) -> Storage {
-        Storage {
-            db: self.db,
-            inner: self.inner,
-            prefix: self.prefix,
-            target_pack_bytes: self.target_pack_bytes,
-            chunking: Chunking::new(),
-            encoding: Encoding::new(),
-            decoding: Decoding::new(),
-        }
-    }
-}
-
-impl Storage {
-    /// Starts building a `Storage` over `db` and `inner`. See
-    /// [`StorageBuilder`].
-    pub fn builder(
-        db: slatedb::Db,
-        inner: Arc<dyn ObjectStore>,
-        target_pack_bytes: u64,
-    ) -> StorageBuilder {
-        StorageBuilder { db, inner, prefix: DEFAULT_PREFIX.to_string(), target_pack_bytes }
-    }
-
-    /// The merge operator `db` must be opened with for `Storage`'s
-    /// pending-bytes counter (and pending-keys list) to work.
-    pub fn merge_operator() -> Arc<dyn MergeOperator + Send + Sync> {
+impl Stage {
+    /// The merge operator `db` must be opened with for `pending_bytes`
+    /// and `pending_keys` to work.
+    fn merge_operator() -> Arc<dyn MergeOperator + Send + Sync> {
         Arc::new(StorageMergeOperator)
     }
 
     fn entry_key(&self, key: Digest) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(self.prefix.len() + 2 + 32);
+        let mut buf = Vec::with_capacity(self.prefix.len() + 7 + 32);
         buf.extend_from_slice(self.prefix.as_bytes());
-        buf.extend_from_slice(b"e/");
+        buf.extend_from_slice(b"sha256/");
         buf.extend_from_slice(key.as_ref());
         buf
     }
@@ -251,15 +266,11 @@ impl Storage {
         format!("{}pending_keys", self.prefix).into_bytes()
     }
 
-    /// Test-only: `flush_pending` finds pending entries via
-    /// `pending_keys_key`, not by scanning this range.
+    /// Test-only: `staged` finds pending entries via `pending_keys_key`,
+    /// not by scanning this range.
     #[cfg(test)]
     fn entry_prefix(&self) -> Vec<u8> {
-        format!("{}e/", self.prefix).into_bytes()
-    }
-
-    fn pack_path(&self, pack_id: Digest) -> Path {
-        Path::from(self.prefix.as_str()).join("packs").join(format!("{pack_id:x}"))
+        format!("{}sha256/", self.prefix).into_bytes()
     }
 
     async fn pending_bytes(&self) -> io::Result<u64> {
@@ -282,52 +293,34 @@ impl Storage {
     }
 
     /// Whether `key` is already stored, without fetching its value.
-    async fn contains_blob(&self, key: Digest) -> io::Result<bool> {
+    async fn contains(&self, key: Digest) -> io::Result<bool> {
         Ok(self.db.get(self.entry_key(key)).await.map_err(other)?.is_some())
     }
 
-    /// Fetch bytes stored under `key`, if present.
-    async fn get_blob(&self, key: Digest) -> io::Result<Option<Bytes>> {
+    /// Fetch and decode the entry stored under `key`, if present.
+    async fn get(&self, key: Digest) -> io::Result<Option<Entry>> {
         let Some(raw) = self.db.get(self.entry_key(key)).await.map_err(other)? else {
             return Ok(None);
         };
-        match Entry::decode(&raw)? {
-            Entry::Inline(bytes) => Ok(Some(bytes)),
-            Entry::Packed { pack_id, offset, length } => {
-                let range: Range<u64> = offset..offset + length;
-                let opts = GetOptions { range: Some(range.into()), ..Default::default() };
-                let result = self
-                    .inner
-                    .get_opts(&self.pack_path(pack_id), opts)
-                    .await
-                    .map_err(io::Error::from)?;
-                Ok(Some(result.bytes().await?))
-            }
-        }
+        Entry::decode(&raw).map(Some)
     }
 
-    /// Store `bytes` under `key`, flushing to a pack if that crosses
-    /// `target_pack_bytes`.
-    async fn put_blob(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
+    /// Stage `bytes` under `key`, durable immediately -- not yet in a pack.
+    async fn put(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
         let len = bytes.len() as u64;
         let entry = Entry::Inline(bytes);
-        self.db.put(self.entry_key(key), entry.encode()).await.map_err(other)?;
-        self.db.merge(self.pending_bytes_key(), len.to_be_bytes()).await.map_err(other)?;
-        self.db
-            .merge(self.pending_keys_key(), Bytes::copy_from_slice(key.as_ref()))
-            .await
-            .map_err(other)?;
-
-        if self.pending_bytes().await? >= self.target_pack_bytes {
-            self.flush_pending().await?;
-        }
+        let mut batch = WriteBatch::new();
+        batch.put_bytes(Bytes::from(self.entry_key(key)), entry.encode());
+        batch.merge(self.pending_bytes_key(), len.to_be_bytes());
+        batch.merge(self.pending_keys_key(), key.as_ref());
+        self.db.write(batch).await.map_err(other)?;
         Ok(())
     }
 
     /// How many distinct keys have ever been stored (staged or packed)
-    /// under this store's prefix. Test-only.
+    /// under this stage's prefix. Test-only.
     #[cfg(test)]
-    pub(crate) async fn entry_count(&self) -> io::Result<usize> {
+    async fn entry_count(&self) -> io::Result<usize> {
         let mut iter = self.db.scan_prefix(self.entry_prefix(), ..).await.map_err(other)?;
         let mut n = 0;
         while iter.next().await.map_err(other)?.is_some() {
@@ -336,61 +329,311 @@ impl Storage {
         Ok(n)
     }
 
-    /// Consolidates all currently-staged entries (per `pending_keys_key`
-    /// -- not a scan over every entry this store has ever held, packed
-    /// or not) into one new pack object, written to `inner`, then flips
-    /// each entry's `slatedb` value to `Packed` via one atomic
-    /// `WriteBatch`. The pack object write completes before the
-    /// `WriteBatch` is attempted (bytes durable before metadata).
-    pub async fn flush_pending(&self) -> io::Result<()> {
-        // Each `Inline` value is kept as its own `Bytes`, not copied into
-        // one contiguous buffer -- `PutPayload` is a cheaply cloneable
-        // sequence of `Bytes` (`Arc<[Bytes]>`), so `inner.put` below
-        // takes them as-is.
-        let mut chunks = Vec::new();
-        let mut total: u64 = 0;
-        let mut placements: Vec<(Bytes, u64, u64)> = Vec::new();
+    /// Currently-staged entries (per `pending_keys_key` -- not a scan
+    /// over every entry ever held, packed or not), with their still-
+    /// `Inline` bytes.
+    async fn staged(&self) -> io::Result<Vec<(Digest, Bytes)>> {
+        let mut staged = Vec::new();
         for digest in self.pending_keys().await? {
-            let Some(raw) = self.db.get(self.entry_key(digest)).await.map_err(other)? else {
-                // Merged into pending_keys_key but no longer present --
-                // shouldn't normally happen, but nothing to pack either way.
+            let Some(entry) = self.get(digest).await? else {
+                // This is purely internal bookkeeping: `put` always
+                // writes the entry before merging its digest into
+                // pending_keys, and entries are never deleted, so
+                // reaching here would mean that invariant itself broke.
+                // Still safe to skip. Nothing to do for a missing entry.
                 continue;
             };
-            let Entry::Inline(bytes) = Entry::decode(&raw)? else {
-                // Already packed; nothing to do for this entry.
+            let Entry::Inline(bytes) = entry else {
+                // `flushing` ensures only one `flush_pending` call runs
+                // at a time, and only `commit_packed` flips Inline to Packed,
+                // so reaching here would mean that serialization itself broke.
+                // Still safe to skip. Nothing to do for an already packed entry.
                 continue;
             };
-            let offset = total;
-            let length = bytes.len() as u64;
-            total += length;
-            placements.push((Bytes::from(self.entry_key(digest)), offset, length));
-            chunks.push(bytes);
+            staged.push((digest, bytes));
         }
+        Ok(staged)
+    }
 
-        let pack_id = Hasher::new().parts(chunks.iter().map(|b| b.as_ref())).digest();
+    /// Atomically flips `entries` to `Packed` and resets the pending
+    /// counters -- called once their bytes are durable in a pack object.
+    async fn commit_packed(&self, entries: Vec<(Digest, Entry)>) -> io::Result<()> {
         let mut batch = WriteBatch::new();
-        for (key, offset, length) in &placements {
-            let entry = Entry::Packed { pack_id, offset: *offset, length: *length };
-            batch.put_bytes(key.clone(), entry.encode());
+        for (digest, entry) in entries {
+            batch.put_bytes(Bytes::from(self.entry_key(digest)), entry.encode());
         }
-
-        if batch.is_empty() {
-            return Ok(());
-        }
-
-        self.inner
-            .put(&self.pack_path(pack_id), PutPayload::from_iter(chunks))
-            .await
-            .map_err(io::Error::from)?;
-
         batch.put_bytes(
             Bytes::from(self.pending_bytes_key()),
             Bytes::copy_from_slice(&0u64.to_be_bytes()),
         );
         batch.put_bytes(Bytes::from(self.pending_keys_key()), Bytes::new());
         self.db.write(batch).await.map_err(other)?;
-
         Ok(())
+    }
+}
+
+/// Where staged entries get consolidated into once `threshold`
+/// accumulates.
+#[derive(Clone)]
+struct Packs {
+    store:     Arc<dyn ObjectStore>,
+    prefix:    String,
+    threshold: u64,
+}
+
+impl Packs {
+    fn path(&self, pack_id: Digest) -> Path {
+        Path::from(self.prefix.as_str()).join("sha256").join(format!("{pack_id:x}"))
+    }
+
+    /// Fetch `length` bytes at `offset` from pack `pack_id`.
+    async fn get_range(&self, pack_id: Digest, offset: u64, length: u64) -> io::Result<Bytes> {
+        let range: Range<u64> = offset..offset + length;
+        let opts = GetOptions { range: Some(range.into()), ..Default::default() };
+        let result =
+            self.store.get_opts(&self.path(pack_id), opts).await.map_err(io::Error::from)?;
+        Ok(result.bytes().await?)
+    }
+
+    /// Write `payload` as one new pack object identified by `pack_id`.
+    async fn write(&self, pack_id: Digest, payload: PutPayload) -> io::Result<()> {
+        self.store.put(&self.path(pack_id), payload).await.map_err(io::Error::from)?;
+        Ok(())
+    }
+}
+
+/// Chunking, encoding, and the physical storage of blobs, staged in
+/// `slatedb` and packed into `packs` over time.
+#[derive(Clone)]
+pub struct Storage {
+    stage:    Stage,
+    packs:    Packs,
+    chunking: Chunking,
+    encoding: Encoding,
+    decoding: Decoding,
+}
+
+/// Builds a `Storage`, opening `db` along the way with the merge
+/// operator `Storage` needs already registered.
+/// Blobs accumulate under `prefix` (defaults to
+/// [`StorageBuilder::DEFAULT_PREFIX`]; override only when sharing `db` and/or
+/// `packs` with something else that needs its own namespace) until
+/// `packs_threshold` (defaults to
+/// [`StorageBuilder::DEFAULT_PACKS_THRESHOLD`]) accumulates, at which
+/// point they're consolidated into one pack object written to `packs`.
+pub struct StorageBuilder {
+    db_prefix:       String,
+    db_backend:      Arc<dyn ObjectStore>,
+    prefix:          String,
+    packs_backend:   Option<Arc<dyn ObjectStore>>,
+    packs_threshold: u64,
+}
+
+impl StorageBuilder {
+    /// The default `prefix`, for the common case of `db` and `packs`
+    /// existing solely for this `Storage`'s own sake.
+    const DEFAULT_PREFIX: &str = "cas/";
+
+    /// The default `packs_threshold`: `Chunking::AVG_SIZE * 32` (16 MiB)
+    /// -- enough to consolidate several dozen chunks per pack, in the
+    /// same ballpark as restic's own default pack target size (see
+    /// tmp/packfile_c.md), not just a handful. Well above `Chunking`'s
+    /// own knobs on purpose, so an average chunk alone never crosses
+    /// this by itself.
+    const DEFAULT_PACKS_THRESHOLD: u64 = Chunking::AVG_SIZE as u64 * 32;
+
+    /// The key prefix blobs are staged and packed under. Only needed
+    /// when `db` (and/or `packs`) is shared with something else that
+    /// needs its own namespace.
+    pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = prefix.into();
+        self
+    }
+
+    /// Writes pack objects to `packs` instead of `db`'s own backend
+    /// (the default -- see [`Storage::builder`]). Only needed when
+    /// content should live somewhere other than wherever `db` persists
+    /// itself.
+    pub fn packs(mut self, packs: Arc<dyn ObjectStore>) -> Self {
+        self.packs_backend = Some(packs);
+        self
+    }
+
+    /// How many bytes to stage before consolidating into a pack
+    /// (defaults to [`StorageBuilder::DEFAULT_PACKS_THRESHOLD`]).
+    pub fn packs_threshold(mut self, packs_threshold: u64) -> Self {
+        self.packs_threshold = packs_threshold;
+        self
+    }
+
+    /// Fails if `packs` was never set (so it defaults to `db`'s own
+    /// backend, guaranteeing they share physical storage) and
+    /// `db_prefix` and `prefix` collide once normalized as
+    /// `object_store::path::Path`s (e.g. `"cas"` and `"cas/"` are the same
+    /// path) -- that's the one thing standing between `db`'s own files
+    /// and `Storage`'s pack objects landing in the same namespace. Once
+    /// `packs` is set explicitly, there's no way to tell from here
+    /// whether it shares physical storage with `db`'s backend, so this
+    /// is skipped -- the caller's call.
+    pub async fn build(self) -> io::Result<Storage> {
+        if self.packs_backend.is_none()
+            && Path::from(self.db_prefix.as_str()) == Path::from(self.prefix.as_str())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "db_prefix and prefix must differ to avoid key collisions when \
+                    packs defaults to sharing db's own backend: both are {:?}",
+                    self.db_prefix
+                ),
+            ));
+        }
+        let packs_store = self.packs_backend.unwrap_or_else(|| self.db_backend.clone());
+        let db = slatedb::Db::builder(self.db_prefix, self.db_backend)
+            .with_merge_operator(Stage::merge_operator())
+            .build()
+            .await
+            .map_err(other)?;
+        Ok(Storage {
+            stage: Stage {
+                db,
+                prefix: self.prefix.clone(),
+                flushing: Arc::new(tokio::sync::Mutex::new(())),
+                flush_failures: Arc::new(AtomicU32::new(0)),
+            },
+            packs: Packs {
+                store:     packs_store,
+                prefix:    self.prefix,
+                threshold: self.packs_threshold,
+            },
+
+            chunking: Chunking::new(),
+            encoding: Encoding::new(),
+            decoding: Decoding::new(),
+        })
+    }
+}
+
+impl Storage {
+    /// How many consecutive `flush_pending` failures `put_blob` tolerates
+    /// (returning `Ok` regardless, since its own write already durably
+    /// succeeded) before propagating the error instead -- see
+    /// `Storage::put_blob`.
+    const MAX_CONSECUTIVE_FLUSH_FAILURES: u32 = 3;
+
+    /// Starts building a `Storage`: `db` (opened under `db_prefix`)
+    /// persists to `backend`, and pack objects go there too by default
+    /// -- call [`StorageBuilder::packs`] to write them elsewhere
+    /// instead. See [`StorageBuilder`].
+    pub fn builder(
+        db_prefix: impl Into<String>,
+        db_backend: Arc<dyn ObjectStore>,
+    ) -> StorageBuilder {
+        StorageBuilder {
+            db_prefix: db_prefix.into(),
+            db_backend,
+            packs_backend: None,
+            prefix: StorageBuilder::DEFAULT_PREFIX.to_string(),
+            packs_threshold: StorageBuilder::DEFAULT_PACKS_THRESHOLD,
+        }
+    }
+
+    /// Whether `key` is already stored, without fetching its value.
+    async fn contains_blob(&self, key: Digest) -> io::Result<bool> {
+        self.stage.contains(key).await
+    }
+
+    /// Fetch bytes stored under `key`, if present.
+    async fn get_blob(&self, key: Digest) -> io::Result<Option<Bytes>> {
+        let Some(entry) = self.stage.get(key).await? else {
+            return Ok(None);
+        };
+        match entry {
+            Entry::Inline(bytes) => Ok(Some(bytes)),
+            Entry::Packed { pack_id, offset, length } => {
+                Ok(Some(self.packs.get_range(pack_id, offset, length).await?))
+            }
+        }
+    }
+
+    /// Store `bytes` under `key`. If enough is already staged to cross
+    /// `packs.threshold`, flushes first -- before staging `bytes` itself,
+    /// so a flush failure never makes this write look like it failed when
+    /// it didn't: on error, `bytes` was never staged, so the error is
+    /// honest. Tolerates up to `MAX_CONSECUTIVE_FLUSH_FAILURES`
+    /// consecutive flush failures this way (`flush_pending` tracks the
+    /// streak); past that, propagates the error instead of continuing to
+    /// accept writes that would never get packed.
+    async fn put_blob(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
+        if self.stage.pending_bytes().await? >= self.packs.threshold
+            && let Err(e) = self.flush_pending().await
+        {
+            let failures = self.stage.flush_failures.load(Ordering::Relaxed);
+            if failures >= Self::MAX_CONSECUTIVE_FLUSH_FAILURES {
+                return Err(e);
+            }
+        }
+        self.stage.put(key, bytes).await
+    }
+
+    /// How many distinct keys have ever been stored (staged or packed)
+    /// under this store's prefix. Test-only.
+    #[cfg(test)]
+    pub(crate) async fn entry_count(&self) -> io::Result<usize> {
+        self.stage.entry_count().await
+    }
+
+    /// Consolidates all currently-staged entries into one new pack object.
+    ///
+    /// If another call is already in progress, this returns immediately
+    /// without doing anything, rather than waiting its turn: nothing is
+    /// lost either way (staged entries are already durable and
+    /// readable), the next `put_blob` that crosses `packs.threshold`
+    /// will try again, and serializing this way means only one
+    /// execution ever reads `pending_keys_key` at a time, so no other
+    /// entry it fetches can already be `Packed`.
+    ///
+    /// Also maintains `flush_failures` -- reset to 0 on success,
+    /// incremented on failure -- regardless of who called this, so
+    /// `put_blob`'s own tolerance for consecutive failures reflects
+    /// every attempt, not just its own.
+    pub async fn flush_pending(&self) -> io::Result<()> {
+        let Ok(_guard) = self.stage.flushing.try_lock() else {
+            return Ok(());
+        };
+
+        let staged = self.stage.staged().await?;
+        if staged.is_empty() {
+            self.stage.flush_failures.store(0, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        // Each `Inline` value is kept as its own `Bytes`, not copied into
+        // one contiguous buffer -- `PutPayload` is a cheaply cloneable
+        // sequence of `Bytes` (`Arc<[Bytes]>`), so `packs.write` below
+        // takes them as-is.
+        let pack_id = Hasher::new().parts(staged.iter().map(|(_, b)| b.as_ref())).digest();
+        let mut entries = Vec::with_capacity(staged.len());
+        let mut chunks = Vec::with_capacity(staged.len());
+        let mut offset: u64 = 0;
+        for (digest, bytes) in staged {
+            let length = bytes.len() as u64;
+            entries.push((digest, Entry::Packed { pack_id, offset, length }));
+            offset += length;
+            chunks.push(bytes);
+        }
+
+        let result = match self.packs.write(pack_id, PutPayload::from_iter(chunks)).await {
+            Ok(()) => self.stage.commit_packed(entries).await,
+            Err(e) => Err(e),
+        };
+        match &result {
+            Ok(()) => self.stage.flush_failures.store(0, Ordering::Relaxed),
+            Err(_) => {
+                self.stage.flush_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result
     }
 
     /// Fetch and decode chunk(s).
@@ -406,7 +649,7 @@ impl Storage {
 
     /// Write one chunk(s) under `key`, skipping the encode step entirely
     /// if `key` is already stored.
-    async fn save(&self, key: Digest, bytes: Vec<u8>, flags: ContentFlags) -> io::Result<()> {
+    async fn save(&self, key: Digest, flags: ContentFlags, bytes: Vec<u8>) -> io::Result<()> {
         if self.contains_blob(key).await? {
             return Ok(());
         }
@@ -521,7 +764,7 @@ impl Storage {
             chunks_bytes.put_u32(chunk.length as u32);
             chunks_hasher.part(digest.as_ref());
             last_chunk_digest = Some(digest);
-            self.save(digest, chunk.data, ContentFlags::empty()).await?;
+            self.save(digest, ContentFlags::empty(), chunk.data).await?;
         }
 
         if total != len {
@@ -547,7 +790,7 @@ impl Storage {
             chunks_bytes.put_slice(digest.as_ref());
             chunks_bytes.put_u32(0);
             last_chunk_digest = Some(digest);
-            self.save(digest, Vec::new(), ContentFlags::empty()).await?;
+            self.save(digest, ContentFlags::empty(), Vec::new()).await?;
         }
 
         // Each chunk appends exactly one 36-byte record, so this always holds.
@@ -564,74 +807,10 @@ impl Storage {
             Ok(last_chunk_digest.expect("len() == 36 implies last_digest was set"))
         } else {
             let chunks_digest = chunks_hasher.digest();
-            self.save(chunks_digest, chunks_bytes, ContentFlags::CHUNKED).await?;
+            self.save(chunks_digest, ContentFlags::CHUNKED, chunks_bytes).await?;
             Ok(chunks_digest)
         }
     }
-}
-
-pub(crate) mod defaults {
-    //! Default values for chunking and encoding.
-    //!
-    //! # Chunking: `CHUNK_MIN_SIZE`, `CHUNK_AVG_SIZE`, `CHUNK_MAX_SIZE`
-    //!
-    //! NOT safe to change without consequence -- see `Chunking` for why.
-    //! min/avg set the dedup-vs-compression tradeoff: smaller chunks
-    //! dedup more precisely (a small change in content only invalidates
-    //! a small chunk) but compress worse (less context per chunk for
-    //! zstd to find matches in, plus more per-chunk framing overhead);
-    //! larger chunks compress better but dedup more coarsely (one
-    //! changed byte invalidates the whole chunk it falls in).
-    //!
-    //! # Encoding: `COMPRESSION_LEVEL`, `SNIFF_LEN`, `SNIFF_MAX_RATIO`
-    //!
-    //! Safe to change at any time. Each is a pure write-time heuristic:
-    //! every stored chunk records its own compressed-or-not decision,
-    //! so changing these only affects future writes, never how existing
-    //! ones are read back.
-    //!
-    //! `SNIFF_LEN`/`SNIFF_MAX_RATIO` trade CPU against storage savings:
-    //! stricter (a lower `SNIFF_MAX_RATIO`) only bothers compressing
-    //! chunks with a clearly worthwhile payoff, saving CPU but leaving
-    //! some real (if modest) compression on the table; looser values
-    //! capture more of those marginal savings but spend more CPU chasing
-    //! chunks that barely shrink.
-
-    /// One step above zstd's own default level (3), trading a bit more
-    /// CPU for a bit better ratio. Worth it here because `SNIFF_MAX_RATIO`
-    /// already filters out content that isn't worth compressing in the
-    /// first place, so every chunk that reaches this point already has
-    /// a real payoff to chase.
-    pub(crate) const COMPRESSION_LEVEL: i32 = 4;
-
-    /// How many bytes of a chunk to sample before deciding whether
-    /// it's worth compressing.
-    pub(crate) const SNIFF_LEN: usize = 16 * 1024;
-
-    /// Skip compression if the sniffed sample doesn't shrink to less
-    /// than this fraction of its own size. Already-compressed content
-    /// typically doesn't shrink further, so this avoids paying to
-    /// compress the rest of it for nothing.
-    pub(crate) const SNIFF_MAX_RATIO: f64 = 0.95;
-
-    pub(crate) const CHUNK_MIN_SIZE: usize = SNIFF_LEN * 4;
-    pub(crate) const CHUNK_AVG_SIZE: usize = CHUNK_MIN_SIZE * 8;
-    pub(crate) const CHUNK_MAX_SIZE: usize = CHUNK_AVG_SIZE * 4;
-
-    const _: () = assert!(
-        SNIFF_LEN < CHUNK_MIN_SIZE,
-        "SNIFF_LEN must stay smaller than `CHUNK_MIN_SIZE`: \
-        otherwise every regular chunk would have its whole content \"sampled\" \
-        -- compressed once to decide, then compressed again from scratch."
-    );
-
-    const _: () = assert!(
-        CHUNK_MAX_SIZE <= 4 * 1024 * 1024,
-        "CHUNK_MAX_SIZE has a hard ceiling to respect: \
-        gRPC's default max message size is 4MB, and a chunk is expected to \
-        map to one message on the wire, so this should stay comfortably under that. \
-        Not just below 4MB, leave room for message framing overhead too.",
-    );
 }
 
 /// The chunk-size knobs.
@@ -655,16 +834,36 @@ impl Default for Chunking {
 }
 
 impl Chunking {
+    /// Kept above `Encoding::SNIFF_LEN` so a regular chunk's whole
+    /// content is never "sampled": compressed once to decide, then
+    /// compressed again from scratch. Enforced at compile time in
+    /// `storage_test.rs`.
+    pub(super) const MIN_SIZE: usize = Encoding::SNIFF_LEN * 4;
+
+    /// `MIN_SIZE`/`AVG_SIZE` set the dedup-vs-compression tradeoff:
+    /// smaller chunks dedup more precisely (a small change in content
+    /// only invalidates a small chunk) but compress worse (less context
+    /// per chunk for zstd to find matches in, plus more per-chunk
+    /// framing overhead); larger chunks compress better but dedup more
+    /// coarsely (one changed byte invalidates the whole chunk it falls
+    /// in).
+    pub(super) const AVG_SIZE: usize = Self::MIN_SIZE * 8;
+
+    /// gRPC's default max message size is 4MB, and a chunk is expected
+    /// to map to one message on the wire, so this stays comfortably
+    /// under that -- not just below 4MB, leave room for message framing
+    /// overhead too. Enforced at compile time in `storage_test.rs`.
+    pub(super) const MAX_SIZE: usize = Self::AVG_SIZE * 4;
+
     pub(super) const fn new() -> Self {
-        Self {
-            min_size: defaults::CHUNK_MIN_SIZE,
-            avg_size: defaults::CHUNK_AVG_SIZE,
-            max_size: defaults::CHUNK_MAX_SIZE,
-        }
+        Self { min_size: Self::MIN_SIZE, avg_size: Self::AVG_SIZE, max_size: Self::MAX_SIZE }
     }
 }
 
-/// How to encode the chunk.
+/// How to encode the chunk. Each constant is a pure write-time
+/// heuristic, safe to change at any time: every stored chunk records
+/// its own compressed-or-not decision, so changing these only affects
+/// future writes, never how existing ones are read back.
 #[derive(Clone, Copy)]
 pub(super) struct Encoding {
     compression_level: i32,
@@ -679,11 +878,33 @@ impl Default for Encoding {
 }
 
 impl Encoding {
+    /// One step above zstd's own default level (3), trading a bit more
+    /// CPU for a bit better ratio. Worth it here because `SNIFF_MAX_RATIO`
+    /// already filters out content that isn't worth compressing in the
+    /// first place, so every chunk that reaches this point already has
+    /// a real payoff to chase.
+    pub(super) const COMPRESSION_LEVEL: i32 = 4;
+
+    /// How many bytes of a chunk to sample before deciding whether
+    /// it's worth compressing.
+    pub(super) const SNIFF_LEN: usize = 16 * 1024;
+
+    /// Skip compression if the sniffed sample doesn't shrink to less
+    /// than this fraction of its own size. Already-compressed content
+    /// typically doesn't shrink further, so this avoids paying to
+    /// compress the rest of it for nothing. Trades CPU against storage
+    /// savings: stricter (lower) only bothers compressing chunks with a
+    /// clearly worthwhile payoff, saving CPU but leaving some real (if
+    /// modest) compression on the table; looser values capture more of
+    /// those marginal savings but spend more CPU chasing chunks that
+    /// barely shrink.
+    pub(super) const SNIFF_MAX_RATIO: f64 = 0.95;
+
     pub(super) const fn new() -> Self {
         Self {
-            compression_level: defaults::COMPRESSION_LEVEL,
-            sniff_len:         defaults::SNIFF_LEN,
-            sniff_max_ratio:   defaults::SNIFF_MAX_RATIO,
+            compression_level: Self::COMPRESSION_LEVEL,
+            sniff_len:         Self::SNIFF_LEN,
+            sniff_max_ratio:   Self::SNIFF_MAX_RATIO,
         }
     }
 

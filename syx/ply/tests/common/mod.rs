@@ -13,12 +13,7 @@ use object_store::ObjectStore;
 pub async fn repository(root: impl AsRef<Path>) -> ply::Repository {
     let backend: Arc<dyn ObjectStore> =
         Arc::new(object_store::local::LocalFileSystem::new_with_prefix(root).unwrap());
-    let db = slatedb::Db::builder("test", backend.clone())
-        .with_merge_operator(cas::Storage::merge_operator())
-        .build()
-        .await
-        .unwrap();
-    let cas = cas::Storage::builder(db, backend, 1024 * 1024).build();
+    let cas = cas::Storage::builder("test", backend).build().await.unwrap();
     ply::Repository::new(cas)
 }
 
