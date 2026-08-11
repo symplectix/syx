@@ -6,14 +6,14 @@ use common::store;
 
 #[tokio::test]
 async fn put_returns_the_content_digest() {
-    let (_dir, store) = store();
+    let (_dir, store) = store().await;
     let d = store.put(&cas::Bytes::from_static(b"hello")).await.unwrap();
     assert_eq!(d, cas_testing::digest_bytes(b"hello"));
 }
 
 #[tokio::test]
 async fn copy_from_file_produces_the_same_digest_as_put() {
-    let (_dir, store) = store();
+    let (_dir, store) = store().await;
     let src_dir = testing::tempdir();
     let src = src_dir.path().join("blob");
     std::fs::write(&src, b"hello").unwrap();
@@ -27,7 +27,7 @@ async fn copy_from_file_produces_the_same_digest_as_put() {
 
 #[tokio::test]
 async fn copy_from_bytes_produces_the_same_digest_as_put() {
-    let (_dir, store) = store();
+    let (_dir, store) = store().await;
     let content = cas::Bytes::from_static(b"hello");
     let mut cursor = std::io::Cursor::new(&content);
     let d = store.copy_from(content.len() as u64, &mut cursor).await.unwrap();

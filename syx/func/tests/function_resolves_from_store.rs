@@ -6,7 +6,7 @@ use common::store;
 
 #[tokio::test]
 async fn action_variant_and_its_command_and_config_resolve_from_store() {
-    let (_dir, store) = store();
+    let (_dir, store) = store().await;
 
     // The command to run, once, directly.
     let command = func::Command::new("python3").arg("main.py");
@@ -48,7 +48,7 @@ async fn action_variant_and_its_command_and_config_resolve_from_store() {
 
 #[tokio::test]
 async fn server_variant_and_its_command_and_config_resolve_from_store() {
-    let (_dir, store) = store();
+    let (_dir, store) = store().await;
 
     // The command to run as the persistent process.
     let command = func::Command::new("serve").arg("--config");

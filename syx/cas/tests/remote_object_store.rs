@@ -1,5 +1,7 @@
 //! Round-trips content through `cas::Storage` backed by a real (local)
-//! S3-compatible remote.
+//! S3-compatible remote, including a blob large enough to span multiple
+//! chunks (and so multiple staged entries plus a manifest), and confirms
+//! staged entries do consolidate into pack objects.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use std::sync::Arc;
@@ -9,14 +11,22 @@ use aws_sdk_s3::config::{
     Credentials,
     Region,
 };
+use futures::StreamExt as _;
+use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
+use object_store::memory::InMemory;
 use testing::s3;
 
 const BUCKET: &str = "cas-test";
 
 /// `cas::Storage` backed by a real `AmazonS3`-compatible remote against
-/// `s3_server`, with `BUCKET` created and ready.
-async fn s3_cas(s3_server: &s3::Server) -> cas::Storage {
+/// `s3_server`, with `BUCKET` created and ready. Also returns that same
+/// remote as an `Arc<dyn ObjectStore>`, for tests that need to inspect
+/// pack objects directly.
+async fn s3_cas(
+    s3_server: &s3::Server,
+    packs_threshold: u64,
+) -> (cas::Storage, Arc<dyn ObjectStore>) {
     // A region is required by both clients below, but this server
     // doesn't validate it. "us-east-1" is just a conventional value.
     let s3_client = aws_sdk_s3::Client::from_conf(
@@ -39,26 +49,100 @@ async fn s3_cas(s3_server: &s3::Server) -> cas::Storage {
     );
     s3_client.create_bucket().bucket(BUCKET).send().await.unwrap();
 
-    let remote = AmazonS3Builder::new()
-        .with_endpoint(s3_server.endpoint())
-        .with_region("us-east-1")
-        .with_bucket_name(BUCKET)
-        .with_access_key_id(s3::ACCESS_KEY_ID)
-        .with_secret_access_key(s3::SECRET_ACCESS_KEY)
-        .with_allow_http(true)
-        .build()
-        .unwrap();
+    let remote: Arc<dyn ObjectStore> = Arc::new(
+        AmazonS3Builder::new()
+            .with_endpoint(s3_server.endpoint())
+            .with_region("us-east-1")
+            .with_bucket_name(BUCKET)
+            .with_access_key_id(s3::ACCESS_KEY_ID)
+            .with_secret_access_key(s3::SECRET_ACCESS_KEY)
+            .with_allow_http(true)
+            .build()
+            .unwrap(),
+    );
 
-    cas::Storage::new(Arc::new(remote))
+    let db_backend: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let cas = cas::Storage::builder("test", db_backend)
+        .packs(remote.clone())
+        .packs_threshold(packs_threshold)
+        .build()
+        .await
+        .unwrap();
+    (cas, remote)
 }
 
 #[tokio::test]
 async fn get_returns_what_was_put() {
     let s3_server = s3::Server::spawn(testing::tempdir()).unwrap();
-    let cas = s3_cas(&s3_server).await;
+    let (cas, _remote) = s3_cas(&s3_server, 1024 * 1024).await;
 
     let content = cas::Bytes::from_static(b"hello");
     let d = cas.put(&content).await.unwrap();
-
     assert_eq!(cas.get::<cas::Bytes>(&d).await.unwrap(), Some(content));
+
+    let content = cas::Bytes::from(testing::random_bytes(2 * 1024 * 1024));
+    let d = cas.put(&content).await.unwrap();
+    assert_eq!(cas.get::<cas::Bytes>(&d).await.unwrap(), Some(content));
+}
+
+#[tokio::test]
+async fn a_full_pack_flushes_on_the_next_write_and_stays_readable() {
+    let s3_server = s3::Server::spawn(testing::tempdir()).unwrap();
+    // Small enough that a single chunk's write crosses the threshold.
+    let (cas, remote) = s3_cas(&s3_server, 8).await;
+
+    // `put_blob` checks the threshold, and flushes if crossed, *before*
+    // staging its own bytes -- so a flush failure never makes an
+    // otherwise-successful write look like it failed. That means the
+    // write that crosses the threshold isn't the one that gets packed;
+    // the next one is.
+    let v1 = cas::Bytes::from_static(b"abcdefg1");
+    let d1 = cas.put(&v1).await.unwrap();
+    assert_eq!(remote.list(None).count().await, 0);
+
+    let v2 = cas::Bytes::from_static(b"abcdefg2");
+    let d2 = cas.put(&v2).await.unwrap();
+    assert_eq!(remote.list(None).count().await, 1);
+
+    assert_eq!(cas.get::<cas::Bytes>(&d1).await.unwrap(), Some(v1));
+    assert_eq!(cas.get::<cas::Bytes>(&d2).await.unwrap(), Some(v2));
+}
+
+#[tokio::test]
+async fn content_in_different_packs_stays_independently_readable() {
+    let s3_server = s3::Server::spawn(testing::tempdir()).unwrap();
+    // Large enough that nothing auto-flushes on its own -- each pack
+    // below is built up by staging several entries, then flushed
+    // explicitly, so it ends up holding more than just one entry.
+    let (cas, remote) = s3_cas(&s3_server, 1024 * 1024).await;
+
+    async fn put_and_flush(cas: &cas::Storage, values: &[cas::Bytes]) -> Vec<cas::Digest> {
+        let mut digests = Vec::with_capacity(values.len());
+        for v in values {
+            digests.push(cas.put(v).await.unwrap());
+        }
+        cas.flush_pending().await.unwrap();
+        digests
+    }
+
+    let pack_a = [
+        cas::Bytes::from_static(b"pack-a-value-1"),
+        cas::Bytes::from_static(b"pack-a-value-2"),
+        cas::Bytes::from_static(b"pack-a-value-3"),
+    ];
+    let pack_a_digests = put_and_flush(&cas, &pack_a).await;
+    assert_eq!(remote.list(None).count().await, 1);
+
+    let pack_b = [
+        cas::Bytes::from_static(b"pack-b-value-1"),
+        cas::Bytes::from_static(b"pack-b-value-2"),
+        cas::Bytes::from_static(b"pack-b-value-3"),
+    ];
+    let pack_b_digests = put_and_flush(&cas, &pack_b).await;
+    assert_eq!(remote.list(None).count().await, 2);
+
+    let entries = pack_a.iter().zip(&pack_a_digests).chain(pack_b.iter().zip(&pack_b_digests));
+    for (v, d) in entries {
+        assert_eq!(cas.get::<cas::Bytes>(d).await.unwrap(), Some(v.clone()));
+    }
 }
