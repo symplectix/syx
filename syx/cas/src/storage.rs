@@ -76,7 +76,6 @@ use bytes::{
     Bytes,
 };
 use futures::StreamExt as _;
-use object_store::path::Path;
 use object_store::{
     ObjectStore,
     PutPayload,
@@ -97,9 +96,9 @@ use crate::hash::{
 use crate::{
     Chunking,
     invalid_data,
-    other,
 };
 
+mod builder;
 mod codec;
 mod packs;
 mod stage;
@@ -119,7 +118,7 @@ pub struct Storage {
 
 /// Builds a `Storage`, opening `db` along the way with the merge
 /// operator `Storage` needs already registered.
-pub struct StorageBuilder {
+pub struct Builder {
     db_prefix:       String,
     db_backend:      Arc<dyn ObjectStore>,
     prefix:          String,
@@ -127,17 +126,6 @@ pub struct StorageBuilder {
     packs_threshold: u64,
     chunking:        Chunking,
     codec:           Codec,
-}
-
-/// Where an entry currently lives. Shared between `storage` (which
-/// constructs/matches these) and `stage` (which encodes/decodes them).
-enum Entry {
-    /// Still staged: the raw bytes themselves -- opaque here, but
-    /// really `[payload][ContentFlags]`, as `Codec::encode`
-    /// produced it.
-    Inline(Bytes),
-    /// Migrated: where to find it in an already-durable pack.
-    Packed { pack_id: Digest, offset: u64, length: u64 },
 }
 
 /// `cas::Storage`'s own staging area within `db` -- entries land here
@@ -164,6 +152,16 @@ struct Packs {
     threshold: u64,
 }
 
+/// Where an entry currently lives.
+enum Entry {
+    /// Still staged: the raw bytes themselves -- opaque here, but
+    /// really `[payload][ContentFlags]`, as `Codec::encode`
+    /// produced it.
+    Inline(Bytes),
+    /// Migrated: where to find it in an already-durable pack.
+    Packed { pack_id: Digest, offset: u64, length: u64 },
+}
+
 /// How to encode/decode a chunk. Each constant is a pure heuristic,
 /// safe to change at any time: every stored chunk records its own
 /// compressed-or-not decision, so changing these only affects
@@ -173,12 +171,6 @@ pub struct Codec {
     compression_level: i32,
     sniff_len:         usize,
     sniff_max_ratio:   f64,
-}
-
-impl Default for Codec {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 bitflags! {
@@ -195,112 +187,13 @@ bitflags! {
     }
 }
 
-impl StorageBuilder {
-    /// The default `prefix`, for the common case of `db` and `packs`
-    /// existing solely for this `Storage`'s own sake.
-    const DEFAULT_PREFIX: &str = "cas/";
-
-    /// The default `packs_threshold`: 32 MiB -- enough to consolidate
-    /// several dozen chunks per pack.
-    const DEFAULT_PACKS_THRESHOLD: u64 = Chunking::AVG_SIZE as u64 * 64;
-
-    /// The key prefix blobs are staged and packed under. Only needed
-    /// when `db` (and/or `packs`) is shared with something else that
-    /// needs its own namespace.
-    pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.prefix = prefix.into();
-        self
-    }
-
-    /// Writes pack objects to `packs` instead of `db`'s own backend
-    /// (the default -- see [`Storage::builder`]). Only needed when
-    /// content should live somewhere other than wherever `db` persists
-    /// itself.
-    pub fn packs(mut self, packs: Arc<dyn ObjectStore>) -> Self {
-        self.packs_backend = Some(packs);
-        self
-    }
-
-    /// How many bytes to stage before consolidating into a pack
-    /// (defaults to [`StorageBuilder::DEFAULT_PACKS_THRESHOLD`]).
-    pub fn packs_threshold(mut self, packs_threshold: u64) -> Self {
-        self.packs_threshold = packs_threshold;
-        self
-    }
-
-    /// Overrides chunking behavior (defaults to [`Chunking::new`]). See
-    /// `Chunking`'s own doc -- not safe to change carelessly.
-    pub fn chunking(mut self, chunking: Chunking) -> Self {
-        self.chunking = chunking;
-        self
-    }
-
-    /// Overrides encoding/decoding behavior (defaults to [`Codec::new`]).
-    /// Safe to change at any time -- see `Codec`'s own doc.
-    pub fn codec(mut self, codec: Codec) -> Self {
-        self.codec = codec;
-        self
-    }
-
-    /// Fails if `packs` was never set and `db_prefix`/`prefix` collide.
-    pub async fn build(self) -> io::Result<Storage> {
-        if self.packs_backend.is_none()
-            && Path::from(self.db_prefix.as_str()) == Path::from(self.prefix.as_str())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "db_prefix and prefix must differ to avoid key collisions when \
-                    packs defaults to sharing db's own backend: both are {:?}",
-                    self.db_prefix
-                ),
-            ));
-        }
-        let packs_store = self.packs_backend.unwrap_or_else(|| self.db_backend.clone());
-        // TODO: `db` is always opened with only `Stage::merge_operator()`.
-        // No way yet for a caller to supply/combine an additional merge
-        // operator for another component sharing this same `db`.
-        let db = slatedb::Db::builder(self.db_prefix, self.db_backend)
-            .with_merge_operator(Stage::merge_operator())
-            .build()
-            .await
-            .map_err(other)?;
-        Ok(Storage {
-            stage:    Stage {
-                db,
-                prefix: self.prefix.clone(),
-                flushing: Arc::new(tokio::sync::Mutex::new(())),
-                flush_failures: Arc::new(AtomicU32::new(0)),
-            },
-            packs:    Packs {
-                store:     packs_store,
-                prefix:    self.prefix,
-                threshold: self.packs_threshold,
-            },
-            chunking: self.chunking,
-            codec:    self.codec,
-        })
-    }
-}
-
 impl Storage {
     /// How many consecutive `flush_pending` failures `put_blob` tolerates.
     const MAX_CONSECUTIVE_FLUSH_FAILURES: u32 = 3;
 
     /// Starts building a `Storage`.
-    pub fn builder(
-        db_prefix: impl Into<String>,
-        db_backend: Arc<dyn ObjectStore>,
-    ) -> StorageBuilder {
-        StorageBuilder {
-            db_prefix: db_prefix.into(),
-            db_backend,
-            packs_backend: None,
-            prefix: StorageBuilder::DEFAULT_PREFIX.to_string(),
-            packs_threshold: StorageBuilder::DEFAULT_PACKS_THRESHOLD,
-            chunking: Chunking::new(),
-            codec: Codec::new(),
-        }
+    pub fn builder(db_prefix: impl Into<String>, db_backend: Arc<dyn ObjectStore>) -> Builder {
+        Builder::new(db_prefix, db_backend)
     }
 
     /// Whether `key` is already stored, without fetching its value.

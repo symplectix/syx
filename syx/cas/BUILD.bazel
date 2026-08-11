@@ -7,6 +7,7 @@ rust.library(
         "src/hash.rs",
         "src/lib.rs",
         "src/storage.rs",
+        "src/storage/builder.rs",
         "src/storage/codec.rs",
         "src/storage/packs.rs",
         "src/storage/stage.rs",

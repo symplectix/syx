@@ -16,9 +16,9 @@ pub use hash::{
     ToBytes,
 };
 pub use storage::{
+    Builder,
     Codec,
     Storage,
-    StorageBuilder,
 };
 
 fn invalid_data(msg: impl Into<String>) -> io::Error {

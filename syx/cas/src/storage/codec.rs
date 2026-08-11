@@ -8,6 +8,12 @@ use super::{
 };
 use crate::invalid_data;
 
+impl Default for Codec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Codec {
     /// One step above zstd's own default level (3), trading a bit more
     /// CPU for a bit better ratio. Worth it here because `SNIFF_MAX_RATIO`
