@@ -5,7 +5,7 @@ use tokio::io::{
     Take,
 };
 
-use crate::Encoding;
+use crate::Codec;
 
 /// The chunk-size settings.
 ///
@@ -28,11 +28,10 @@ impl Default for Chunking {
 }
 
 impl Chunking {
-    /// Kept above `Encoding::SNIFF_LEN` so a regular chunk's whole
-    /// content is never "sampled": compressed once to decide, then
-    /// compressed again from scratch. Enforced at compile time in
-    /// `storage_test.rs`.
-    pub const MIN_SIZE: usize = Encoding::SNIFF_LEN * 4;
+    /// Kept above `Codec::SNIFF_LEN` so a regular chunk's whole content
+    /// is never "sampled": compressed once to decide, then compressed
+    /// again from scratch. Enforced at compile time in `storage_test.rs`.
+    pub const MIN_SIZE: usize = Codec::SNIFF_LEN * 4;
 
     /// `MIN_SIZE`/`AVG_SIZE` set the dedup-vs-compression tradeoff:
     /// smaller chunks dedup more precisely (a small change in content

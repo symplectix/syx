@@ -44,37 +44,37 @@ async fn any_key_except(cas: &Storage, exclude: Digest) -> Digest {
 }
 
 fn encode(flags: ContentFlags, raw: Vec<u8>) -> Vec<u8> {
-    Encoding::new().encode(flags, raw)
+    Codec::new().encode(flags, raw)
 }
 
 #[test]
 fn worth_compressing_is_true_for_repetitive_content() {
-    assert!(Encoding::new().worth_compressing(&[b'a'; 4096]));
+    assert!(Codec::new().worth_compressing(&[b'a'; 4096]));
 }
 
 #[test]
 fn worth_compressing_is_false_for_random_content() {
-    assert!(!Encoding::new().worth_compressing(&testing::random_bytes(4096)));
+    assert!(!Codec::new().worth_compressing(&testing::random_bytes(4096)));
 }
 
 #[test]
 fn worth_compressing_is_false_for_empty_content() {
-    assert!(!Encoding::new().worth_compressing(&[]));
+    assert!(!Codec::new().worth_compressing(&[]));
 }
 
 #[test]
 fn an_overridden_sniff_max_ratio_leaves_the_rest_at_their_defaults() {
     let sample = testing::random_bytes(4096);
-    assert!(!Encoding::new().worth_compressing(&sample));
+    assert!(!Codec::new().worth_compressing(&sample));
     // >1.0: zstd's frame overhead makes `compressed_len` a little
     // *larger* than random data's own length, not just equal to it.
-    assert!(Encoding::new().sniff_max_ratio(2.0).worth_compressing(&sample));
+    assert!(Codec::new().sniff_max_ratio(2.0).worth_compressing(&sample));
 }
 
 // SNIFF_LEN must stay smaller than CHUNK_MIN_SIZE: otherwise every
 // regular chunk would have its whole content "sampled" -- compressed
 // once to decide, then compressed again from scratch.
-const _: () = assert!(Encoding::SNIFF_LEN < Chunking::MIN_SIZE);
+const _: () = assert!(Codec::SNIFF_LEN < Chunking::MIN_SIZE);
 
 // CHUNK_MAX_SIZE has a hard ceiling to respect: gRPC's default max
 // message size is 4MB, and a chunk is expected to map to one message
@@ -86,7 +86,7 @@ const _: () = assert!(Chunking::MAX_SIZE <= 4 * 1024 * 1024);
 fn encode_entry_round_trips_through_decode_entry() {
     for raw in [b"a".repeat(4096), testing::random_bytes(4096)] {
         let stored = encode(ContentFlags::empty(), raw.clone());
-        let (flags, decoded) = Decoding::new().decode(Bytes::from(stored)).unwrap();
+        let (flags, decoded) = Codec::new().decode(Bytes::from(stored)).unwrap();
         assert!(!flags.contains(ContentFlags::CHUNKED));
         assert_eq!(decoded, raw);
     }

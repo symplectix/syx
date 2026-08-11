@@ -46,7 +46,7 @@
 //!   [`Entry::encode`]'s output, either `Inline` or `Packed` below.
 //!
 //! `Inline`: `[payload][ContentFlags][EntryFlags]`
-//! The content exactly as [`Encoding::encode`] produced it (`[payload][ContentFlags]`), plus one
+//! The content exactly as [`Codec::encode`] produced it (`[payload][ContentFlags]`), plus one
 //! more trailing tag byte recording that this value *is* the content, not a pointer to it.
 //!
 //! `Packed`: `[pack_id: 32 bytes][offset: u64][length: u64][EntryFlags]`
@@ -95,9 +95,8 @@ use crate::hash::{
 };
 use crate::{
     Chunking,
+    Codec,
     ContentFlags,
-    Decoding,
-    Encoding,
     invalid_data,
     other,
 };
@@ -108,15 +107,14 @@ mod stage;
 #[cfg(test)]
 mod tests;
 
-/// Chunking, encoding, and the physical storage of blobs, staged in
-/// `slatedb` and packed into `packs` over time.
+/// Chunking, encoding/decoding, and the physical storage of blobs,
+/// staged in `slatedb` and packed into `packs` over time.
 #[derive(Clone)]
 pub struct Storage {
     stage:    Stage,
     packs:    Packs,
     chunking: Chunking,
-    encoding: Encoding,
-    decoding: Decoding,
+    codec:    Codec,
 }
 
 /// Builds a `Storage`, opening `db` along the way with the merge
@@ -128,14 +126,14 @@ pub struct StorageBuilder {
     packs_backend:   Option<Arc<dyn ObjectStore>>,
     packs_threshold: u64,
     chunking:        Chunking,
-    encoding:        Encoding,
+    codec:           Codec,
 }
 
 /// Where an entry currently lives. Shared between `storage` (which
 /// constructs/matches these) and `stage` (which encodes/decodes them).
 enum Entry {
     /// Still staged: the raw bytes themselves -- opaque here, but
-    /// really `[payload][ContentFlags]`, as `Encoding::encode`
+    /// really `[payload][ContentFlags]`, as `Codec::encode`
     /// produced it.
     Inline(Bytes),
     /// Migrated: where to find it in an already-durable pack.
@@ -206,10 +204,10 @@ impl StorageBuilder {
         self
     }
 
-    /// Overrides encoding behavior (defaults to [`Encoding::new`]). Safe
-    /// to change at any time -- see `Encoding`'s own doc.
-    pub fn encoding(mut self, encoding: Encoding) -> Self {
-        self.encoding = encoding;
+    /// Overrides encoding/decoding behavior (defaults to [`Codec::new`]).
+    /// Safe to change at any time -- see `Codec`'s own doc.
+    pub fn codec(mut self, codec: Codec) -> Self {
+        self.codec = codec;
         self
     }
 
@@ -249,8 +247,7 @@ impl StorageBuilder {
                 threshold: self.packs_threshold,
             },
             chunking: self.chunking,
-            encoding: self.encoding,
-            decoding: Decoding::new(),
+            codec:    self.codec,
         })
     }
 }
@@ -271,7 +268,7 @@ impl Storage {
             prefix: StorageBuilder::DEFAULT_PREFIX.to_string(),
             packs_threshold: StorageBuilder::DEFAULT_PACKS_THRESHOLD,
             chunking: Chunking::new(),
-            encoding: Encoding::new(),
+            codec: Codec::new(),
         }
     }
 
@@ -368,7 +365,7 @@ impl Storage {
         let Some(stored) = self.get_blob(*digest).await? else {
             return Ok(None);
         };
-        let dec = self.decoding;
+        let dec = self.codec;
         task::spawn_blocking(move || dec.decode(stored).map(Some))
             .await
             .expect("decode should not panic")
@@ -380,7 +377,7 @@ impl Storage {
         if self.contains_blob(key).await? {
             return Ok(());
         }
-        let enc = self.encoding;
+        let enc = self.codec;
 
         // Encoding runs in its own `spawn_blocking`, independent of however
         // the backend performs the write itself: it's CPU-bound work that
