@@ -9,7 +9,9 @@ rust.library(
         "src/hash.rs",
         "src/lib.rs",
         "src/storage.rs",
-        "src/storage_test.rs",
+        "src/storage/packs.rs",
+        "src/storage/stage.rs",
+        "src/storage/tests.rs",
     ],
     visibility = ["//visibility:public"],
     deps = [

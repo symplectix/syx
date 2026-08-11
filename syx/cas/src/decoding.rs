@@ -4,9 +4,15 @@ use bytes::Bytes;
 
 use crate::{
     ContentFlags,
-    Decoding,
     invalid_data,
 };
+
+/// How to decode the chunk.
+/// The read-side counterpart to `Encoding`.
+#[derive(Clone, Copy)]
+pub(crate) struct Decoding {
+    // Unlike encoding, decoding needs no options for now.
+}
 
 impl Default for Decoding {
     fn default() -> Self {

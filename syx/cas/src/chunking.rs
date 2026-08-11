@@ -1,7 +1,25 @@
-use crate::{
-    Chunking,
-    Encoding,
+use fastcdc::v2020;
+use tokio::io::{
+    AsyncRead,
+    AsyncReadExt as _,
+    Take,
 };
+
+use crate::Encoding;
+
+/// The chunk-size settings.
+///
+/// These aren't safe to change carelessly. Chunk boundaries depend on
+/// these parameters, so changing them shifts where cuts fall:
+/// even byte-identical content gets split into different chunks than
+/// before, with different digests. Existing chunks stay perfectly readable,
+/// but new writes no longer dedup against what's already stored.
+#[derive(Clone, Copy)]
+pub struct Chunking {
+    min_size: usize,
+    avg_size: usize,
+    max_size: usize,
+}
 
 impl Default for Chunking {
     fn default() -> Self {
@@ -54,5 +72,20 @@ impl Chunking {
     pub const fn max_size(mut self, max_size: usize) -> Self {
         self.max_size = max_size;
         self
+    }
+
+    /// Splits `r`, bounded to exactly `len` bytes, into content-defined
+    /// chunks. `r` may be a multiplexed/persistent stream where EOF
+    /// doesn't mark this blob's end, so this bounds the chunker to
+    /// exactly `len` bytes rather than reading until EOF.
+    pub(super) fn reader<'r, R>(
+        &self,
+        len: u64,
+        r: &'r mut R,
+    ) -> v2020::AsyncStreamCDC<Take<&'r mut R>>
+    where
+        R: AsyncRead + Unpin,
+    {
+        v2020::AsyncStreamCDC::new(r.take(len), self.min_size, self.avg_size, self.max_size)
     }
 }

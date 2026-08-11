@@ -1,7 +1,15 @@
-use crate::{
-    ContentFlags,
-    Encoding,
-};
+use crate::ContentFlags;
+
+/// How to encode the chunk. Each constant is a pure write-time
+/// heuristic, safe to change at any time: every stored chunk records
+/// its own compressed-or-not decision, so changing these only affects
+/// future writes, never how existing ones are read back.
+#[derive(Clone, Copy)]
+pub struct Encoding {
+    compression_level: i32,
+    sniff_len:         usize,
+    sniff_max_ratio:   f64,
+}
 
 impl Default for Encoding {
     fn default() -> Self {
