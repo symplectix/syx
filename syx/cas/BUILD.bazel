@@ -59,19 +59,6 @@ rust.test(
         ":cas",
         "//syx/testing",
         "@crates//:aws-sdk-s3",
-        "@crates//:object_store",
-        "@crates//:slatedb",
-        "@crates//:tokio",
-    ],
-)
-
-rust.test(
-    name = "cas_packing_storage_test",
-    size = "small",
-    srcs = ["tests/packing_storage.rs"],
-    deps = [
-        ":cas",
-        "//syx/testing",
         "@crates//:futures",
         "@crates//:object_store",
         "@crates//:slatedb",

@@ -47,51 +47,6 @@ fn encode(flags: ContentFlags, raw: Vec<u8>) -> Vec<u8> {
     Codec::new().encode(flags, raw)
 }
 
-#[test]
-fn worth_compressing_is_true_for_repetitive_content() {
-    assert!(Codec::new().worth_compressing(&[b'a'; 4096]));
-}
-
-#[test]
-fn worth_compressing_is_false_for_random_content() {
-    assert!(!Codec::new().worth_compressing(&testing::random_bytes(4096)));
-}
-
-#[test]
-fn worth_compressing_is_false_for_empty_content() {
-    assert!(!Codec::new().worth_compressing(&[]));
-}
-
-#[test]
-fn an_overridden_sniff_max_ratio_leaves_the_rest_at_their_defaults() {
-    let sample = testing::random_bytes(4096);
-    assert!(!Codec::new().worth_compressing(&sample));
-    // >1.0: zstd's frame overhead makes `compressed_len` a little
-    // *larger* than random data's own length, not just equal to it.
-    assert!(Codec::new().sniff_max_ratio(2.0).worth_compressing(&sample));
-}
-
-// SNIFF_LEN must stay smaller than CHUNK_MIN_SIZE: otherwise every
-// regular chunk would have its whole content "sampled" -- compressed
-// once to decide, then compressed again from scratch.
-const _: () = assert!(Codec::SNIFF_LEN < Chunking::MIN_SIZE);
-
-// CHUNK_MAX_SIZE has a hard ceiling to respect: gRPC's default max
-// message size is 4MB, and a chunk is expected to map to one message
-// on the wire, so this should stay comfortably under that. Not just
-// below 4MB, leave room for message framing overhead too.
-const _: () = assert!(Chunking::MAX_SIZE <= 4 * 1024 * 1024);
-
-#[test]
-fn encode_entry_round_trips_through_decode_entry() {
-    for raw in [b"a".repeat(4096), testing::random_bytes(4096)] {
-        let stored = encode(ContentFlags::empty(), raw.clone());
-        let (flags, decoded) = Codec::new().decode(Bytes::from(stored)).unwrap();
-        assert!(!flags.contains(ContentFlags::CHUNKED));
-        assert_eq!(decoded, raw);
-    }
-}
-
 #[tokio::test]
 async fn a_single_chunks_digest_is_the_content_digest_not_a_wrapped_one() {
     // This is what makes a small standalone blob dedup against the
@@ -158,6 +113,27 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
     check(packing(in_memory()).await, &blob_a, &blob_b, mem_keys).await;
     let (_tmp, inner) = local_fs();
     check(packing(inner).await, &blob_a, &blob_b, tmp_keys).await;
+}
+
+#[tokio::test]
+async fn flush_pending_flips_staged_entries_from_inline_to_packed() {
+    let cas = Storage::builder("test", in_memory())
+        .packs(in_memory())
+        .packs_threshold(8)
+        .build()
+        .await
+        .unwrap();
+
+    let content = Bytes::from_static(b"0123456789");
+    let d = cas.put(&content).await.unwrap();
+    assert!(matches!(cas.stage.get(d).await.unwrap(), Some(Entry::Inline(_))));
+    assert!(cas.stage.pending_bytes().await.unwrap() > 0);
+
+    cas.flush_pending().await.unwrap();
+    assert!(matches!(cas.stage.get(d).await.unwrap(), Some(Entry::Packed { .. })));
+    assert_eq!(cas.stage.pending_bytes().await.unwrap(), 0);
+
+    assert_eq!(cas.get::<Bytes>(&d).await.unwrap(), Some(content));
 }
 
 #[tokio::test]
@@ -283,24 +259,4 @@ async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
     check(packing(in_memory()).await).await;
     let (_tmp, inner) = local_fs();
     check(packing(inner).await).await;
-}
-
-#[tokio::test]
-async fn build_rejects_a_db_prefix_that_collides_with_prefix() {
-    // Not `.prefix(...)`-ed: exercises the default ("cas/"), which
-    // normalizes to the same `Path` as db_prefix "cas". `packs` is also
-    // left unset, so it defaults to sharing `backend` -- the check
-    // only applies in that case.
-    let err = Storage::builder("cas", in_memory()).build().await.err().unwrap();
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-}
-
-#[tokio::test]
-async fn build_allows_a_colliding_db_prefix_and_prefix_once_packs_is_set_explicitly() {
-    // Same colliding db_prefix/prefix as above, but `packs` is
-    // set explicitly (even to the very same backend) -- the check
-    // can't tell whether that's physically shared storage, so it's
-    // the caller's call, not rejected here.
-    let backend = in_memory();
-    Storage::builder("cas", backend.clone()).packs(backend).build().await.unwrap();
 }

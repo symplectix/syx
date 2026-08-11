@@ -111,3 +111,34 @@ impl Builder {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use object_store::memory::InMemory;
+
+    use super::*;
+
+    fn in_memory() -> Arc<dyn ObjectStore> {
+        Arc::new(InMemory::new())
+    }
+
+    #[tokio::test]
+    async fn build_rejects_a_db_prefix_that_collides_with_prefix() {
+        // Not `.prefix(...)`-ed: exercises the default ("cas/"), which
+        // normalizes to the same `Path` as db_prefix "cas". `packs` is also
+        // left unset, so it defaults to sharing `backend` -- the check
+        // only applies in that case.
+        let err = Storage::builder("cas", in_memory()).build().await.err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn build_allows_a_colliding_db_prefix_and_prefix_once_packs_is_set_explicitly() {
+        // Same colliding db_prefix/prefix as above, but `packs` is
+        // set explicitly (even to the very same backend) -- the check
+        // can't tell whether that's physically shared storage, so it's
+        // the caller's call, not rejected here.
+        let backend = in_memory();
+        Storage::builder("cas", backend.clone()).packs(backend).build().await.unwrap();
+    }
+}

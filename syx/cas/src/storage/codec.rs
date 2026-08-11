@@ -107,3 +107,48 @@ impl Codec {
         Ok((flags, bytes))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Chunking;
+
+    #[test]
+    fn worth_compressing_is_true_for_repetitive_content() {
+        assert!(Codec::new().worth_compressing(&[b'a'; 4096]));
+    }
+
+    #[test]
+    fn worth_compressing_is_false_for_random_content() {
+        assert!(!Codec::new().worth_compressing(&testing::random_bytes(4096)));
+    }
+
+    #[test]
+    fn worth_compressing_is_false_for_empty_content() {
+        assert!(!Codec::new().worth_compressing(&[]));
+    }
+
+    #[test]
+    fn an_overridden_sniff_max_ratio_leaves_the_rest_at_their_defaults() {
+        let sample = testing::random_bytes(4096);
+        assert!(!Codec::new().worth_compressing(&sample));
+        // >1.0: zstd's frame overhead makes `compressed_len` a little
+        // *larger* than random data's own length, not just equal to it.
+        assert!(Codec::new().sniff_max_ratio(2.0).worth_compressing(&sample));
+    }
+
+    // SNIFF_LEN must stay smaller than CHUNK_MIN_SIZE: otherwise every
+    // regular chunk would have its whole content "sampled" -- compressed
+    // once to decide, then compressed again from scratch.
+    const _: () = assert!(Codec::SNIFF_LEN < Chunking::MIN_SIZE);
+
+    #[test]
+    fn encode_round_trips_through_decode() {
+        for raw in [b"a".repeat(4096), testing::random_bytes(4096)] {
+            let stored = Codec::new().encode(ContentFlags::empty(), raw.clone());
+            let (flags, decoded) = Codec::new().decode(Bytes::from(stored)).unwrap();
+            assert!(!flags.contains(ContentFlags::CHUNKED));
+            assert_eq!(decoded, raw);
+        }
+    }
+}

@@ -30,9 +30,9 @@
 //! Two separate namespaces share the name "prefix": `db_prefix`, an `object_store::path::Path`
 //! passed straight through to `slatedb::Db::builder` and never touched again here (everything
 //! under it -- manifest, WAL, SST files -- is `slatedb`'s own concern), and `prefix`
-//! (`Stage`/`Packs`'s own `prefix` field, default `cas/`, see [`StorageBuilder::DEFAULT_PREFIX`]),
+//! (`Stage`/`Packs`'s own `prefix` field, default `cas/`, see [`Builder::DEFAULT_PREFIX`]),
 //! covered below. Both exist so `db` and/or `packs` can be shared with something else that carves
-//! out its own namespace without colliding -- see `StorageBuilder::build`'s collision check.
+//! out its own namespace without colliding -- see `Builder::build`'s collision check.
 //!
 //! ## `Stage` layout
 //!

@@ -30,7 +30,7 @@ impl Default for Chunking {
 impl Chunking {
     /// Kept above `Codec::SNIFF_LEN` so a regular chunk's whole content
     /// is never "sampled": compressed once to decide, then compressed
-    /// again from scratch. Enforced at compile time in `storage/tests.rs`.
+    /// again from scratch. Enforced at compile time in `storage/codec.rs`.
     pub const MIN_SIZE: usize = Codec::SNIFF_LEN * 4;
 
     /// `MIN_SIZE`/`AVG_SIZE` set the dedup-vs-compression tradeoff:
@@ -45,7 +45,7 @@ impl Chunking {
     /// gRPC's default max message size is 4MB, and a chunk is expected
     /// to map to one message on the wire, so this stays comfortably
     /// under that -- not just below 4MB, leave room for message framing
-    /// overhead too. Enforced at compile time in `storage/tests.rs`.
+    /// overhead too.
     pub const MAX_SIZE: usize = Self::AVG_SIZE * 4;
 
     /// Builds `Chunking` with the default `MIN_SIZE`/`AVG_SIZE`/`MAX_SIZE`.
@@ -87,4 +87,15 @@ impl Chunking {
     {
         v2020::AsyncStreamCDC::new(r.take(len), self.min_size, self.avg_size, self.max_size)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // MAX_SIZE has a hard ceiling to respect: gRPC's default max message
+    // size is 4MB, and a chunk is expected to map to one message on the
+    // wire, so this should stay comfortably under that. Not just below
+    // 4MB, leave room for message framing overhead too.
+    const _: () = assert!(Chunking::MAX_SIZE <= 4 * 1024 * 1024);
 }
