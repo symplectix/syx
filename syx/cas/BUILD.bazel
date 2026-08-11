@@ -36,7 +36,6 @@ rust.test(
     deps = [
         "//syx/testing",
         "@crates//:object_store",
-        "@crates//:slatedb",
         "@crates//:tempfile",
         "@crates//:tokio",
     ],
@@ -61,7 +60,6 @@ rust.test(
         "@crates//:aws-sdk-s3",
         "@crates//:futures",
         "@crates//:object_store",
-        "@crates//:slatedb",
         "@crates//:tokio",
     ],
 )

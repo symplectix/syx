@@ -34,7 +34,6 @@ rust.test_suite(
         "//syx/ply",
         "//syx/testing",
         "@crates//:object_store",
-        "@crates//:slatedb",
         "@crates//:tokio",
     ],
 )
