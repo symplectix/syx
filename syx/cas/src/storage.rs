@@ -69,6 +69,7 @@ use std::sync::atomic::{
     Ordering,
 };
 
+use bitflags::bitflags;
 use bytes::{
     Buf,
     BufMut,
@@ -95,12 +96,11 @@ use crate::hash::{
 };
 use crate::{
     Chunking,
-    Codec,
-    ContentFlags,
     invalid_data,
     other,
 };
 
+mod codec;
 mod packs;
 mod stage;
 
@@ -162,6 +162,37 @@ struct Packs {
     store:     Arc<dyn ObjectStore>,
     prefix:    String,
     threshold: u64,
+}
+
+/// How to encode/decode a chunk. Each constant is a pure heuristic,
+/// safe to change at any time: every stored chunk records its own
+/// compressed-or-not decision, so changing these only affects
+/// future writes, never how existing ones are read back.
+#[derive(Clone, Copy)]
+pub struct Codec {
+    compression_level: i32,
+    sniff_len:         usize,
+    sniff_max_ratio:   f64,
+}
+
+impl Default for Codec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+bitflags! {
+    /// The trailing byte of a blob's own encoded content -- set once,
+    /// at write time, and unchanged from then on regardless of where
+    /// that content ends up physically living.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ContentFlags: u8 {
+        /// The payload that follows is compressed by zstd.
+        const COMPRESSED = 1 << 0;
+        /// The payload is chunked, contains an ordered list of Chunk,
+        /// not content itself.
+        const CHUNKED = 1 << 1;
+    }
 }
 
 impl StorageBuilder {

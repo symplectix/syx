@@ -1,40 +1,12 @@
 use std::io;
 
-use bitflags::bitflags;
 use bytes::Bytes;
 
+use super::{
+    Codec,
+    ContentFlags,
+};
 use crate::invalid_data;
-
-/// How to encode/decode a chunk. Each constant is a pure heuristic,
-/// safe to change at any time: every stored chunk records its own
-/// compressed-or-not decision, so changing these only affects
-/// future writes, never how existing ones are read back.
-#[derive(Clone, Copy)]
-pub struct Codec {
-    compression_level: i32,
-    sniff_len:         usize,
-    sniff_max_ratio:   f64,
-}
-
-impl Default for Codec {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-bitflags! {
-    /// The trailing byte of a blob's own encoded content -- set once,
-    /// at write time, and unchanged from then on regardless of where
-    /// that content ends up physically living.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) struct ContentFlags: u8 {
-        /// The payload that follows is compressed by zstd.
-        const COMPRESSED = 1 << 0;
-        /// The payload is chunked, contains an ordered list of Chunk,
-        /// not content itself.
-        const CHUNKED = 1 << 1;
-    }
-}
 
 impl Codec {
     /// One step above zstd's own default level (3), trading a bit more

@@ -4,10 +4,10 @@ rust.library(
     name = "cas",
     srcs = [
         "src/chunking.rs",
-        "src/codec.rs",
         "src/hash.rs",
         "src/lib.rs",
         "src/storage.rs",
+        "src/storage/codec.rs",
         "src/storage/packs.rs",
         "src/storage/stage.rs",
         "src/storage/tests.rs",

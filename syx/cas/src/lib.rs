@@ -5,13 +5,10 @@ use std::io;
 pub use bytes::Bytes;
 
 mod chunking;
-mod codec;
 mod hash;
 mod storage;
 
 pub use chunking::Chunking;
-pub use codec::Codec;
-pub(crate) use codec::ContentFlags;
 pub use hash::{
     Digest,
     FromBytes,
@@ -19,6 +16,7 @@ pub use hash::{
     ToBytes,
 };
 pub use storage::{
+    Codec,
     Storage,
     StorageBuilder,
 };
