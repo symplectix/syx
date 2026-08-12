@@ -19,7 +19,7 @@ fn different_args_produce_different_command_digests() {
 
 #[test]
 fn different_env_produces_different_command_digests() {
-    let a = func::Command::new("run").env("KEY", "a");
-    let b = func::Command::new("run").env("KEY", "b");
+    let a = fabric::Command::new("run").env("KEY", "a");
+    let b = fabric::Command::new("run").env("KEY", "b");
     assert_ne!(cas_testing::digest(&a), cas_testing::digest(&b));
 }

@@ -1,14 +1,14 @@
 //! `Store::read_into` streams content to a writer instead of returning
 //! it as a fully materialized value.
 
-mod common;
 use std::io;
 
-use common::store;
+mod common;
+use common::temp_graph;
 
 #[tokio::test]
 async fn read_into_writes_small_content() {
-    let (_dir, store) = store().await;
+    let (_dir, store) = temp_graph().await;
     let d = store.put(&cas::Bytes::from_static(b"hello")).await.unwrap();
 
     let mut out = Vec::new();
@@ -19,7 +19,7 @@ async fn read_into_writes_small_content() {
 
 #[tokio::test]
 async fn read_into_writes_large_multi_chunk_content() {
-    let (_dir, store) = store().await;
+    let (_dir, store) = temp_graph().await;
     let content = testing::random_bytes(600_000);
     let d = store.put(&cas::Bytes::from(content.clone())).await.unwrap();
 
@@ -31,7 +31,7 @@ async fn read_into_writes_large_multi_chunk_content() {
 
 #[tokio::test]
 async fn read_into_matches_get_for_the_same_digest() {
-    let (_dir, store) = store().await;
+    let (_dir, store) = temp_graph().await;
     let content = testing::random_bytes(600_000);
     let d = store.copy_from(content.len() as u64, &mut io::Cursor::new(content)).await.unwrap();
 
@@ -44,7 +44,7 @@ async fn read_into_matches_get_for_the_same_digest() {
 
 #[tokio::test]
 async fn read_into_returns_false_for_a_missing_digest() {
-    let (_dir, store) = store().await;
+    let (_dir, store) = temp_graph().await;
     let missing = cas_testing::digest_bytes(b"never stored");
 
     let mut out = Vec::new();
