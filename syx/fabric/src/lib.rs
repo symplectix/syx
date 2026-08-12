@@ -2,7 +2,7 @@
 
 mod blob;
 mod function;
-mod repository;
+mod graph;
 
 pub use blob::{
     Node,
@@ -12,4 +12,4 @@ pub use function::{
     Command,
     Function,
 };
-pub use repository::Graph;
+pub use graph::Graph;

@@ -5,9 +5,9 @@ use common::temp_graph;
 
 #[tokio::test]
 async fn get_missing_digest_is_none() {
-    let (_dir, store) = temp_graph().await;
+    let (_dir, graph) = temp_graph().await;
     assert_eq!(
-        store.get::<cas::Bytes>(&cas_testing::digest_bytes(b"missing")).await.unwrap(),
+        graph.get::<cas::Bytes>(&cas_testing::digest_bytes(b"missing")).await.unwrap(),
         None
     );
 }

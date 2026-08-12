@@ -1,10 +1,10 @@
-//! What a `Repository` persists across instances.
+//! What a `Graph` persists across instances.
 
 mod common;
 
 #[tokio::test]
-async fn content_persists_across_store_instances() {
-    // A fresh Repository instance over the same root sees content a prior
+async fn content_persists_across_graph_instances() {
+    // A fresh Graph instance over the same root sees content a prior
     // instance wrote: proof it actually landed in the backing store.
     let dir = testing::tempdir();
 
