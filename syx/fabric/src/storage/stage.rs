@@ -6,6 +6,7 @@ use bytes::{
     Bytes,
     BytesMut,
 };
+use cas::Digest;
 use slatedb::{
     MergeOperator,
     MergeOperatorError,
@@ -15,9 +16,8 @@ use slatedb::{
 use super::{
     Entry,
     Stage,
+    other,
 };
-use crate::hash::Digest;
-use crate::other;
 
 bitflags! {
     /// The trailing byte of `slatedb` value. Never seen by anything
@@ -75,9 +75,6 @@ impl Entry {
 }
 
 /// `Stage`'s merge operator.
-// TODO: assumes it's the only `MergeOperator` registered on `db`. If `db`
-// ever gets shared with another user that needs its own merge behavior,
-// this needs to compose with that instead of being the sole dispatcher.
 struct StorageMergeOperator;
 
 impl MergeOperator for StorageMergeOperator {

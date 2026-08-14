@@ -8,13 +8,16 @@ use tokio::io::{
     AsyncWrite,
 };
 
-use crate::Graph;
+use crate::{
+    Graph,
+    storage,
+};
 
 /// Dispatches to one of several `MergeOperator`s by key prefix.
 ///
-/// `slatedb` accepts exactly one `MergeOperator` per `db`, but `cas::Storage`
-/// and `Graph`'s own relation storage each need their own merge semantics
-/// on the same `db`.
+/// `slatedb` accepts exactly one `MergeOperator` per `db`, but the blob
+/// storage engine (`storage::Storage`) and `Graph`'s own relation storage
+/// each need their own merge semantics on the same `db`.
 struct PrefixMergeOperator {
     routes: Vec<(Vec<u8>, Box<dyn slatedb::MergeOperator + Send + Sync>)>,
 }
@@ -54,8 +57,8 @@ impl slatedb::MergeOperator for PrefixMergeOperator {
     }
 }
 
-/// Builds a `Graph`, opening the `slatedb::Db` it and its `cas::Storage`
-/// share.
+/// Builds a `Graph`, opening the `slatedb::Db` it and its blob storage
+/// engine (`storage::Storage`) share.
 pub struct Builder {
     db_prefix:       String,
     db_backend:      Arc<dyn ObjectStore>,
@@ -110,19 +113,19 @@ impl Builder {
     }
 
     /// Opens `db`, registered with a `PrefixMergeOperator` that currently
-    /// only routes to `cas::Storage::merge_operator()`, and builds the
-    /// `Graph` and its `cas::Storage` over that same `db`.
+    /// only routes to the blob storage engine's own operator, and builds
+    /// the `Graph` and its `storage::Storage` over that same `db`.
     // TODO: `Graph`'s own relation storage will need its own merge operator
     // eventually (e.g. for growable reference sets, see hypergraph.md).
     // `PrefixMergeOperator` below is a rough scaffold for composing it with
-    // cas's once it exists, not a finished design -- `Graph`'s own merge
-    // semantics don't exist yet.
+    // the blob engine's once it exists, not a finished design -- `Graph`'s
+    // own merge semantics don't exist yet.
     pub async fn build(self) -> io::Result<Graph> {
-        let cas_prefix =
-            self.prefix.clone().unwrap_or_else(|| cas::Builder::DEFAULT_PREFIX.to_string());
+        let prefix =
+            self.prefix.clone().unwrap_or_else(|| storage::Builder::DEFAULT_PREFIX.to_string());
         let merge_operator: Arc<dyn slatedb::MergeOperator + Send + Sync> =
             Arc::new(PrefixMergeOperator {
-                routes: vec![(cas_prefix.into_bytes(), cas::Storage::merge_operator())],
+                routes: vec![(prefix.into_bytes(), storage::Storage::merge_operator())],
             });
 
         let db = slatedb::Db::builder(self.db_prefix, self.db_backend.clone())
@@ -132,21 +135,21 @@ impl Builder {
             .map_err(io::Error::other)?;
 
         let packs_backend = self.packs_backend.unwrap_or_else(|| self.db_backend.clone());
-        let mut cas_builder = cas::Storage::builder_with_db(db.clone(), packs_backend);
+        let mut storage_builder = storage::Storage::builder_with_db(db.clone(), packs_backend);
         if let Some(prefix) = self.prefix {
-            cas_builder = cas_builder.prefix(prefix);
+            storage_builder = storage_builder.prefix(prefix);
         }
         if let Some(packs_threshold) = self.packs_threshold {
-            cas_builder = cas_builder.packs_threshold(packs_threshold);
+            storage_builder = storage_builder.packs_threshold(packs_threshold);
         }
         if let Some(chunking) = self.chunking {
-            cas_builder = cas_builder.chunking(chunking);
+            storage_builder = storage_builder.chunking(chunking);
         }
         if let Some(codec) = self.codec {
-            cas_builder = cas_builder.codec(codec);
+            storage_builder = storage_builder.codec(codec);
         }
 
-        Ok(Graph::new(db, cas_builder.build().await?))
+        Ok(Graph::new(db, storage_builder.build().await?))
     }
 }
 
@@ -157,19 +160,19 @@ impl Graph {
         Builder::new(db_prefix, db_backend)
     }
 
-    /// Wraps `db` (opened with `cas::Storage::merge_operator()` registered,
-    /// composed with whatever else `Graph`'s own future relation storage
-    /// needs) and the `cas::Storage` built over that same `db`. Only
-    /// `Builder::build` calls this -- construct a `Graph` via
-    /// `Graph::builder` instead of opening `db`/building `cas::Storage`
-    /// yourself.
-    const fn new(db: slatedb::Db, cas: cas::Storage) -> Self {
-        Self { db, cas }
+    /// Wraps `db` (opened with the blob storage engine's merge operator
+    /// registered, composed with whatever else `Graph`'s own future
+    /// relation storage needs) and the `storage::Storage` built over that
+    /// same `db`. Only `Builder::build` calls this -- construct a `Graph`
+    /// via `Graph::builder` instead of opening `db`/building
+    /// `storage::Storage` yourself.
+    const fn new(db: slatedb::Db, storage: storage::Storage) -> Self {
+        Self { db, storage }
     }
 
     /// Reads the content at `digest`, if present.
     pub async fn get<T: cas::FromBytes>(&self, digest: &cas::Digest) -> io::Result<Option<T>> {
-        self.cas.get(digest).await
+        self.storage.get(digest).await
     }
 
     /// Reads the content at `digest` if present and write it to `w`.
@@ -179,13 +182,13 @@ impl Graph {
     where
         W: AsyncWrite + Unpin,
     {
-        self.cas.read_into(digest, w).await
+        self.storage.read_into(digest, w).await
     }
 
     /// Store `content`, addressed by its own digest, and return that
     /// digest. A thin wrapper over `copy_from`.
     pub async fn put<T: cas::ToBytes>(&self, content: &T) -> io::Result<cas::Digest> {
-        self.cas.put(content).await
+        self.storage.put(content).await
     }
 
     /// Store the content read from `r` of `len` bytes, addressed by its
@@ -194,6 +197,13 @@ impl Graph {
     where
         R: AsyncRead + Unpin,
     {
-        self.cas.copy_from(len, r).await
+        self.storage.copy_from(len, r).await
+    }
+
+    /// Consolidates all currently-staged blobs into one new pack object.
+    /// Mostly for tests -- `put`/`copy_from` already flush on their own
+    /// once enough accumulates.
+    pub async fn flush_pending(&self) -> io::Result<()> {
+        self.storage.flush_pending().await
     }
 }

@@ -4,12 +4,18 @@ use bytes::{
     BufMut,
     Bytes,
 };
+use cas::{
+    Chunking,
+    Codec,
+    ContentFlags,
+    Digest,
+    Hasher,
+};
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 
 use super::*;
-use crate::hash::Hasher;
 
 fn in_memory() -> Arc<dyn ObjectStore> {
     Arc::new(InMemory::new())

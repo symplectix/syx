@@ -2,6 +2,7 @@ use std::io;
 use std::ops::Range;
 
 use bytes::Bytes;
+use cas::Digest;
 use object_store::path::Path;
 use object_store::{
     GetOptions,
@@ -10,7 +11,6 @@ use object_store::{
 };
 
 use super::Packs;
-use crate::hash::Digest;
 
 impl Packs {
     fn path(&self, pack_id: Digest) -> Path {

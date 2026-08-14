@@ -4,26 +4,18 @@ rust.library(
     name = "cas",
     srcs = [
         "src/chunking.rs",
+        "src/codec.rs",
         "src/hash.rs",
         "src/lib.rs",
-        "src/storage.rs",
-        "src/storage/builder.rs",
-        "src/storage/codec.rs",
-        "src/storage/packs.rs",
-        "src/storage/stage.rs",
-        "src/storage/tests.rs",
     ],
     visibility = ["//visibility:public"],
     deps = [
         "@crates//:bitflags",
         "@crates//:bytes",
         "@crates//:fastcdc",
-        "@crates//:futures",
-        "@crates//:object_store",
         "@crates//:serde",
         "@crates//:serde_bytes",
         "@crates//:sha2",
-        "@crates//:slatedb",
         "@crates//:tokio",
         "@crates//:zstd",
     ],
@@ -35,32 +27,6 @@ rust.test(
     crate = ":cas",
     deps = [
         "//syx/testing",
-        "@crates//:object_store",
-        "@crates//:tempfile",
-        "@crates//:tokio",
-    ],
-)
-
-rust.test(
-    name = "cas_remote_object_store_test",
-    size = "small",
-    srcs = ["tests/remote_object_store.rs"],
-    data = ["@minio_static//file"],
-    # The bundled minio_static binary sometimes reports "Server not
-    # initialized yet" on its first request right after startup.
-    flaky = True,
-    # The minio_static runfile is a static Linux/amd64 binary.
-    target_compatible_with = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:linux",
-    ],
-    deps = [
-        ":cas",
-        "//syx/testing",
-        "@crates//:aws-sdk-s3",
-        "@crates//:futures",
-        "@crates//:object_store",
-        "@crates//:tokio",
     ],
 )
 

@@ -2,6 +2,16 @@
 //! decoding and verifying on the way out. Blobs are staged in `slatedb`
 //! before being consolidated into pack objects in a wrapped `ObjectStore`.
 //!
+//! Fabric-internal: `cas` used to own this (as `cas::Storage`), but `cas`
+//! had exactly one consumer -- `fabric` -- and this engine's own `db` is
+//! the same `slatedb::Db` handle `Graph` holds directly (see
+//! `graph.rs`). Splitting it across a crate boundary bought nothing but a
+//! public hooks API (`DbMode`, `builder_with_db`, `merge_operator()`)
+//! that existed only to let two crates cooperate over one `db`. `cas`
+//! keeps the storage-agnostic pieces (`Digest`, `Chunking`, `Codec`);
+//! this module keeps the part that's actually about `slatedb`/
+//! `object_store`.
+//!
 //! # Why pack at all
 //!
 //! One object per chunk means one backend API call per chunk, which
@@ -46,7 +56,7 @@
 //!   [`Entry::encode`]'s output, either `Inline` or `Packed` below.
 //!
 //! `Inline`: `[payload][ContentFlags][EntryFlags]`
-//! The content exactly as [`Codec::encode`] produced it (`[payload][ContentFlags]`), plus one
+//! The content exactly as [`cas::Codec::encode`] produced it (`[payload][ContentFlags]`), plus one
 //! more trailing tag byte recording that this value *is* the content, not a pointer to it.
 //!
 //! `Packed`: `[pack_id: 32 bytes][offset: u64][length: u64][EntryFlags]`
@@ -69,11 +79,19 @@ use std::sync::atomic::{
     Ordering,
 };
 
-use bitflags::bitflags;
 use bytes::{
     Buf,
     BufMut,
     Bytes,
+};
+use cas::{
+    Chunking,
+    Codec,
+    ContentFlags,
+    Digest,
+    FromBytes,
+    Hasher,
+    ToBytes,
 };
 use futures::StreamExt as _;
 use object_store::{
@@ -87,24 +105,20 @@ use tokio::io::{
 };
 use tokio::task;
 
-use crate::hash::{
-    Digest,
-    FromBytes,
-    Hasher,
-    ToBytes,
-};
-use crate::{
-    Chunking,
-    invalid_data,
-};
-
 mod builder;
-mod codec;
 mod packs;
 mod stage;
 
 #[cfg(test)]
 mod tests;
+
+fn invalid_data(msg: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.into())
+}
+
+fn other(e: impl std::error::Error + Send + Sync + 'static) -> io::Error {
+    io::Error::other(e)
+}
 
 /// Chunking, encoding/decoding, and the physical storage of blobs,
 /// staged in `slatedb` and packed into `packs` over time.
@@ -130,13 +144,17 @@ pub struct Builder {
 
 /// How `Builder::build` gets its `slatedb::Db`.
 enum DbMode {
-    /// Open a new `slatedb::Db` at `db_prefix` in `db_backend`.
+    /// Open a new `slatedb::Db` at `db_prefix` in `db_backend`. `Graph`
+    /// always uses `Provided` in production (it opens `db` itself, see
+    /// `graph.rs`) -- `Open` exists for tests that want a standalone
+    /// `Storage` without wiring up their own `db`.
+    #[cfg_attr(not(test), allow(dead_code))]
     Open { db_prefix: String, db_backend: Arc<dyn ObjectStore> },
     /// Use this already-opened `db` as-is.
     Provided(slatedb::Db),
 }
 
-/// `cas::Storage`'s own staging area within `db` -- entries land here
+/// `Storage`'s own staging area within `db` -- entries land here
 /// first, before being consolidated into `Packs`.
 #[derive(Clone)]
 struct Stage {
@@ -170,47 +188,24 @@ enum Entry {
     Packed { pack_id: Digest, offset: u64, length: u64 },
 }
 
-/// How to encode/decode a chunk. Each constant is a pure heuristic,
-/// safe to change at any time: every stored chunk records its own
-/// compressed-or-not decision, so changing these only affects
-/// future writes, never how existing ones are read back.
-#[derive(Clone, Copy)]
-pub struct Codec {
-    compression_level: i32,
-    sniff_len:         usize,
-    sniff_max_ratio:   f64,
-}
-
-bitflags! {
-    /// The trailing byte of a blob's own encoded content -- set once,
-    /// at write time, and unchanged from then on regardless of where
-    /// that content ends up physically living.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct ContentFlags: u8 {
-        /// The payload that follows is compressed by zstd.
-        const COMPRESSED = 1 << 0;
-        /// The payload is chunked, contains an ordered list of Chunk,
-        /// not content itself.
-        const CHUNKED = 1 << 1;
-    }
-}
-
 impl Storage {
     /// How many consecutive `flush_pending` failures `put_blob` tolerates.
     const MAX_CONSECUTIVE_FLUSH_FAILURES: u32 = 3;
 
     /// Starts building a `Storage`, opening a new `slatedb::Db` at
-    /// `db_prefix` in `db_backend`.
+    /// `db_prefix` in `db_backend`. Test-only convenience -- `Graph`
+    /// always uses `Storage::builder_with_db` in production.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn builder(db_prefix: impl Into<String>, db_backend: Arc<dyn ObjectStore>) -> Builder {
         Builder::new(db_prefix, db_backend)
     }
 
     /// Starts building a `Storage` over an already-opened `db`, instead of
-    /// opening a new one -- for sharing one `slatedb::Db` with another
-    /// component that has its own keys in the same db. `db` must already be
-    /// registered with [`Storage::merge_operator`] (composed with whatever
-    /// else needs to share it). `packs_backend` is required here since
-    /// there's no `db`-owned backend handle left to default it to.
+    /// opening a new one -- for sharing one `slatedb::Db` with `Graph`'s
+    /// own relation storage. `db` must already be registered with
+    /// [`Storage::merge_operator`] (composed with whatever else needs to
+    /// share it). `packs_backend` is required here since there's no
+    /// `db`-owned backend handle left to default it to.
     pub fn builder_with_db(db: slatedb::Db, packs_backend: Arc<dyn ObjectStore>) -> Builder {
         Builder::with_db(db, packs_backend)
     }

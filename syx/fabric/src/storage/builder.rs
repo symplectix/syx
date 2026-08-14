@@ -2,6 +2,10 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
+use cas::{
+    Chunking,
+    Codec,
+};
 use object_store::ObjectStore;
 use object_store::path::Path;
 
@@ -11,25 +15,21 @@ use super::{
     Packs,
     Stage,
     Storage,
-};
-use crate::{
-    Chunking,
-    Codec,
     other,
 };
 
 impl Builder {
     /// The default `prefix`, for the common case of `db` and `packs`
-    /// existing solely for this `Storage`'s own sake. Public so a caller
-    /// opening `db` itself (see `Storage::builder_with_db`) can resolve
-    /// the same default when routing merge operators by key prefix.
-    pub const DEFAULT_PREFIX: &str = "cas/";
+    /// existing solely for this `Storage`'s own sake.
+    pub(crate) const DEFAULT_PREFIX: &str = "cas/";
 
     /// The default `packs_threshold`: 32 MiB -- enough to consolidate
     /// several dozen chunks per pack.
     const DEFAULT_PACKS_THRESHOLD: u64 = Chunking::AVG_SIZE as u64 * 64;
 
-    /// Starts building a `Storage`, opening a new `db`.
+    /// Starts building a `Storage`, opening a new `db`. Test-only
+    /// convenience -- see `Storage::builder`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn new(db_prefix: impl Into<String>, db_backend: Arc<dyn ObjectStore>) -> Builder {
         Builder {
             db_mode:         DbMode::Open { db_prefix: db_prefix.into(), db_backend },
@@ -61,7 +61,9 @@ impl Builder {
 
     /// Writes pack objects to `packs` instead of `db`'s own backend.
     /// Only needed when content should live somewhere other than
-    /// wherever `db` persists itself.
+    /// wherever `db` persists itself. Only reachable via `Builder::new`,
+    /// so test-only for the same reason that is.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn packs(mut self, packs: Arc<dyn ObjectStore>) -> Self {
         self.packs_backend = Some(packs);
         self
