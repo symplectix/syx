@@ -119,11 +119,10 @@ impl Builder {
     // the blob engine's once it exists, not a finished design -- `Graph`'s
     // own merge semantics don't exist yet.
     pub async fn build(self) -> io::Result<Graph> {
-        let prefix =
-            self.prefix.clone().unwrap_or_else(|| storage::Builder::DEFAULT_PREFIX.to_string());
+        let prefix = self.prefix.unwrap_or_else(|| storage::DEFAULT_PREFIX.to_string());
         let merge_operator: Arc<dyn slatedb::MergeOperator + Send + Sync> =
             Arc::new(PrefixMergeOperator {
-                routes: vec![(prefix.into_bytes(), storage::merge_operator())],
+                routes: vec![(prefix.clone().into_bytes(), storage::merge_operator())],
             });
 
         let db = slatedb::Db::builder(self.db_prefix, self.db_backend.clone())
@@ -133,21 +132,12 @@ impl Builder {
             .map_err(io::Error::other)?;
 
         let packs_backend = self.packs_backend.unwrap_or_else(|| self.db_backend.clone());
-        let mut storage_builder = storage::Builder::new(packs_backend);
-        if let Some(prefix) = self.prefix {
-            storage_builder = storage_builder.prefix(prefix);
-        }
-        if let Some(packs_threshold) = self.packs_threshold {
-            storage_builder = storage_builder.packs_threshold(packs_threshold);
-        }
-        if let Some(chunking) = self.chunking {
-            storage_builder = storage_builder.chunking(chunking);
-        }
-        if let Some(codec) = self.codec {
-            storage_builder = storage_builder.codec(codec);
-        }
+        let packs_threshold = self.packs_threshold.unwrap_or(storage::DEFAULT_PACKS_THRESHOLD);
+        let chunking = self.chunking.unwrap_or_default();
+        let codec = self.codec.unwrap_or_default();
 
-        let storage::Parts { stage, packs, chunking, codec } = storage_builder.build();
+        let storage::Parts { stage, packs } =
+            storage::parts(packs_backend, prefix, packs_threshold);
         Ok(Graph::new(db, stage, packs, chunking, codec))
     }
 }

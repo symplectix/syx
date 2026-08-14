@@ -107,7 +107,6 @@ use tokio::io::{
 };
 use tokio::task;
 
-mod builder;
 mod packs;
 mod stage;
 
@@ -129,6 +128,34 @@ pub(crate) fn merge_operator() -> Box<dyn slatedb::MergeOperator + Send + Sync> 
     Stage::merge_operator()
 }
 
+/// The default `prefix`, for the common case of `packs` existing solely
+/// for this `Graph`'s own blob storage.
+pub(crate) const DEFAULT_PREFIX: &str = "cas/";
+
+/// The default `packs_threshold`: 32 MiB -- enough to consolidate
+/// several dozen chunks per pack.
+pub(crate) const DEFAULT_PACKS_THRESHOLD: u64 = Chunking::AVG_SIZE as u64 * 64;
+
+/// Assembles the blob-storage parts (`stage`/`packs`/`chunking`/`codec`)
+/// for `Graph` to hold directly. `Graph::Builder` is the configuration
+/// surface (defaults, overrides) -- this just builds what it resolves,
+/// so there's no second builder re-exposing the same knobs one layer
+/// down for no added behavior.
+pub(crate) fn parts(
+    packs_backend: Arc<dyn ObjectStore>,
+    prefix: String,
+    packs_threshold: u64,
+) -> Parts {
+    Parts {
+        stage: Stage {
+            prefix:         prefix.clone(),
+            flushing:       Arc::new(tokio::sync::Mutex::new(())),
+            flush_failures: Arc::new(AtomicU32::new(0)),
+        },
+        packs: Packs { store: packs_backend, prefix, threshold: packs_threshold },
+    }
+}
+
 /// The blob-storage facet of a `Graph`: chunking, encoding/decoding, and
 /// physical storage of blobs staged in `db` and packed into `packs` over
 /// time. A borrowed view, not an owned type -- `Graph` holds `db`/
@@ -144,25 +171,13 @@ pub struct Cas<'a> {
     codec:    Codec,
 }
 
-/// Builds the parts a `Graph` assembles itself from (`stage`/`packs`/
-/// `chunking`/`codec`). Not a `Storage` type: `Graph` holds these as its
-/// own fields directly rather than behind another layer, see the module
-/// doc.
-pub struct Builder {
-    packs_backend:   Arc<dyn ObjectStore>,
-    prefix:          String,
-    packs_threshold: u64,
-    chunking:        Chunking,
-    codec:           Codec,
-}
-
-/// What `Builder::build` produces, for `Graph::new` to destructure into
-/// its own fields.
+/// What `parts` produces, for `Graph::new` to destructure into its own
+/// fields. `chunking`/`codec` aren't here: they pass straight through
+/// unchanged, so every caller already has its own copy and doesn't need
+/// one handed back.
 pub(crate) struct Parts {
-    pub(crate) stage:    Stage,
-    pub(crate) packs:    Packs,
-    pub(crate) chunking: Chunking,
-    pub(crate) codec:    Codec,
+    pub(crate) stage: Stage,
+    pub(crate) packs: Packs,
 }
 
 /// The staging area within whichever `db` each `Cas` call is given --

@@ -43,11 +43,15 @@ async fn test_db() -> slatedb::Db {
 /// `slatedb::Db` (staging durability isn't what these tests are about;
 /// `packs` is the backend variety under test).
 async fn packing(packs: Arc<dyn ObjectStore>) -> (slatedb::Db, Parts) {
-    (test_db().await, Builder::new(packs).build())
+    let db = test_db().await;
+    let parts = parts(packs, DEFAULT_PREFIX.to_string(), DEFAULT_PACKS_THRESHOLD);
+    (db, parts)
 }
 
+/// No test overrides chunking/encoding behavior, so `cas()` just uses
+/// their defaults directly rather than threading them through `Parts`.
 fn cas<'a>(db: &'a slatedb::Db, parts: &'a Parts) -> Cas<'a> {
-    Cas::new(db, &parts.stage, &parts.packs, parts.chunking, parts.codec)
+    Cas::new(db, &parts.stage, &parts.packs, Chunking::new(), Codec::new())
 }
 
 /// Some chunk digest referenced by `exclude`'s own manifest, other than
@@ -144,7 +148,7 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
 #[tokio::test]
 async fn flush_pending_flips_staged_entries_from_inline_to_packed() {
     let db = test_db().await;
-    let parts = Builder::new(in_memory()).packs_threshold(8).build();
+    let parts = parts(in_memory(), DEFAULT_PREFIX.to_string(), 8);
     let cas = cas(&db, &parts);
 
     let content = Bytes::from_static(b"0123456789");

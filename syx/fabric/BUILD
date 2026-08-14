@@ -8,7 +8,6 @@ rust.library(
         "src/graph.rs",
         "src/lib.rs",
         "src/storage.rs",
-        "src/storage/builder.rs",
         "src/storage/packs.rs",
         "src/storage/stage.rs",
         "src/storage/tests.rs",
