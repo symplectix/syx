@@ -20,8 +20,10 @@ use crate::{
 
 impl Builder {
     /// The default `prefix`, for the common case of `db` and `packs`
-    /// existing solely for this `Storage`'s own sake.
-    const DEFAULT_PREFIX: &str = "cas/";
+    /// existing solely for this `Storage`'s own sake. Public so a caller
+    /// opening `db` itself (see `Storage::builder_with_db`) can resolve
+    /// the same default when routing merge operators by key prefix.
+    pub const DEFAULT_PREFIX: &str = "cas/";
 
     /// The default `packs_threshold`: 32 MiB -- enough to consolidate
     /// several dozen chunks per pack.
@@ -103,7 +105,7 @@ impl Builder {
                 }
                 let packs_store = self.packs_backend.unwrap_or_else(|| db_backend.clone());
                 let db = slatedb::Db::builder(db_prefix, db_backend)
-                    .with_merge_operator(Stage::merge_operator())
+                    .with_merge_operator(Arc::from(Stage::merge_operator()))
                     .build()
                     .await
                     .map_err(other)?;

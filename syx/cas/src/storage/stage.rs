@@ -1,5 +1,4 @@
 use std::io;
-use std::sync::Arc;
 
 use bitflags::bitflags;
 use bytes::{
@@ -111,8 +110,8 @@ impl MergeOperator for StorageMergeOperator {
 impl Stage {
     /// The merge operator `db` must be opened with for `pending_bytes`
     /// and `pending_keys` to work.
-    pub(super) fn merge_operator() -> Arc<dyn MergeOperator + Send + Sync> {
-        Arc::new(StorageMergeOperator)
+    pub(super) fn merge_operator() -> Box<dyn MergeOperator + Send + Sync> {
+        Box::new(StorageMergeOperator)
     }
 
     fn entry_key(&self, key: Digest) -> Vec<u8> {

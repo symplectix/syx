@@ -219,7 +219,7 @@ impl Storage {
     /// to work correctly. Only needed by a caller opening `db` itself and
     /// passing it to [`Storage::builder_with_db`] -- `Storage::builder`
     /// registers this on the `db` it opens automatically.
-    pub fn merge_operator() -> Arc<dyn slatedb::MergeOperator + Send + Sync> {
+    pub fn merge_operator() -> Box<dyn slatedb::MergeOperator + Send + Sync> {
         Stage::merge_operator()
     }
 

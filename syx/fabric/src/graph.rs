@@ -10,6 +10,50 @@ use tokio::io::{
 
 use crate::Graph;
 
+/// Dispatches to one of several `MergeOperator`s by key prefix.
+///
+/// `slatedb` accepts exactly one `MergeOperator` per `db`, but `cas::Storage`
+/// and `Graph`'s own relation storage each need their own merge semantics
+/// on the same `db`.
+struct PrefixMergeOperator {
+    routes: Vec<(Vec<u8>, Box<dyn slatedb::MergeOperator + Send + Sync>)>,
+}
+
+impl PrefixMergeOperator {
+    fn route(
+        &self,
+        key: &cas::Bytes,
+    ) -> Result<&(dyn slatedb::MergeOperator + Send + Sync), slatedb::MergeOperatorError> {
+        self.routes
+            .iter()
+            .find(|(prefix, _)| key.starts_with(prefix.as_slice()))
+            .map(|(_, operator)| operator.as_ref())
+            .ok_or_else(|| slatedb::MergeOperatorError::Callback {
+                message: format!("no merge operator registered for key {key:?}"),
+            })
+    }
+}
+
+impl slatedb::MergeOperator for PrefixMergeOperator {
+    fn merge(
+        &self,
+        key: &cas::Bytes,
+        existing_value: Option<cas::Bytes>,
+        value: cas::Bytes,
+    ) -> Result<cas::Bytes, slatedb::MergeOperatorError> {
+        self.route(key)?.merge(key, existing_value, value)
+    }
+
+    fn merge_batch(
+        &self,
+        key: &cas::Bytes,
+        existing_value: Option<cas::Bytes>,
+        operands: &[cas::Bytes],
+    ) -> Result<cas::Bytes, slatedb::MergeOperatorError> {
+        self.route(key)?.merge_batch(key, existing_value, operands)
+    }
+}
+
 /// Builds a `Graph`, opening the `slatedb::Db` it and its `cas::Storage`
 /// share.
 pub struct Builder {
@@ -65,11 +109,24 @@ impl Builder {
         self
     }
 
-    /// Opens `db`, registered with `cas::Storage::merge_operator()`, and
-    /// builds the `Graph` and its `cas::Storage` over that same `db`.
+    /// Opens `db`, registered with a `PrefixMergeOperator` that currently
+    /// only routes to `cas::Storage::merge_operator()`, and builds the
+    /// `Graph` and its `cas::Storage` over that same `db`.
+    // TODO: `Graph`'s own relation storage will need its own merge operator
+    // eventually (e.g. for growable reference sets, see hypergraph.md).
+    // `PrefixMergeOperator` below is a rough scaffold for composing it with
+    // cas's once it exists, not a finished design -- `Graph`'s own merge
+    // semantics don't exist yet.
     pub async fn build(self) -> io::Result<Graph> {
+        let cas_prefix =
+            self.prefix.clone().unwrap_or_else(|| cas::Builder::DEFAULT_PREFIX.to_string());
+        let merge_operator: Arc<dyn slatedb::MergeOperator + Send + Sync> =
+            Arc::new(PrefixMergeOperator {
+                routes: vec![(cas_prefix.into_bytes(), cas::Storage::merge_operator())],
+            });
+
         let db = slatedb::Db::builder(self.db_prefix, self.db_backend.clone())
-            .with_merge_operator(cas::Storage::merge_operator())
+            .with_merge_operator(merge_operator)
             .build()
             .await
             .map_err(io::Error::other)?;
