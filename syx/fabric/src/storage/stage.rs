@@ -134,8 +134,8 @@ impl Stage {
         format!("{}sha256/", self.prefix).into_bytes()
     }
 
-    pub(super) async fn pending_bytes(&self) -> io::Result<u64> {
-        match self.db.get(self.pending_bytes_key()).await.map_err(other)? {
+    pub(super) async fn pending_bytes(&self, db: &slatedb::Db) -> io::Result<u64> {
+        match db.get(self.pending_bytes_key()).await.map_err(other)? {
             Some(bytes) => Ok(u64::from_be_bytes(bytes.as_ref().try_into().unwrap_or_default())),
             None => Ok(0),
         }
@@ -143,8 +143,8 @@ impl Stage {
 
     /// Digests currently staged (not yet packed), in the order they
     /// were merged into `pending_keys_key`.
-    async fn pending_keys(&self) -> io::Result<Vec<Digest>> {
-        let Some(bytes) = self.db.get(self.pending_keys_key()).await.map_err(other)? else {
+    async fn pending_keys(&self, db: &slatedb::Db) -> io::Result<Vec<Digest>> {
+        let Some(bytes) = db.get(self.pending_keys_key()).await.map_err(other)? else {
             return Ok(Vec::new());
         };
         if !bytes.len().is_multiple_of(32) {
@@ -154,35 +154,35 @@ impl Stage {
     }
 
     /// Whether `key` is already stored, without fetching its value.
-    pub(super) async fn contains(&self, key: Digest) -> io::Result<bool> {
-        Ok(self.db.get(self.entry_key(key)).await.map_err(other)?.is_some())
+    pub(super) async fn contains(&self, db: &slatedb::Db, key: Digest) -> io::Result<bool> {
+        Ok(db.get(self.entry_key(key)).await.map_err(other)?.is_some())
     }
 
     /// Fetch and decode the entry stored under `key`, if present.
-    pub(super) async fn get(&self, key: Digest) -> io::Result<Option<Entry>> {
-        let Some(raw) = self.db.get(self.entry_key(key)).await.map_err(other)? else {
+    pub(super) async fn get(&self, db: &slatedb::Db, key: Digest) -> io::Result<Option<Entry>> {
+        let Some(raw) = db.get(self.entry_key(key)).await.map_err(other)? else {
             return Ok(None);
         };
         Entry::decode(&raw).map(Some)
     }
 
     /// Stage `bytes` under `key`, durable immediately -- not yet in a pack.
-    pub(super) async fn put(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
+    pub(super) async fn put(&self, db: &slatedb::Db, key: Digest, bytes: Bytes) -> io::Result<()> {
         let len = bytes.len() as u64;
         let entry = Entry::Inline(bytes);
         let mut batch = WriteBatch::new();
         batch.put_bytes(Bytes::from(self.entry_key(key)), entry.encode());
         batch.merge(self.pending_bytes_key(), len.to_be_bytes());
         batch.merge(self.pending_keys_key(), key.as_ref());
-        self.db.write(batch).await.map_err(other)?;
+        db.write(batch).await.map_err(other)?;
         Ok(())
     }
 
     /// How many distinct keys have ever been stored (staged or packed)
     /// under this stage's prefix. Test-only.
     #[cfg(test)]
-    pub(super) async fn entry_count(&self) -> io::Result<usize> {
-        let mut iter = self.db.scan_prefix(self.entry_prefix(), ..).await.map_err(other)?;
+    pub(super) async fn entry_count(&self, db: &slatedb::Db) -> io::Result<usize> {
+        let mut iter = db.scan_prefix(self.entry_prefix(), ..).await.map_err(other)?;
         let mut n = 0;
         while iter.next().await.map_err(other)?.is_some() {
             n += 1;
@@ -193,10 +193,10 @@ impl Stage {
     /// Currently-staged entries (per `pending_keys_key` -- not a scan
     /// over every entry ever held, packed or not), with their still-
     /// `Inline` bytes.
-    pub(super) async fn staged(&self) -> io::Result<Vec<(Digest, Bytes)>> {
+    pub(super) async fn staged(&self, db: &slatedb::Db) -> io::Result<Vec<(Digest, Bytes)>> {
         let mut staged = Vec::new();
-        for digest in self.pending_keys().await? {
-            let Some(entry) = self.get(digest).await? else {
+        for digest in self.pending_keys(db).await? {
+            let Some(entry) = self.get(db, digest).await? else {
                 // This is purely internal bookkeeping: `put` always
                 // writes the entry before merging its digest into
                 // pending_keys, and entries are never deleted, so
@@ -218,7 +218,11 @@ impl Stage {
 
     /// Atomically flips `entries` to `Packed` and resets the pending
     /// counters -- called once their bytes are durable in a pack object.
-    pub(super) async fn commit_packed(&self, entries: Vec<(Digest, Entry)>) -> io::Result<()> {
+    pub(super) async fn commit_packed(
+        &self,
+        db: &slatedb::Db,
+        entries: Vec<(Digest, Entry)>,
+    ) -> io::Result<()> {
         let mut batch = WriteBatch::new();
         for (digest, entry) in entries {
             batch.put_bytes(Bytes::from(self.entry_key(digest)), entry.encode());
@@ -228,7 +232,7 @@ impl Stage {
             Bytes::copy_from_slice(&0u64.to_be_bytes()),
         );
         batch.put_bytes(Bytes::from(self.pending_keys_key()), Bytes::new());
-        self.db.write(batch).await.map_err(other)?;
+        db.write(batch).await.map_err(other)?;
         Ok(())
     }
 }

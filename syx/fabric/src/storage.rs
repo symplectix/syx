@@ -3,14 +3,18 @@
 //! before being consolidated into pack objects in a wrapped `ObjectStore`.
 //!
 //! Fabric-internal: `cas` used to own this (as `cas::Storage`), but `cas`
-//! had exactly one consumer -- `fabric` -- and this engine's own `db` is
-//! the same `slatedb::Db` handle `Graph` holds directly (see
-//! `graph.rs`). Splitting it across a crate boundary bought nothing but a
-//! public hooks API (`DbMode`, `builder_with_db`, `merge_operator()`)
-//! that existed only to let two crates cooperate over one `db`. `cas`
-//! keeps the storage-agnostic pieces (`Digest`, `Chunking`, `Codec`);
-//! this module keeps the part that's actually about `slatedb`/
-//! `object_store`.
+//! had exactly one consumer -- `fabric`. `cas` keeps the storage-agnostic
+//! pieces (`Digest`, `Chunking`, `Codec`); this module keeps the part
+//! that's actually about `slatedb`/`object_store`.
+//!
+//! `Graph` (see `graph.rs`) holds `db`/`stage`/`packs`/`chunking`/`codec`
+//! as its own fields -- there's no `Storage` type bundling them up. What
+//! it hands out instead is `Cas<'_>`, a borrowed view constructed fresh
+//! per call (`Graph::cas()`): all the blob-storage methods live there,
+//! so `Graph`'s own methods don't have to be the blob-storage API
+//! directly (leaves room for e.g. `Graph::links()` later without name
+//! collisions), and every method on `Cas` reaches `db` via `self.db`
+//! instead of taking it as a parameter.
 //!
 //! # Why pack at all
 //!
@@ -40,9 +44,7 @@
 //! Two separate namespaces share the name "prefix": `db_prefix`, an `object_store::path::Path`
 //! passed straight through to `slatedb::Db::builder` and never touched again here (everything
 //! under it -- manifest, WAL, SST files -- is `slatedb`'s own concern), and `prefix`
-//! (`Stage`/`Packs`'s own `prefix` field, default `cas/`, see [`Builder::DEFAULT_PREFIX`]),
-//! covered below. Both exist so `db` and/or `packs` can be shared with something else that carves
-//! out its own namespace without colliding -- see `Builder::build`'s collision check.
+//! (`Stage`/`Packs`'s own `prefix` field, default `cas/`, see [`Builder::DEFAULT_PREFIX`]).
 //!
 //! ## `Stage` layout
 //!
@@ -120,49 +122,57 @@ fn other(e: impl std::error::Error + Send + Sync + 'static) -> io::Error {
     io::Error::other(e)
 }
 
-/// Chunking, encoding/decoding, and the physical storage of blobs,
-/// staged in `slatedb` and packed into `packs` over time.
-#[derive(Clone)]
-pub struct Storage {
-    stage:    Stage,
-    packs:    Packs,
+/// The merge operator `db` must be opened with for `Cas` to work
+/// correctly against it. `Cas`/`Graph` never open `db` themselves --
+/// whoever does (`Graph::Builder`) registers this.
+pub(crate) fn merge_operator() -> Box<dyn slatedb::MergeOperator + Send + Sync> {
+    Stage::merge_operator()
+}
+
+/// The blob-storage facet of a `Graph`: chunking, encoding/decoding, and
+/// physical storage of blobs staged in `db` and packed into `packs` over
+/// time. A borrowed view, not an owned type -- `Graph` holds `db`/
+/// `stage`/`packs`/`chunking`/`codec` itself and builds one of these
+/// fresh per call via `Graph::cas()`. `Copy`, since every field either
+/// is a reference or is itself `Copy` -- cheap to pass around by value.
+#[derive(Clone, Copy)]
+pub struct Cas<'a> {
+    db:       &'a slatedb::Db,
+    stage:    &'a Stage,
+    packs:    &'a Packs,
     chunking: Chunking,
     codec:    Codec,
 }
 
-/// Builds a `Storage`, either opening `db` along the way with the merge
-/// operator `Storage` needs already registered, or using one the caller
-/// already opened (and registered it on themselves).
+/// Builds the parts a `Graph` assembles itself from (`stage`/`packs`/
+/// `chunking`/`codec`). Not a `Storage` type: `Graph` holds these as its
+/// own fields directly rather than behind another layer, see the module
+/// doc.
 pub struct Builder {
-    db_mode:         DbMode,
+    packs_backend:   Arc<dyn ObjectStore>,
     prefix:          String,
-    packs_backend:   Option<Arc<dyn ObjectStore>>,
     packs_threshold: u64,
     chunking:        Chunking,
     codec:           Codec,
 }
 
-/// How `Builder::build` gets its `slatedb::Db`.
-enum DbMode {
-    /// Open a new `slatedb::Db` at `db_prefix` in `db_backend`. `Graph`
-    /// always uses `Provided` in production (it opens `db` itself, see
-    /// `graph.rs`) -- `Open` exists for tests that want a standalone
-    /// `Storage` without wiring up their own `db`.
-    #[cfg_attr(not(test), allow(dead_code))]
-    Open { db_prefix: String, db_backend: Arc<dyn ObjectStore> },
-    /// Use this already-opened `db` as-is.
-    Provided(slatedb::Db),
+/// What `Builder::build` produces, for `Graph::new` to destructure into
+/// its own fields.
+pub(crate) struct Parts {
+    pub(crate) stage:    Stage,
+    pub(crate) packs:    Packs,
+    pub(crate) chunking: Chunking,
+    pub(crate) codec:    Codec,
 }
 
-/// `Storage`'s own staging area within `db` -- entries land here
-/// first, before being consolidated into `Packs`.
+/// The staging area within whichever `db` each `Cas` call is given --
+/// entries land here first, before being consolidated into `Packs`.
 #[derive(Clone)]
-struct Stage {
-    db: slatedb::Db,
+pub(crate) struct Stage {
     /// This stage's own namespace within `db`.
-    prefix: String,
+    prefix:         String,
     /// Serializes `flush_pending`.
-    flushing: Arc<tokio::sync::Mutex<()>>,
+    flushing:       Arc<tokio::sync::Mutex<()>>,
     /// Consecutive `flush_pending` failures, reset to 0 on success.
     /// `put_blob`'s opportunistic call reads this to decide whether to
     /// swallow an error or propagate it.
@@ -172,7 +182,7 @@ struct Stage {
 /// Where staged entries get consolidated into once `threshold`
 /// accumulates.
 #[derive(Clone)]
-struct Packs {
+pub(crate) struct Packs {
     store:     Arc<dyn ObjectStore>,
     prefix:    String,
     threshold: u64,
@@ -188,44 +198,30 @@ enum Entry {
     Packed { pack_id: Digest, offset: u64, length: u64 },
 }
 
-impl Storage {
+impl<'a> Cas<'a> {
     /// How many consecutive `flush_pending` failures `put_blob` tolerates.
     const MAX_CONSECUTIVE_FLUSH_FAILURES: u32 = 3;
 
-    /// Starts building a `Storage`, opening a new `slatedb::Db` at
-    /// `db_prefix` in `db_backend`. Test-only convenience -- `Graph`
-    /// always uses `Storage::builder_with_db` in production.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn builder(db_prefix: impl Into<String>, db_backend: Arc<dyn ObjectStore>) -> Builder {
-        Builder::new(db_prefix, db_backend)
-    }
-
-    /// Starts building a `Storage` over an already-opened `db`, instead of
-    /// opening a new one -- for sharing one `slatedb::Db` with `Graph`'s
-    /// own relation storage. `db` must already be registered with
-    /// [`Storage::merge_operator`] (composed with whatever else needs to
-    /// share it). `packs_backend` is required here since there's no
-    /// `db`-owned backend handle left to default it to.
-    pub fn builder_with_db(db: slatedb::Db, packs_backend: Arc<dyn ObjectStore>) -> Builder {
-        Builder::with_db(db, packs_backend)
-    }
-
-    /// The merge operator a `slatedb::Db` must be opened with for `Storage`
-    /// to work correctly. Only needed by a caller opening `db` itself and
-    /// passing it to [`Storage::builder_with_db`] -- `Storage::builder`
-    /// registers this on the `db` it opens automatically.
-    pub fn merge_operator() -> Box<dyn slatedb::MergeOperator + Send + Sync> {
-        Stage::merge_operator()
+    /// Builds a view over `db`/`stage`/`packs`/`chunking`/`codec` --
+    /// only `Graph::cas()` calls this, see the module doc.
+    pub(crate) fn new(
+        db: &'a slatedb::Db,
+        stage: &'a Stage,
+        packs: &'a Packs,
+        chunking: Chunking,
+        codec: Codec,
+    ) -> Self {
+        Self { db, stage, packs, chunking, codec }
     }
 
     /// Whether `key` is already stored, without fetching its value.
     async fn contains_blob(&self, key: Digest) -> io::Result<bool> {
-        self.stage.contains(key).await
+        self.stage.contains(self.db, key).await
     }
 
     /// Fetch bytes stored under `key`, if present.
     async fn get_blob(&self, key: Digest) -> io::Result<Option<Bytes>> {
-        let Some(entry) = self.stage.get(key).await? else {
+        let Some(entry) = self.stage.get(self.db, key).await? else {
             return Ok(None);
         };
         match entry {
@@ -245,7 +241,7 @@ impl Storage {
     /// flush failures this way; past that, propagates the error
     /// instead of continuing to accept writes that would never get packed.
     async fn put_blob(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
-        if self.stage.pending_bytes().await? >= self.packs.threshold
+        if self.stage.pending_bytes(self.db).await? >= self.packs.threshold
             && let Err(e) = self.flush_pending().await
         {
             let failures = self.stage.flush_failures.load(Ordering::Relaxed);
@@ -253,14 +249,14 @@ impl Storage {
                 return Err(e);
             }
         }
-        self.stage.put(key, bytes).await
+        self.stage.put(self.db, key, bytes).await
     }
 
     /// How many distinct keys have ever been staged or packed
     /// under this store's prefix. Test-only.
     #[cfg(test)]
     pub(crate) async fn entry_count(&self) -> io::Result<usize> {
-        self.stage.entry_count().await
+        self.stage.entry_count(self.db).await
     }
 
     /// Consolidates all currently-staged entries into one new pack object.
@@ -272,7 +268,7 @@ impl Storage {
             return Ok(());
         };
 
-        let staged = self.stage.staged().await?;
+        let staged = self.stage.staged(self.db).await?;
         if staged.is_empty() {
             self.stage.flush_failures.store(0, Ordering::Relaxed);
             return Ok(());
@@ -294,7 +290,7 @@ impl Storage {
         }
 
         let result = match self.packs.write(pack_id, PutPayload::from_iter(chunks)).await {
-            Ok(()) => self.stage.commit_packed(entries).await,
+            Ok(()) => self.stage.commit_packed(self.db, entries).await,
             Err(e) => Err(e),
         };
         match &result {

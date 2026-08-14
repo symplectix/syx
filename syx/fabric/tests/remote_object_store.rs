@@ -77,12 +77,12 @@ async fn get_returns_what_was_put() {
     let (graph, _remote) = s3_graph(&s3_server, 1024 * 1024).await;
 
     let content = cas::Bytes::from_static(b"hello");
-    let d = graph.put(&content).await.unwrap();
-    assert_eq!(graph.get::<cas::Bytes>(&d).await.unwrap(), Some(content));
+    let d = graph.cas().put(&content).await.unwrap();
+    assert_eq!(graph.cas().get::<cas::Bytes>(&d).await.unwrap(), Some(content));
 
     let content = cas::Bytes::from(testing::random_bytes(2 * 1024 * 1024));
-    let d = graph.put(&content).await.unwrap();
-    assert_eq!(graph.get::<cas::Bytes>(&d).await.unwrap(), Some(content));
+    let d = graph.cas().put(&content).await.unwrap();
+    assert_eq!(graph.cas().get::<cas::Bytes>(&d).await.unwrap(), Some(content));
 }
 
 #[tokio::test]
@@ -97,15 +97,15 @@ async fn a_full_pack_flushes_on_the_next_write_and_stays_readable() {
     // write that crosses the threshold isn't the one that gets packed;
     // the next one is.
     let v1 = cas::Bytes::from_static(b"abcdefg1");
-    let d1 = graph.put(&v1).await.unwrap();
+    let d1 = graph.cas().put(&v1).await.unwrap();
     assert_eq!(remote.list(None).count().await, 0);
 
     let v2 = cas::Bytes::from_static(b"abcdefg2");
-    let d2 = graph.put(&v2).await.unwrap();
+    let d2 = graph.cas().put(&v2).await.unwrap();
     assert_eq!(remote.list(None).count().await, 1);
 
-    assert_eq!(graph.get::<cas::Bytes>(&d1).await.unwrap(), Some(v1));
-    assert_eq!(graph.get::<cas::Bytes>(&d2).await.unwrap(), Some(v2));
+    assert_eq!(graph.cas().get::<cas::Bytes>(&d1).await.unwrap(), Some(v1));
+    assert_eq!(graph.cas().get::<cas::Bytes>(&d2).await.unwrap(), Some(v2));
 }
 
 #[tokio::test]
@@ -119,9 +119,9 @@ async fn content_in_different_packs_stays_independently_readable() {
     async fn put_and_flush(graph: &fabric::Graph, values: &[cas::Bytes]) -> Vec<cas::Digest> {
         let mut digests = Vec::with_capacity(values.len());
         for v in values {
-            digests.push(graph.put(v).await.unwrap());
+            digests.push(graph.cas().put(v).await.unwrap());
         }
-        graph.flush_pending().await.unwrap();
+        graph.cas().flush_pending().await.unwrap();
         digests
     }
 
@@ -143,6 +143,6 @@ async fn content_in_different_packs_stays_independently_readable() {
 
     let entries = pack_a.iter().zip(&pack_a_digests).chain(pack_b.iter().zip(&pack_b_digests));
     for (v, d) in entries {
-        assert_eq!(graph.get::<cas::Bytes>(d).await.unwrap(), Some(v.clone()));
+        assert_eq!(graph.cas().get::<cas::Bytes>(d).await.unwrap(), Some(v.clone()));
     }
 }

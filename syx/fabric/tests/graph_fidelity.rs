@@ -6,8 +6,8 @@ use common::temp_graph;
 #[tokio::test]
 async fn content_put_is_returned_unchanged_by_get() {
     let (_dir, graph) = temp_graph().await;
-    let d = graph.put(&cas::Bytes::from_static(b"hello")).await.unwrap();
-    assert_eq!(graph.get(&d).await.unwrap(), Some(cas::Bytes::from_static(b"hello")));
+    let d = graph.cas().put(&cas::Bytes::from_static(b"hello")).await.unwrap();
+    assert_eq!(graph.cas().get(&d).await.unwrap(), Some(cas::Bytes::from_static(b"hello")));
 }
 
 #[tokio::test]
@@ -22,7 +22,7 @@ async fn copy_from_accepts_a_file_and_streams_it_in() {
 
     let mut file = tokio::fs::File::open(&src).await.unwrap();
     let len = file.metadata().await.unwrap().len();
-    let d = graph.copy_from(len, &mut file).await.unwrap();
+    let d = graph.cas().copy_from(len, &mut file).await.unwrap();
     assert_eq!(d, cas_testing::digest_bytes(b"hello"));
-    assert_eq!(graph.get(&d).await.unwrap(), Some(cas::Bytes::from_static(b"hello")));
+    assert_eq!(graph.cas().get(&d).await.unwrap(), Some(cas::Bytes::from_static(b"hello")));
 }

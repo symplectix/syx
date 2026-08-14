@@ -29,17 +29,31 @@ fn local_fs() -> (testing::TempDir, Arc<dyn ObjectStore>) {
     (tmp, backend)
 }
 
-/// A `Storage` writing packs to `packs`, staged in its own in-memory
-/// `slatedb` (staging durability isn't what these tests are about;
+/// A fresh `slatedb::Db`, registered with the blob storage engine's own
+/// merge operator -- everything a test needs to drive a `Cas` against.
+async fn test_db() -> slatedb::Db {
+    slatedb::Db::builder("test", in_memory())
+        .with_merge_operator(Arc::from(merge_operator()))
+        .build()
+        .await
+        .unwrap()
+}
+
+/// A `Cas` writing packs to `packs`, staged in its own in-memory
+/// `slatedb::Db` (staging durability isn't what these tests are about;
 /// `packs` is the backend variety under test).
-async fn packing(packs: Arc<dyn ObjectStore>) -> Storage {
-    Storage::builder("test", in_memory()).packs(packs).build().await.unwrap()
+async fn packing(packs: Arc<dyn ObjectStore>) -> (slatedb::Db, Parts) {
+    (test_db().await, Builder::new(packs).build())
+}
+
+fn cas<'a>(db: &'a slatedb::Db, parts: &'a Parts) -> Cas<'a> {
+    Cas::new(db, &parts.stage, &parts.packs, parts.chunking, parts.codec)
 }
 
 /// Some chunk digest referenced by `exclude`'s own manifest, other than
 /// `exclude` itself -- for tests that need an existing chunk key to
 /// target for corruption without independently recomputing chunk digests.
-async fn any_key_except(cas: &Storage, exclude: Digest) -> Digest {
+async fn any_key_except(cas: Cas<'_>, exclude: Digest) -> Digest {
     let (_, manifest_bytes) = cas.load(&exclude).await.unwrap().expect("manifest present");
     let manifest = decode_chunks(&manifest_bytes).unwrap();
     manifest
@@ -60,16 +74,18 @@ async fn a_single_chunks_digest_is_the_content_digest_not_a_wrapped_one() {
     // are keyed by the exact same digest. Runs against both inner
     // object stores, since this is a property of `cas`'s own digest
     // scheme, not of whichever store happens to be holding the packs.
-    async fn check(cas: Storage) {
+    async fn check(cas: Cas<'_>) {
         let content = testing::random_bytes(4096); // well under CHUNK_MIN_SIZE
         let content_digest = Hasher::new().part(&content).digest();
         let d = cas.put(&Bytes::from(content)).await.unwrap();
         assert_eq!(d, content_digest);
     }
 
-    check(packing(in_memory()).await).await;
+    let (db, parts) = packing(in_memory()).await;
+    check(cas(&db, &parts)).await;
     let (_tmp, inner) = local_fs();
-    check(packing(inner).await).await;
+    let (db, parts) = packing(inner).await;
+    check(cas(&db, &parts)).await;
 }
 
 #[tokio::test]
@@ -90,12 +106,12 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
     };
 
     // How many keys after putting `blob`.
-    async fn count_keys(cas: Storage, blob: Bytes) -> usize {
+    async fn count_keys(cas: Cas<'_>, blob: Bytes) -> usize {
         cas.put(&blob).await.unwrap();
         cas.entry_count().await.unwrap()
     }
 
-    async fn check(cas: Storage, blob_a: &Bytes, blob_b: &Bytes, baseline: usize) {
+    async fn check(cas: Cas<'_>, blob_a: &Bytes, blob_b: &Bytes, baseline: usize) {
         cas.put(blob_a).await.unwrap();
         let count_before = cas.entry_count().await.unwrap();
         cas.put(blob_b).await.unwrap();
@@ -109,42 +125,43 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
         );
     }
 
-    let mem_keys = count_keys(packing(in_memory()).await, blob_b.clone()).await;
+    let (db, parts) = packing(in_memory()).await;
+    let mem_keys = count_keys(cas(&db, &parts), blob_b.clone()).await;
     let (_tmp, inner) = local_fs();
-    let tmp_keys = count_keys(packing(inner).await, blob_b.clone()).await;
+    let (db, parts) = packing(inner).await;
+    let tmp_keys = count_keys(cas(&db, &parts), blob_b.clone()).await;
     // The baseline is a property of blob_b's content and cas's chunking,
     // not of which backend computed it.
     assert_eq!(mem_keys, tmp_keys);
 
-    check(packing(in_memory()).await, &blob_a, &blob_b, mem_keys).await;
+    let (db, parts) = packing(in_memory()).await;
+    check(cas(&db, &parts), &blob_a, &blob_b, mem_keys).await;
     let (_tmp, inner) = local_fs();
-    check(packing(inner).await, &blob_a, &blob_b, tmp_keys).await;
+    let (db, parts) = packing(inner).await;
+    check(cas(&db, &parts), &blob_a, &blob_b, tmp_keys).await;
 }
 
 #[tokio::test]
 async fn flush_pending_flips_staged_entries_from_inline_to_packed() {
-    let cas = Storage::builder("test", in_memory())
-        .packs(in_memory())
-        .packs_threshold(8)
-        .build()
-        .await
-        .unwrap();
+    let db = test_db().await;
+    let parts = Builder::new(in_memory()).packs_threshold(8).build();
+    let cas = cas(&db, &parts);
 
     let content = Bytes::from_static(b"0123456789");
     let d = cas.put(&content).await.unwrap();
-    assert!(matches!(cas.stage.get(d).await.unwrap(), Some(Entry::Inline(_))));
-    assert!(cas.stage.pending_bytes().await.unwrap() > 0);
+    assert!(matches!(cas.stage.get(cas.db, d).await.unwrap(), Some(Entry::Inline(_))));
+    assert!(cas.stage.pending_bytes(cas.db).await.unwrap() > 0);
 
     cas.flush_pending().await.unwrap();
-    assert!(matches!(cas.stage.get(d).await.unwrap(), Some(Entry::Packed { .. })));
-    assert_eq!(cas.stage.pending_bytes().await.unwrap(), 0);
+    assert!(matches!(cas.stage.get(cas.db, d).await.unwrap(), Some(Entry::Packed { .. })));
+    assert_eq!(cas.stage.pending_bytes(cas.db).await.unwrap(), 0);
 
     assert_eq!(cas.get::<Bytes>(&d).await.unwrap(), Some(content));
 }
 
 #[tokio::test]
 async fn get_returns_invalid_data_for_tampered_content() {
-    async fn check(cas: Storage) {
+    async fn check(cas: Cas<'_>) {
         let d = cas.put(&Bytes::from_static(b"hello")).await.unwrap();
 
         // Overwrite the stored bytes with content that doesn't hash
@@ -156,20 +173,23 @@ async fn get_returns_invalid_data_for_tampered_content() {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    check(packing(in_memory()).await).await;
+    let (db, parts) = packing(in_memory()).await;
+    check(cas(&db, &parts)).await;
     let (_tmp, inner) = local_fs();
-    check(packing(inner).await).await;
+    let (db, parts) = packing(inner).await;
+    check(cas(&db, &parts)).await;
 }
 
 #[tokio::test]
 async fn get_returns_invalid_data_for_a_tampered_chunk() {
     // Needs a real (non-manifest) key to target, so this one stays
     // `in_memory`-only rather than being generalized over the backend.
-    let cas = packing(in_memory()).await;
+    let (db, parts) = packing(in_memory()).await;
+    let cas = cas(&db, &parts);
     let content = testing::random_bytes(Chunking::MAX_SIZE * 2);
     let d = cas.put(&Bytes::from(content)).await.unwrap();
 
-    let chunk_key = any_key_except(&cas, d).await;
+    let chunk_key = any_key_except(cas, d).await;
     let tampered = encode(ContentFlags::empty(), b"tampered chunk content".to_vec());
     cas.put_blob(chunk_key, Bytes::from(tampered)).await.unwrap();
 
@@ -179,7 +199,7 @@ async fn get_returns_invalid_data_for_a_tampered_chunk() {
 
 #[tokio::test]
 async fn read_into_returns_invalid_data_for_tampered_content() {
-    async fn check(cas: Storage) {
+    async fn check(cas: Cas<'_>) {
         let d = cas.put(&Bytes::from_static(b"hello")).await.unwrap();
 
         let tampered = encode(ContentFlags::empty(), b"not hello".to_vec());
@@ -190,20 +210,23 @@ async fn read_into_returns_invalid_data_for_tampered_content() {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    check(packing(in_memory()).await).await;
+    let (db, parts) = packing(in_memory()).await;
+    check(cas(&db, &parts)).await;
     let (_tmp, inner) = local_fs();
-    check(packing(inner).await).await;
+    let (db, parts) = packing(inner).await;
+    check(cas(&db, &parts)).await;
 }
 
 #[tokio::test]
 async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
     // Needs a real (non-manifest) key to target, so this one stays
     // `in_memory`-only rather than being generalized over the backend.
-    let cas = packing(in_memory()).await;
+    let (db, parts) = packing(in_memory()).await;
+    let cas = cas(&db, &parts);
     let content = testing::random_bytes(Chunking::MAX_SIZE * 2);
     let d = cas.put(&Bytes::from(content)).await.unwrap();
 
-    let chunk_key = any_key_except(&cas, d).await;
+    let chunk_key = any_key_except(cas, d).await;
     let tampered = encode(ContentFlags::empty(), b"tampered chunk content".to_vec());
     cas.put_blob(chunk_key, Bytes::from(tampered)).await.unwrap();
 
@@ -214,7 +237,7 @@ async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
 
 #[tokio::test]
 async fn get_returns_invalid_data_for_a_tampered_manifest() {
-    async fn check(cas: Storage) {
+    async fn check(cas: Cas<'_>) {
         let content = testing::random_bytes(Chunking::MAX_SIZE * 2);
         let d = cas.put(&Bytes::from(content)).await.unwrap();
 
@@ -225,14 +248,16 @@ async fn get_returns_invalid_data_for_a_tampered_manifest() {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    check(packing(in_memory()).await).await;
+    let (db, parts) = packing(in_memory()).await;
+    check(cas(&db, &parts)).await;
     let (_tmp, inner) = local_fs();
-    check(packing(inner).await).await;
+    let (db, parts) = packing(inner).await;
+    check(cas(&db, &parts)).await;
 }
 
 #[tokio::test]
 async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
-    async fn check(cas: Storage) {
+    async fn check(cas: Cas<'_>) {
         let (present_digest, present_raw) =
             (Hasher::new().part(b"present").digest(), b"present".to_vec());
         cas.put_blob(
@@ -262,7 +287,9 @@ async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    check(packing(in_memory()).await).await;
+    let (db, parts) = packing(in_memory()).await;
+    check(cas(&db, &parts)).await;
     let (_tmp, inner) = local_fs();
-    check(packing(inner).await).await;
+    let (db, parts) = packing(inner).await;
+    check(cas(&db, &parts)).await;
 }
