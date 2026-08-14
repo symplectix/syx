@@ -98,6 +98,11 @@ impl Builder {
         self
     }
 
+    // TODO: `chunking` and `codec` can be overridden independently, but
+    // `cas::Codec::SNIFF_LEN` should stay below `cas::Chunking::MIN_SIZE`.
+    // Nothing breaks if it happens, but `Codec::encode` compresses a chunk
+    // twice instead of once.
+
     /// Overrides chunking behavior.
     pub fn chunking(mut self, chunking: cas::Chunking) -> Self {
         self.chunking = Some(chunking);
