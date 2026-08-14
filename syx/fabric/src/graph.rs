@@ -112,7 +112,7 @@ impl Builder {
 
     /// Opens `db`, registered with a `PrefixMergeOperator` that currently
     /// only routes to the blob storage engine's own operator, and builds
-    /// the `Graph` -- `db` plus the blob-storage parts (`stage`/`packs`/
+    /// the `Graph` -- `db` plus the blob-storage parts (`packing`/
     /// `chunking`/`codec`) `Graph` holds directly.
     // TODO: `Graph`'s own relation storage will need its own merge operator
     // eventually (e.g. for growable reference sets, see hypergraph.md).
@@ -137,9 +137,8 @@ impl Builder {
         let chunking = self.chunking.unwrap_or_default();
         let codec = self.codec.unwrap_or_default();
 
-        let storage::Parts { stage, packs } =
-            storage::parts(packs_backend, prefix, packs_threshold);
-        Ok(Graph::new(db, stage, packs, chunking, codec))
+        let packing = storage::Packing::new(packs_backend, prefix, packs_threshold);
+        Ok(Graph::new(db, packing, chunking, codec))
     }
 }
 
@@ -158,18 +157,17 @@ impl Graph {
     /// `db`/building these parts yourself.
     const fn new(
         db: slatedb::Db,
-        stage: storage::Stage,
-        packs: storage::Packs,
+        packing: storage::Packing,
         chunking: cas::Chunking,
         codec: cas::Codec,
     ) -> Self {
-        Self { db, stage, packs, chunking, codec }
+        Self { db, packing, chunking, codec }
     }
 
     /// The blob-storage facet of this `Graph`: `get`/`put`/`read_into`/
     /// `copy_from`/`flush_pending`. A cheap, borrowed view -- construct
     /// it fresh wherever it's needed rather than holding onto one.
     pub fn cas(&self) -> Cas<'_> {
-        Cas::new(&self.db, &self.stage, &self.packs, self.chunking, self.codec)
+        Cas::new(&self.db, &self.packing, self.chunking, self.codec)
     }
 }

@@ -40,8 +40,7 @@ pub struct Graph {
     ///   changing extraction logic and rerunning it just adds new relations against the same
     ///   source, old ones left intact.
     db:       slatedb::Db,
-    stage:    storage::Stage,
-    packs:    storage::Packs,
+    packing:  storage::Packing,
     chunking: cas::Chunking,
     codec:    cas::Codec,
 }

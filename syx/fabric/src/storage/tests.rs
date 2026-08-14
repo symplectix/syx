@@ -39,19 +39,19 @@ async fn test_db() -> slatedb::Db {
         .unwrap()
 }
 
-/// A `Cas` writing packs to `packs`, staged in its own in-memory
+/// A `Cas` writing packs to `packs_backend`, staged in its own in-memory
 /// `slatedb::Db` (staging durability isn't what these tests are about;
-/// `packs` is the backend variety under test).
-async fn packing(packs: Arc<dyn ObjectStore>) -> (slatedb::Db, Parts) {
+/// `packs_backend` is the backend variety under test).
+async fn packed_in(packs_backend: Arc<dyn ObjectStore>) -> (slatedb::Db, Packing) {
     let db = test_db().await;
-    let parts = parts(packs, DEFAULT_PREFIX.to_string(), DEFAULT_PACKS_THRESHOLD);
-    (db, parts)
+    let packing = Packing::new(packs_backend, DEFAULT_PREFIX.to_string(), DEFAULT_PACKS_THRESHOLD);
+    (db, packing)
 }
 
 /// No test overrides chunking/encoding behavior, so `cas()` just uses
-/// their defaults directly rather than threading them through `Parts`.
-fn cas<'a>(db: &'a slatedb::Db, parts: &'a Parts) -> Cas<'a> {
-    Cas::new(db, &parts.stage, &parts.packs, Chunking::new(), Codec::new())
+/// their defaults directly rather than threading them through `Packing`.
+fn cas<'a>(db: &'a slatedb::Db, packing: &'a Packing) -> Cas<'a> {
+    Cas::new(db, packing, Chunking::new(), Codec::new())
 }
 
 /// Some chunk digest referenced by `exclude`'s own manifest, other than
@@ -85,11 +85,11 @@ async fn a_single_chunks_digest_is_the_content_digest_not_a_wrapped_one() {
         assert_eq!(d, content_digest);
     }
 
-    let (db, parts) = packing(in_memory()).await;
-    check(cas(&db, &parts)).await;
+    let (db, packing) = packed_in(in_memory()).await;
+    check(cas(&db, &packing)).await;
     let (_tmp, inner) = local_fs();
-    let (db, parts) = packing(inner).await;
-    check(cas(&db, &parts)).await;
+    let (db, packing) = packed_in(inner).await;
+    check(cas(&db, &packing)).await;
 }
 
 #[tokio::test]
@@ -129,36 +129,36 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
         );
     }
 
-    let (db, parts) = packing(in_memory()).await;
-    let mem_keys = count_keys(cas(&db, &parts), blob_b.clone()).await;
+    let (db, packing) = packed_in(in_memory()).await;
+    let mem_keys = count_keys(cas(&db, &packing), blob_b.clone()).await;
     let (_tmp, inner) = local_fs();
-    let (db, parts) = packing(inner).await;
-    let tmp_keys = count_keys(cas(&db, &parts), blob_b.clone()).await;
+    let (db, packing) = packed_in(inner).await;
+    let tmp_keys = count_keys(cas(&db, &packing), blob_b.clone()).await;
     // The baseline is a property of blob_b's content and cas's chunking,
     // not of which backend computed it.
     assert_eq!(mem_keys, tmp_keys);
 
-    let (db, parts) = packing(in_memory()).await;
-    check(cas(&db, &parts), &blob_a, &blob_b, mem_keys).await;
+    let (db, packing) = packed_in(in_memory()).await;
+    check(cas(&db, &packing), &blob_a, &blob_b, mem_keys).await;
     let (_tmp, inner) = local_fs();
-    let (db, parts) = packing(inner).await;
-    check(cas(&db, &parts), &blob_a, &blob_b, tmp_keys).await;
+    let (db, packing) = packed_in(inner).await;
+    check(cas(&db, &packing), &blob_a, &blob_b, tmp_keys).await;
 }
 
 #[tokio::test]
 async fn flush_pending_flips_staged_entries_from_inline_to_packed() {
     let db = test_db().await;
-    let parts = parts(in_memory(), DEFAULT_PREFIX.to_string(), 8);
-    let cas = cas(&db, &parts);
+    let packing = Packing::new(in_memory(), DEFAULT_PREFIX.to_string(), 8);
+    let cas = cas(&db, &packing);
 
     let content = Bytes::from_static(b"0123456789");
     let d = cas.put(&content).await.unwrap();
-    assert!(matches!(cas.stage.get(cas.db, d).await.unwrap(), Some(Entry::Inline(_))));
-    assert!(cas.stage.pending_bytes(cas.db).await.unwrap() > 0);
+    assert!(matches!(cas.get_entry(d).await.unwrap(), Some(Entry::Inline(_))));
+    assert!(cas.pending_bytes().await.unwrap() > 0);
 
     cas.flush_pending().await.unwrap();
-    assert!(matches!(cas.stage.get(cas.db, d).await.unwrap(), Some(Entry::Packed { .. })));
-    assert_eq!(cas.stage.pending_bytes(cas.db).await.unwrap(), 0);
+    assert!(matches!(cas.get_entry(d).await.unwrap(), Some(Entry::Packed { .. })));
+    assert_eq!(cas.pending_bytes().await.unwrap(), 0);
 
     assert_eq!(cas.get::<Bytes>(&d).await.unwrap(), Some(content));
 }
@@ -177,19 +177,19 @@ async fn get_returns_invalid_data_for_tampered_content() {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    let (db, parts) = packing(in_memory()).await;
-    check(cas(&db, &parts)).await;
+    let (db, packing) = packed_in(in_memory()).await;
+    check(cas(&db, &packing)).await;
     let (_tmp, inner) = local_fs();
-    let (db, parts) = packing(inner).await;
-    check(cas(&db, &parts)).await;
+    let (db, packing) = packed_in(inner).await;
+    check(cas(&db, &packing)).await;
 }
 
 #[tokio::test]
 async fn get_returns_invalid_data_for_a_tampered_chunk() {
     // Needs a real (non-manifest) key to target, so this one stays
     // `in_memory`-only rather than being generalized over the backend.
-    let (db, parts) = packing(in_memory()).await;
-    let cas = cas(&db, &parts);
+    let (db, packing) = packed_in(in_memory()).await;
+    let cas = cas(&db, &packing);
     let content = testing::random_bytes(Chunking::MAX_SIZE * 2);
     let d = cas.put(&Bytes::from(content)).await.unwrap();
 
@@ -214,19 +214,19 @@ async fn read_into_returns_invalid_data_for_tampered_content() {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    let (db, parts) = packing(in_memory()).await;
-    check(cas(&db, &parts)).await;
+    let (db, packing) = packed_in(in_memory()).await;
+    check(cas(&db, &packing)).await;
     let (_tmp, inner) = local_fs();
-    let (db, parts) = packing(inner).await;
-    check(cas(&db, &parts)).await;
+    let (db, packing) = packed_in(inner).await;
+    check(cas(&db, &packing)).await;
 }
 
 #[tokio::test]
 async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
     // Needs a real (non-manifest) key to target, so this one stays
     // `in_memory`-only rather than being generalized over the backend.
-    let (db, parts) = packing(in_memory()).await;
-    let cas = cas(&db, &parts);
+    let (db, packing) = packed_in(in_memory()).await;
+    let cas = cas(&db, &packing);
     let content = testing::random_bytes(Chunking::MAX_SIZE * 2);
     let d = cas.put(&Bytes::from(content)).await.unwrap();
 
@@ -252,11 +252,11 @@ async fn get_returns_invalid_data_for_a_tampered_manifest() {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    let (db, parts) = packing(in_memory()).await;
-    check(cas(&db, &parts)).await;
+    let (db, packing) = packed_in(in_memory()).await;
+    check(cas(&db, &packing)).await;
     let (_tmp, inner) = local_fs();
-    let (db, parts) = packing(inner).await;
-    check(cas(&db, &parts)).await;
+    let (db, packing) = packed_in(inner).await;
+    check(cas(&db, &packing)).await;
 }
 
 #[tokio::test]
@@ -291,9 +291,9 @@ async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    let (db, parts) = packing(in_memory()).await;
-    check(cas(&db, &parts)).await;
+    let (db, packing) = packed_in(in_memory()).await;
+    check(cas(&db, &packing)).await;
     let (_tmp, inner) = local_fs();
-    let (db, parts) = packing(inner).await;
-    check(cas(&db, &parts)).await;
+    let (db, packing) = packed_in(inner).await;
+    check(cas(&db, &packing)).await;
 }
