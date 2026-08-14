@@ -13,7 +13,9 @@ rust.library(
     deps = [
         "//syx/cas",
         "@crates//:cbor2",
+        "@crates//:object_store",
         "@crates//:serde",
+        "@crates//:slatedb",
         "@crates//:tokio",
     ],
 )

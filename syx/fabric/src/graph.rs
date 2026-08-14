@@ -1,37 +1,113 @@
 //! A content-addressable (hyper)graph.
 use std::io;
+use std::sync::Arc;
 
+use object_store::ObjectStore;
 use tokio::io::{
     AsyncRead,
     AsyncWrite,
 };
 
-/// A content-addressable (hyper)graph.
-///
-/// `Graph` is not a database, it's git for your application's data:
-/// - not just files but any fact
-/// - not just commits a human makes but any derivations a Function makes
-#[derive(Clone)]
-pub struct Graph {
-    /// `Graph` is built directly on `cas::Storage`, so a relation's own source
-    /// material lives in the same content-addressed space as the relation
-    /// itself, not in a separate system.
-    /// - One ingestion pipeline, two consequences for free: store the source as a blob, run
-    ///   extraction (a Function), write the resulting relations against that digest. Ingestion
-    ///   itself is just a relation between the graph and an external resource, the same mechanism
-    ///   any other derivation uses. That gets: no external store to sync with, since a relation's
-    ///   source lives inside the graph itself; and lineage all the way back to the true source for
-    ///   free, no separate provenance mechanism needed.
-    /// - Re-extraction never re-fetches anything: the source is pinned by digest forever, so
-    ///   changing extraction logic and rerunning it just adds new relations against the same
-    ///   source, old ones left intact.
-    cas: cas::Storage,
+use crate::Graph;
+
+/// Builds a `Graph`, opening the `slatedb::Db` it and its `cas::Storage`
+/// share.
+pub struct Builder {
+    db_prefix:       String,
+    db_backend:      Arc<dyn ObjectStore>,
+    packs_backend:   Option<Arc<dyn ObjectStore>>,
+    prefix:          Option<String>,
+    packs_threshold: Option<u64>,
+    chunking:        Option<cas::Chunking>,
+    codec:           Option<cas::Codec>,
+}
+
+impl Builder {
+    fn new(db_prefix: impl Into<String>, db_backend: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            db_prefix: db_prefix.into(),
+            db_backend,
+            packs_backend: None,
+            prefix: None,
+            packs_threshold: None,
+            chunking: None,
+            codec: None,
+        }
+    }
+
+    /// The key prefix blobs are staged and packed under.
+    pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = Some(prefix.into());
+        self
+    }
+
+    /// Writes pack objects to `packs` instead of `db`'s own backend.
+    pub fn packs(mut self, packs: Arc<dyn ObjectStore>) -> Self {
+        self.packs_backend = Some(packs);
+        self
+    }
+
+    /// How many bytes to stage before consolidating into a pack.
+    pub fn packs_threshold(mut self, packs_threshold: u64) -> Self {
+        self.packs_threshold = Some(packs_threshold);
+        self
+    }
+
+    /// Overrides chunking behavior.
+    pub fn chunking(mut self, chunking: cas::Chunking) -> Self {
+        self.chunking = Some(chunking);
+        self
+    }
+
+    /// Overrides encoding/decoding behavior.
+    pub fn codec(mut self, codec: cas::Codec) -> Self {
+        self.codec = Some(codec);
+        self
+    }
+
+    /// Opens `db`, registered with `cas::Storage::merge_operator()`, and
+    /// builds the `Graph` and its `cas::Storage` over that same `db`.
+    pub async fn build(self) -> io::Result<Graph> {
+        let db = slatedb::Db::builder(self.db_prefix, self.db_backend.clone())
+            .with_merge_operator(cas::Storage::merge_operator())
+            .build()
+            .await
+            .map_err(io::Error::other)?;
+
+        let packs_backend = self.packs_backend.unwrap_or_else(|| self.db_backend.clone());
+        let mut cas_builder = cas::Storage::builder_with_db(db.clone(), packs_backend);
+        if let Some(prefix) = self.prefix {
+            cas_builder = cas_builder.prefix(prefix);
+        }
+        if let Some(packs_threshold) = self.packs_threshold {
+            cas_builder = cas_builder.packs_threshold(packs_threshold);
+        }
+        if let Some(chunking) = self.chunking {
+            cas_builder = cas_builder.chunking(chunking);
+        }
+        if let Some(codec) = self.codec {
+            cas_builder = cas_builder.codec(codec);
+        }
+
+        Ok(Graph::new(db, cas_builder.build().await?))
+    }
 }
 
 impl Graph {
-    /// Wraps `cas`.
-    pub const fn new(cas: cas::Storage) -> Self {
-        Self { cas }
+    /// Starts building a `Graph`, which will open its own `db` at
+    /// `db_prefix` in `db_backend`.
+    pub fn builder(db_prefix: impl Into<String>, db_backend: Arc<dyn ObjectStore>) -> Builder {
+        Builder::new(db_prefix, db_backend)
+    }
+
+    /// Wraps `db` (opened with `cas::Storage::merge_operator()` registered,
+    /// composed with whatever else `Graph`'s own future relation storage
+    /// needs) and the `cas::Storage` built over that same `db`. Only
+    /// `Builder::build` calls this -- construct a `Graph` via
+    /// `Graph::builder` instead of opening `db`/building `cas::Storage`
+    /// yourself.
+    const fn new(db: slatedb::Db, cas: cas::Storage) -> Self {
+        Self { db, cas }
     }
 
     /// Reads the content at `digest`, if present.

@@ -116,16 +116,24 @@ pub struct Storage {
     codec:    Codec,
 }
 
-/// Builds a `Storage`, opening `db` along the way with the merge
-/// operator `Storage` needs already registered.
+/// Builds a `Storage`, either opening `db` along the way with the merge
+/// operator `Storage` needs already registered, or using one the caller
+/// already opened (and registered it on themselves).
 pub struct Builder {
-    db_prefix:       String,
-    db_backend:      Arc<dyn ObjectStore>,
+    db_mode:         DbMode,
     prefix:          String,
     packs_backend:   Option<Arc<dyn ObjectStore>>,
     packs_threshold: u64,
     chunking:        Chunking,
     codec:           Codec,
+}
+
+/// How `Builder::build` gets its `slatedb::Db`.
+enum DbMode {
+    /// Open a new `slatedb::Db` at `db_prefix` in `db_backend`.
+    Open { db_prefix: String, db_backend: Arc<dyn ObjectStore> },
+    /// Use this already-opened `db` as-is.
+    Provided(slatedb::Db),
 }
 
 /// `cas::Storage`'s own staging area within `db` -- entries land here
@@ -191,9 +199,28 @@ impl Storage {
     /// How many consecutive `flush_pending` failures `put_blob` tolerates.
     const MAX_CONSECUTIVE_FLUSH_FAILURES: u32 = 3;
 
-    /// Starts building a `Storage`.
+    /// Starts building a `Storage`, opening a new `slatedb::Db` at
+    /// `db_prefix` in `db_backend`.
     pub fn builder(db_prefix: impl Into<String>, db_backend: Arc<dyn ObjectStore>) -> Builder {
         Builder::new(db_prefix, db_backend)
+    }
+
+    /// Starts building a `Storage` over an already-opened `db`, instead of
+    /// opening a new one -- for sharing one `slatedb::Db` with another
+    /// component that has its own keys in the same db. `db` must already be
+    /// registered with [`Storage::merge_operator`] (composed with whatever
+    /// else needs to share it). `packs_backend` is required here since
+    /// there's no `db`-owned backend handle left to default it to.
+    pub fn builder_with_db(db: slatedb::Db, packs_backend: Arc<dyn ObjectStore>) -> Builder {
+        Builder::with_db(db, packs_backend)
+    }
+
+    /// The merge operator a `slatedb::Db` must be opened with for `Storage`
+    /// to work correctly. Only needed by a caller opening `db` itself and
+    /// passing it to [`Storage::builder_with_db`] -- `Storage::builder`
+    /// registers this on the `db` it opens automatically.
+    pub fn merge_operator() -> Arc<dyn slatedb::MergeOperator + Send + Sync> {
+        Stage::merge_operator()
     }
 
     /// Whether `key` is already stored, without fetching its value.
