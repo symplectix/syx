@@ -5,5 +5,5 @@ rust.library(
     testonly = True,
     srcs = ["src/lib.rs"],
     visibility = ["//visibility:public"],
-    deps = ["//syx/cas"],
+    deps = ["//syx/content_addressing"],
 )

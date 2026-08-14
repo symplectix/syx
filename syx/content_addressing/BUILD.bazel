@@ -1,7 +1,7 @@
 load("//bazel:rust.bzl", "rust")
 
 rust.library(
-    name = "cas",
+    name = "content_addressing",
     srcs = [
         "src/chunking.rs",
         "src/codec.rs",
@@ -22,16 +22,16 @@ rust.library(
 )
 
 rust.test(
-    name = "cas_test",
+    name = "content_addressing_test",
     size = "small",
-    crate = ":cas",
+    crate = ":content_addressing",
     deps = [
         "//syx/testing",
     ],
 )
 
 rust.test_suite(
-    name = "cas_test_suite",
+    name = "content_addressing_test_suite",
     size = "small",
     srcs = [
         "tests/digest_fidelity.rs",
@@ -40,7 +40,7 @@ rust.test_suite(
     ],
     shared_srcs = ["tests/common/mod.rs"],
     deps = [
-        ":cas",
+        ":content_addressing",
         "//syx/cas_testing",
         "@crates//:cbor2",
         "@crates//:serde",

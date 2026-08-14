@@ -15,7 +15,7 @@ rust.library(
     proc_macro_deps = ["//syx/cas_cbor2"],
     visibility = ["//visibility:public"],
     deps = [
-        "//syx/cas",
+        "//syx/content_addressing",
         "@crates//:bitflags",
         "@crates//:bytes",
         "@crates//:cbor2",
@@ -51,7 +51,7 @@ rust.test(
     ],
     deps = [
         ":fabric",
-        "//syx/cas",
+        "//syx/content_addressing",
         "//syx/testing",
         "@crates//:aws-sdk-s3",
         "@crates//:futures",
@@ -85,7 +85,7 @@ rust.test_suite(
     shared_srcs = ["tests/common/mod.rs"],
     deps = [
         ":fabric",
-        "//syx/cas",
+        "//syx/content_addressing",
         "//syx/cas_testing",
         "//syx/testing",
         "@crates//:object_store",

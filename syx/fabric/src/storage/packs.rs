@@ -2,7 +2,7 @@ use std::io;
 use std::ops::Range;
 
 use bytes::Bytes;
-use cas::Digest;
+use content_addressing::Digest;
 use object_store::path::Path;
 use object_store::{
     GetOptions,

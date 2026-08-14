@@ -6,7 +6,7 @@ use bytes::{
     Bytes,
     BytesMut,
 };
-use cas::Digest;
+use content_addressing::Digest;
 use slatedb::{
     MergeOperator,
     MergeOperatorError,

@@ -2,6 +2,7 @@
 use std::io;
 use std::sync::Arc;
 
+use content_addressing as cas;
 use object_store::ObjectStore;
 
 use crate::{

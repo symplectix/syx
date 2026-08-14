@@ -1,6 +1,8 @@
 //! A `Function` and everything it references resolve back out of a
 //! `fabric::Repository`, using only its own digest.
 
+use content_addressing as cas;
+
 mod common;
 use common::temp_graph;
 

@@ -1,6 +1,8 @@
 //! Content much larger than a single chunk still round-trips exactly,
 //! and every ingestion method agrees on its digest.
 
+use content_addressing as cas;
+
 mod common;
 use common::temp_graph;
 

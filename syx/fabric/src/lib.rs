@@ -1,5 +1,7 @@
 //! fabric: content-addressed trees and references to runnable things.
 
+use content_addressing as cas;
+
 mod blob;
 mod function;
 mod graph;

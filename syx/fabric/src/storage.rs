@@ -86,7 +86,7 @@ use bytes::{
     BufMut,
     Bytes,
 };
-use cas::{
+use content_addressing::{
     Chunking,
     Codec,
     ContentFlags,

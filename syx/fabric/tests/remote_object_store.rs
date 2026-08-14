@@ -11,6 +11,7 @@ use aws_sdk_s3::config::{
     Credentials,
     Region,
 };
+use content_addressing as cas;
 use futures::StreamExt as _;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;

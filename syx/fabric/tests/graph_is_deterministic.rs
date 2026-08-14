@@ -1,6 +1,8 @@
 //! A `Store`'s returned digest doesn't depend on which method ingested
 //! the content.
 
+use content_addressing as cas;
+
 mod common;
 use common::temp_graph;
 

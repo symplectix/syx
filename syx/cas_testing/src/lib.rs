@@ -1,6 +1,6 @@
-//! Test helpers for `cas::Digest`.
+//! Test helpers for `content_addressing::Digest`.
 
-use cas::{
+use content_addressing::{
     Digest,
     Hasher,
     ToBytes,

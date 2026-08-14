@@ -1,5 +1,7 @@
 //! Digest is deterministic.
 
+use content_addressing as cas;
+
 mod common;
 use common::Example;
 

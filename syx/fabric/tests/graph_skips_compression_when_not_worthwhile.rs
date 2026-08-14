@@ -2,6 +2,8 @@
 //! it ends up compressed. (Whether compression was actually applied is
 //! an internal decision, covered by unit tests inside `cas`'s own `Codec`.)
 
+use content_addressing as cas;
+
 mod common;
 use common::temp_graph;
 

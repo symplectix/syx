@@ -1,5 +1,7 @@
 //! What a `Graph` persists across instances.
 
+use content_addressing as cas;
+
 mod common;
 
 #[tokio::test]

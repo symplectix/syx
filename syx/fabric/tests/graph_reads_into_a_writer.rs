@@ -3,6 +3,8 @@
 
 use std::io;
 
+use content_addressing as cas;
+
 mod common;
 use common::temp_graph;
 

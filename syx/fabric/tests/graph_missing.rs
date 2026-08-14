@@ -1,5 +1,7 @@
 //! A digest that was never stored is reported as absent, not an error.
 
+use content_addressing as cas;
+
 mod common;
 use common::temp_graph;
 

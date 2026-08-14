@@ -5,6 +5,8 @@ use std::collections::{
     BTreeSet,
 };
 
+use content_addressing as cas;
+
 /// What a `Tree` entry's name points to: a file's content, or a nested
 /// `Tree`, each referenced by digest rather than embedded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
