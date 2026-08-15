@@ -1,5 +1,7 @@
 //! A `Digest`'s bytes are preserved faithfully.
 
+use content_addressing as cas;
+
 #[test]
 fn digest_bytes_round_trip_through_digest_new() {
     let want = cas_testing::digest_bytes(b"hello");

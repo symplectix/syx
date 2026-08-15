@@ -1,12 +1,36 @@
 use std::io;
 
+use bitflags::bitflags;
 use bytes::Bytes;
 
-use super::{
-    Codec,
-    ContentFlags,
-};
-use crate::invalid_data;
+fn invalid_data(msg: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.into())
+}
+
+bitflags! {
+    /// The trailing byte of a blob's own encoded content -- set once,
+    /// at write time, and unchanged from then on regardless of where
+    /// that content ends up physically living.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ContentFlags: u8 {
+        /// The payload that follows is compressed by zstd.
+        const COMPRESSED = 1 << 0;
+        /// The payload is chunked, contains an ordered list of Chunk,
+        /// not content itself.
+        const CHUNKED = 1 << 1;
+    }
+}
+
+/// How to encode/decode a chunk. Each constant is a pure heuristic,
+/// safe to change at any time: every stored chunk records its own
+/// compressed-or-not decision, so changing these only affects
+/// future writes, never how existing ones are read back.
+#[derive(Clone, Copy)]
+pub struct Codec {
+    compression_level: i32,
+    sniff_len:         usize,
+    sniff_max_ratio:   f64,
+}
 
 impl Default for Codec {
     fn default() -> Self {
@@ -66,7 +90,7 @@ impl Codec {
 
     /// Compress `bytes` with zstd if that's worthwhile, and append a
     /// flag byte recording whether it was.
-    pub(super) fn encode(&self, mut flags: ContentFlags, mut bytes: Vec<u8>) -> Vec<u8> {
+    pub fn encode(&self, mut flags: ContentFlags, mut bytes: Vec<u8>) -> Vec<u8> {
         let sample = &bytes[..bytes.len().min(self.sniff_len)];
         if self.worth_compressing(sample) {
             let mut compressed = zstd::bulk::compress(&bytes, self.compression_level)
@@ -81,7 +105,7 @@ impl Codec {
 
     /// Whether compressing `sample` shrinks it enough to be worth
     /// compressing the rest of the chunk it was taken from.
-    pub(super) fn worth_compressing(&self, sample: &[u8]) -> bool {
+    pub fn worth_compressing(&self, sample: &[u8]) -> bool {
         if sample.is_empty() {
             return false;
         }
@@ -92,7 +116,7 @@ impl Codec {
 
     /// The not-worth-compressing case is just a cheap sub-slice
     /// of the already-allocated buffer.
-    pub(super) fn decode(&self, stored: Bytes) -> io::Result<(ContentFlags, Bytes)> {
+    pub fn decode(&self, stored: Bytes) -> io::Result<(ContentFlags, Bytes)> {
         if stored.is_empty() {
             return Err(invalid_data("stored content is missing its trailing flag byte"));
         }

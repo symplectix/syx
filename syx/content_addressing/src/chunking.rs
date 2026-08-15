@@ -77,11 +77,7 @@ impl Chunking {
     /// chunks. `r` may be a multiplexed/persistent stream where EOF
     /// doesn't mark this blob's end, so this bounds the chunker to
     /// exactly `len` bytes rather than reading until EOF.
-    pub(super) fn reader<'r, R>(
-        &self,
-        len: u64,
-        r: &'r mut R,
-    ) -> v2020::AsyncStreamCDC<Take<&'r mut R>>
+    pub fn reader<'r, R>(&self, len: u64, r: &'r mut R) -> v2020::AsyncStreamCDC<Take<&'r mut R>>
     where
         R: AsyncRead + Unpin,
     {

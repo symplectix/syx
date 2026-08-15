@@ -1,0 +1,50 @@
+load("//bazel:rust.bzl", "rust")
+
+rust.library(
+    name = "content_addressing",
+    srcs = [
+        "src/chunking.rs",
+        "src/codec.rs",
+        "src/hash.rs",
+        "src/lib.rs",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@crates//:bitflags",
+        "@crates//:bytes",
+        "@crates//:fastcdc",
+        "@crates//:serde",
+        "@crates//:serde_bytes",
+        "@crates//:sha2",
+        "@crates//:tokio",
+        "@crates//:zstd",
+    ],
+)
+
+rust.test(
+    name = "content_addressing_test",
+    size = "small",
+    crate = ":content_addressing",
+    deps = [
+        "//syx/testing",
+    ],
+)
+
+rust.test_suite(
+    name = "content_addressing_test_suite",
+    size = "small",
+    srcs = [
+        "tests/digest_fidelity.rs",
+        "tests/digest_is_deterministic.rs",
+        "tests/digest_is_sensitive.rs",
+    ],
+    shared_srcs = ["tests/common/mod.rs"],
+    deps = [
+        ":content_addressing",
+        "//syx/cas_testing",
+        "@crates//:cbor2",
+        "@crates//:serde",
+        "@crates//:serde_bytes",
+        "@crates//:tokio",
+    ],
+)

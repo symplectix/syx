@@ -1,4 +1,4 @@
-//! Round-trips content through `cas::Storage` backed by a real (local)
+//! Round-trips content through `fabric::Graph` backed by a real (local)
 //! S3-compatible remote, including a blob large enough to span multiple
 //! chunks (and so multiple staged entries plus a manifest), and confirms
 //! staged entries do consolidate into pack objects.
@@ -11,6 +11,7 @@ use aws_sdk_s3::config::{
     Credentials,
     Region,
 };
+use content_addressing as cas;
 use futures::StreamExt as _;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
@@ -19,14 +20,14 @@ use testing::s3;
 
 const BUCKET: &str = "cas-test";
 
-/// `cas::Storage` backed by a real `AmazonS3`-compatible remote against
+/// `fabric::Graph` backed by a real `AmazonS3`-compatible remote against
 /// `s3_server`, with `BUCKET` created and ready. Also returns that same
 /// remote as an `Arc<dyn ObjectStore>`, for tests that need to inspect
 /// pack objects directly.
-async fn s3_cas(
+async fn s3_graph(
     s3_server: &s3::Server,
     packs_threshold: u64,
-) -> (cas::Storage, Arc<dyn ObjectStore>) {
+) -> (fabric::Graph, Arc<dyn ObjectStore>) {
     // A region is required by both clients below, but this server
     // doesn't validate it. "us-east-1" is just a conventional value.
     let s3_client = aws_sdk_s3::Client::from_conf(
@@ -62,34 +63,34 @@ async fn s3_cas(
     );
 
     let db_backend: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let cas = cas::Storage::builder("test", db_backend)
+    let graph = fabric::Graph::builder("test", db_backend)
         .packs(remote.clone())
         .packs_threshold(packs_threshold)
         .build()
         .await
         .unwrap();
-    (cas, remote)
+    (graph, remote)
 }
 
 #[tokio::test]
 async fn get_returns_what_was_put() {
     let s3_server = s3::Server::spawn(testing::tempdir()).unwrap();
-    let (cas, _remote) = s3_cas(&s3_server, 1024 * 1024).await;
+    let (graph, _remote) = s3_graph(&s3_server, 1024 * 1024).await;
 
     let content = cas::Bytes::from_static(b"hello");
-    let d = cas.put(&content).await.unwrap();
-    assert_eq!(cas.get::<cas::Bytes>(&d).await.unwrap(), Some(content));
+    let d = graph.cas().put(&content).await.unwrap();
+    assert_eq!(graph.cas().get::<cas::Bytes>(&d).await.unwrap(), Some(content));
 
     let content = cas::Bytes::from(testing::random_bytes(2 * 1024 * 1024));
-    let d = cas.put(&content).await.unwrap();
-    assert_eq!(cas.get::<cas::Bytes>(&d).await.unwrap(), Some(content));
+    let d = graph.cas().put(&content).await.unwrap();
+    assert_eq!(graph.cas().get::<cas::Bytes>(&d).await.unwrap(), Some(content));
 }
 
 #[tokio::test]
 async fn a_full_pack_flushes_on_the_next_write_and_stays_readable() {
     let s3_server = s3::Server::spawn(testing::tempdir()).unwrap();
     // Small enough that a single chunk's write crosses the threshold.
-    let (cas, remote) = s3_cas(&s3_server, 8).await;
+    let (graph, remote) = s3_graph(&s3_server, 8).await;
 
     // `put_blob` checks the threshold, and flushes if crossed, *before*
     // staging its own bytes -- so a flush failure never makes an
@@ -97,15 +98,15 @@ async fn a_full_pack_flushes_on_the_next_write_and_stays_readable() {
     // write that crosses the threshold isn't the one that gets packed;
     // the next one is.
     let v1 = cas::Bytes::from_static(b"abcdefg1");
-    let d1 = cas.put(&v1).await.unwrap();
+    let d1 = graph.cas().put(&v1).await.unwrap();
     assert_eq!(remote.list(None).count().await, 0);
 
     let v2 = cas::Bytes::from_static(b"abcdefg2");
-    let d2 = cas.put(&v2).await.unwrap();
+    let d2 = graph.cas().put(&v2).await.unwrap();
     assert_eq!(remote.list(None).count().await, 1);
 
-    assert_eq!(cas.get::<cas::Bytes>(&d1).await.unwrap(), Some(v1));
-    assert_eq!(cas.get::<cas::Bytes>(&d2).await.unwrap(), Some(v2));
+    assert_eq!(graph.cas().get::<cas::Bytes>(&d1).await.unwrap(), Some(v1));
+    assert_eq!(graph.cas().get::<cas::Bytes>(&d2).await.unwrap(), Some(v2));
 }
 
 #[tokio::test]
@@ -114,14 +115,14 @@ async fn content_in_different_packs_stays_independently_readable() {
     // Large enough that nothing auto-flushes on its own -- each pack
     // below is built up by staging several entries, then flushed
     // explicitly, so it ends up holding more than just one entry.
-    let (cas, remote) = s3_cas(&s3_server, 1024 * 1024).await;
+    let (graph, remote) = s3_graph(&s3_server, 1024 * 1024).await;
 
-    async fn put_and_flush(cas: &cas::Storage, values: &[cas::Bytes]) -> Vec<cas::Digest> {
+    async fn put_and_flush(graph: &fabric::Graph, values: &[cas::Bytes]) -> Vec<cas::Digest> {
         let mut digests = Vec::with_capacity(values.len());
         for v in values {
-            digests.push(cas.put(v).await.unwrap());
+            digests.push(graph.cas().put(v).await.unwrap());
         }
-        cas.flush_pending().await.unwrap();
+        graph.cas().flush_pending().await.unwrap();
         digests
     }
 
@@ -130,7 +131,7 @@ async fn content_in_different_packs_stays_independently_readable() {
         cas::Bytes::from_static(b"pack-a-value-2"),
         cas::Bytes::from_static(b"pack-a-value-3"),
     ];
-    let pack_a_digests = put_and_flush(&cas, &pack_a).await;
+    let pack_a_digests = put_and_flush(&graph, &pack_a).await;
     assert_eq!(remote.list(None).count().await, 1);
 
     let pack_b = [
@@ -138,11 +139,11 @@ async fn content_in_different_packs_stays_independently_readable() {
         cas::Bytes::from_static(b"pack-b-value-2"),
         cas::Bytes::from_static(b"pack-b-value-3"),
     ];
-    let pack_b_digests = put_and_flush(&cas, &pack_b).await;
+    let pack_b_digests = put_and_flush(&graph, &pack_b).await;
     assert_eq!(remote.list(None).count().await, 2);
 
     let entries = pack_a.iter().zip(&pack_a_digests).chain(pack_b.iter().zip(&pack_b_digests));
     for (v, d) in entries {
-        assert_eq!(cas.get::<cas::Bytes>(d).await.unwrap(), Some(v.clone()));
+        assert_eq!(graph.cas().get::<cas::Bytes>(d).await.unwrap(), Some(v.clone()));
     }
 }

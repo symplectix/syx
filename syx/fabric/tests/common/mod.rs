@@ -14,8 +14,7 @@ pub fn command(program: &str, args: &[&str]) -> fabric::Command {
 pub async fn graph(root: impl AsRef<Path>) -> fabric::Graph {
     let backend: Arc<dyn ObjectStore> =
         Arc::new(object_store::local::LocalFileSystem::new_with_prefix(root).unwrap());
-    let cas = cas::Storage::builder("test", backend).build().await.unwrap();
-    fabric::Graph::new(cas)
+    fabric::Graph::builder("test", backend).build().await.unwrap()
 }
 
 /// A `Graph` backed by a local temporary directory.

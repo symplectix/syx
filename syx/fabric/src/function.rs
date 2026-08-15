@@ -3,6 +3,8 @@
 
 use std::collections::BTreeMap;
 
+use content_addressing as cas;
+
 /// A program, its arguments, and the environment variables to invoke it
 /// with. Shared by:
 /// - `Function::Action` (run once)

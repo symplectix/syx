@@ -1,7 +1,9 @@
-//! Shared fixtures for `cas`'s external test suite.
+//! Shared fixtures for `content_addressing`'s external test suite.
 // `shared_srcs` compiles this file into every test binary in the
 // suite separately, so not every item here is used by every one.
 #![allow(dead_code)]
+
+use content_addressing as cas;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Example {
