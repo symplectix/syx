@@ -84,8 +84,8 @@ rust.test_suite(
     shared_srcs = ["tests/common/mod.rs"],
     deps = [
         ":fabric",
-        "//syx/content_addressing",
         "//syx/cas_testing",
+        "//syx/content_addressing",
         "//syx/testing",
         "@crates//:object_store",
         "@crates//:tokio",
