@@ -61,7 +61,7 @@ pub struct Builder {
     db_prefix:       String,
     db_backend:      Arc<dyn ObjectStore>,
     packs_backend:   Option<Arc<dyn ObjectStore>>,
-    prefix:          Option<String>,
+    cas_prefix:      Option<String>,
     packs_threshold: Option<u64>,
     chunking:        Option<cas::Chunking>,
     codec:           Option<cas::Codec>,
@@ -73,16 +73,19 @@ impl Builder {
             db_prefix: db_prefix.into(),
             db_backend,
             packs_backend: None,
-            prefix: None,
+            cas_prefix: None,
             packs_threshold: None,
             chunking: None,
             codec: None,
         }
     }
 
-    /// The key prefix blobs are staged and packed under.
-    pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.prefix = Some(prefix.into());
+    /// The key prefix blobs are staged and packed under. Named
+    /// `cas_prefix`, not just `prefix`, to avoid confusion with
+    /// `db_prefix`, the unrelated prefix `slatedb::Db` itself is opened
+    /// under.
+    pub fn cas_prefix(mut self, cas_prefix: impl Into<String>) -> Self {
+        self.cas_prefix = Some(cas_prefix.into());
         self
     }
 
@@ -117,18 +120,14 @@ impl Builder {
 
     /// Opens `db`, registered with a `PrefixMergeOperator` that currently
     /// only routes to the blob storage engine's own operator, and builds
-    /// the `Graph` -- `db` plus the blob-storage parts (`packing`/
-    /// `chunking`/`codec`) `Graph` holds directly.
+    /// the `Graph`.
     // TODO: `Graph`'s own relation storage will need its own merge operator
-    // eventually (e.g. for growable reference sets, see hypergraph.md).
-    // `PrefixMergeOperator` below is a rough scaffold for composing it with
-    // the blob engine's once it exists, not a finished design -- `Graph`'s
-    // own merge semantics don't exist yet.
+    // eventually.
     pub async fn build(self) -> io::Result<Graph> {
-        let prefix = self.prefix.unwrap_or_else(|| storage::DEFAULT_PREFIX.to_string());
+        let cas_prefix = self.cas_prefix.unwrap_or_else(|| storage::DEFAULT_CAS_PREFIX.to_string());
         let merge_operator: Arc<dyn slatedb::MergeOperator + Send + Sync> =
             Arc::new(PrefixMergeOperator {
-                routes: vec![(prefix.clone().into_bytes(), storage::merge_operator())],
+                routes: vec![(cas_prefix.clone().into_bytes(), storage::merge_operator())],
             });
 
         let db = slatedb::Db::builder(self.db_prefix, self.db_backend.clone())
@@ -142,8 +141,8 @@ impl Builder {
         let chunking = self.chunking.unwrap_or_default();
         let codec = self.codec.unwrap_or_default();
 
-        let packing = storage::Packing::new(packs_backend, prefix, packs_threshold);
-        Ok(Graph::new(db, packing, chunking, codec))
+        let flushing = storage::Flushing::new(packs_threshold);
+        Ok(Graph::new(db, packs_backend, cas_prefix, flushing, chunking, codec))
     }
 }
 
@@ -154,25 +153,24 @@ impl Graph {
         Builder::new(db_prefix, db_backend)
     }
 
-    /// Assembles `Graph` from its own `db` (opened with the blob storage
-    /// engine's merge operator registered, composed with whatever else
-    /// `Graph`'s own future relation storage needs) and the blob-storage
-    /// parts staged into that same `db`. Only `Builder::build` calls this
-    /// -- construct a `Graph` via `Graph::builder` instead of opening
-    /// `db`/building these parts yourself.
+    /// Only `Builder::build` calls this. Construct a `Graph` via
+    /// `Graph::builder` instead of opening `db`/building these parts
+    /// yourself.
     const fn new(
         db: slatedb::Db,
-        packing: storage::Packing,
+        store: Arc<dyn ObjectStore>,
+        cas_prefix: String,
+        flushing: storage::Flushing,
         chunking: cas::Chunking,
         codec: cas::Codec,
     ) -> Self {
-        Self { db, packing, chunking, codec }
+        Self { db, store, cas_prefix, flushing, chunking, codec }
     }
 
     /// The blob-storage facet of this `Graph`: `get`/`put`/`read_into`/
-    /// `copy_from`/`flush_pending`. A cheap, borrowed view -- construct
-    /// it fresh wherever it's needed rather than holding onto one.
+    /// `copy_from`/`flush_pending`. A cheap, borrowed view. Construct it
+    /// fresh wherever it's needed rather than holding onto one.
     pub fn cas(&self) -> Cas<'_> {
-        Cas::new(&self.db, &self.packing, self.chunking, self.codec)
+        Cas::new(&self.db, &self.store, &self.cas_prefix, &self.flushing, self.chunking, self.codec)
     }
 }

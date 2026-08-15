@@ -20,7 +20,7 @@ bitflags! {
     /// or a pointer to where the content currently lives instead.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct EntryFlags: u8 {
-        /// This entry isn't content -- it's a pointer to where the
+        /// This entry isn't content, it's a pointer to where the
         /// content lives instead.
         const PACKED = 1 << 0;
     }
@@ -28,9 +28,10 @@ bitflags! {
 
 impl Entry {
     /// The tag byte trails the payload rather than leading it, so the
-    /// common `Inline` case can append in place -- via `try_into_mut`,
-    /// reusing `bytes`' own allocation -- instead of copying a chunk's
-    /// entire content (up to a few MiB) just to prepend one byte.
+    /// common `Inline` case can append in place via `try_into_mut`,
+    /// reusing `bytes`' own allocation, instead of copying a chunk's
+    /// entire content, which can run to a few MiB, just to prepend one
+    /// byte.
     pub(super) fn encode(self) -> Bytes {
         match self {
             Entry::Inline(bytes) => {

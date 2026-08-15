@@ -1,65 +1,17 @@
 //! Content-addressed blob storage: chunking, encoding on the way in,
-//! decoding and verifying on the way out. Blobs are staged in `slatedb`
-//! before being consolidated into pack objects in a wrapped `ObjectStore`.
-//!
-//! Fabric-internal: `content_addressing` used to own this (as
-//! `cas::Storage`), but it had exactly one consumer -- `fabric`.
-//! `content_addressing` keeps the storage-agnostic pieces (`Digest`,
-//! `Chunking`, `Codec`); this module keeps the part that's actually
-//! about `slatedb`/`object_store`.
-//!
-//! `Graph` (see `graph.rs`) holds `db`/`packing`/`chunking`/`codec` as
-//! its own fields -- there's no `Storage` type bundling them up. What it
-//! hands out instead is `Cas<'_>`, a borrowed view constructed fresh per
-//! call (`Graph::cas()`): all the blob-storage methods live there, so
-//! `Graph`'s own methods don't have to be the blob-storage API directly
-//! (leaves room for e.g. `Graph::links()` later without name
-//! collisions), and every method on `Cas` reaches `db` via `self.db`
-//! instead of taking it as a parameter.
-//!
-//! `Packing` (this file) is a plain data container -- where things are
-//! staged/packed and what threshold/prefix govern it -- not an object
-//! with its own behavior. All the operations that used to live on it
-//! (and on a separate `Packs` type before that merged into it) are
-//! methods on `Cas` instead, since `Cas` is the thing that actually has
-//! everything an operation needs (`db` plus `packing`'s config) in one
-//! place; splitting that across multiple small stateful types just
-//! meant threading `db` (or worse, no `db` at all, and awkwardly
-//! inconsistent per-type shapes) between them for no benefit.
-//!
-//! # Why pack at all
-//!
-//! One object per chunk means one backend API call per chunk, which
-//! gets expensive (S3 request pricing, rate limits) as blob count
-//! grows. Consolidating many small objects into fewer, larger packs
-//! cuts that down, the same way `git`/`restic` pack loose objects.
-//!
-//! # Why stage in `slatedb` rather than pack directly
-//!
-//! Two simpler alternatives were considered and rejected:
-//!
-//! - Write each chunk as its own object immediately, then repack later: still pays one API call per
-//!   chunk up front, plus a GET, a PUT, and a DELETE per chunk to consolidate afterward -- strictly
-//!   more calls, not fewer.
-//!
-//! - Buffer writes in memory and flush a pack once enough accumulates: a crash before the flush
-//!   silently loses writes that already returned `Ok` to the caller.
-//!
-//! Staging in `slatedb` first avoids both: no per-chunk backend object
-//! is ever created, and nothing is acknowledged before it's durable.
-//! Once enough accumulates, concatenates the staged bytes into one pack
-//! object and flips each entry to `Entry::Packed`.
+//! decoding and verifying on the way out.
 //!
 //! # Data layout
 //!
-//! Two separate namespaces share the name "prefix": `db_prefix`, an `object_store::path::Path`
-//! passed straight through to `slatedb::Db::builder` and never touched again here (everything
-//! under it -- manifest, WAL, SST files -- is `slatedb`'s own concern), and `prefix`
-//! (`Packing`'s own `prefix` field, default `cas/`, see [`DEFAULT_PREFIX`]).
+//! ## Packing
 //!
-//! ## Staging layout
+//! One object per chunk means one backend API call per chunk, which
+//! gets expensive as blob count grows. Consolidating many small objects
+//! into fewer, larger packs cuts that down.
 //!
-//! With `prefix` as `"cas/"`:
+//! ## Staging
+//!
+//! With `cas_prefix` as `"cas/"`:
 //!
 //! - `cas/pending_bytes`: `u64` big-endian, how many `Inline` bytes are currently staged.
 //! - `cas/pending_keys`: a flat concatenation of 32-byte digests, still staged.
@@ -79,7 +31,7 @@
 //! Written once, when `flush_pending` consolidates staged entries into a pack and flips each one
 //! from `Inline` to `Packed` in the same `WriteBatch` that makes the flip durable.
 //!
-//! ## Pack layout
+//! ## Object Store
 //!
 //! - `cas/sha256/{pack_id:x}`: one object per `flush_pending` run, hex-encoded. A pack object's
 //!   bytes are just its packed entries' concatenated bytes, each one dropping its trailing
@@ -137,50 +89,43 @@ fn other(e: impl std::error::Error + Send + Sync + 'static) -> io::Error {
 }
 
 /// The merge operator `db` must be opened with for `Cas` to work
-/// correctly against it. `Cas`/`Graph` never open `db` themselves --
-/// whoever does (`Graph::Builder`) registers this.
+/// correctly against it. `Cas`/`Graph` never open `db` themselves;
+/// `Graph::Builder` registers this instead.
 pub(crate) fn merge_operator() -> Box<dyn slatedb::MergeOperator + Send + Sync> {
     entry::merge_operator()
 }
 
-/// The default `prefix`, for the common case of `packs` existing solely
-/// for this `Graph`'s own blob storage.
-pub(crate) const DEFAULT_PREFIX: &str = "cas/";
+/// The default `cas_prefix`, for the common case of `store` existing
+/// solely for this `Graph`'s own blob storage.
+pub(crate) const DEFAULT_CAS_PREFIX: &str = "cas/";
 
-/// The default `packs_threshold`: 32 MiB -- enough to consolidate
-/// several dozen chunks per pack.
+/// The default `packs_threshold`, 32 MiB, enough to consolidate several
+/// dozen chunks per pack.
 pub(crate) const DEFAULT_PACKS_THRESHOLD: u64 = Chunking::AVG_SIZE as u64 * 64;
 
-/// Where blobs are staged (in whichever `db` a `Cas` call is given,
-/// under `prefix`) and packed (in `store`, once `threshold`
-/// accumulates). A plain data container -- see the module doc for why
-/// the operations that use these fields live on `Cas` instead of here.
+/// Flush behavior: when to consolidate staged entries into a pack, and
+/// bookkeeping for that process. A plain data container; the operations
+/// that use it live on `Cas`.
 #[derive(Clone)]
-pub(crate) struct Packing {
-    /// This subsystem's own namespace within both `db` and `store`.
-    prefix:         String,
+pub(crate) struct Flushing {
     /// Serializes `flush_pending`.
-    flushing:       Arc<tokio::sync::Mutex<()>>,
+    mutex:     Arc<tokio::sync::Mutex<()>>,
     /// Consecutive `flush_pending` failures, reset to 0 on success.
     /// `put_blob`'s opportunistic call reads this to decide whether to
     /// swallow an error or propagate it.
-    flush_failures: Arc<AtomicU32>,
-    /// Where staged entries get consolidated into once `threshold`
-    /// accumulates.
-    store:          Arc<dyn ObjectStore>,
-    threshold:      u64,
+    failures:  Arc<AtomicU32>,
+    /// How many bytes to stage before consolidating into a pack.
+    threshold: u64,
 }
 
-impl Packing {
-    /// Builds `Packing` for `Graph` to hold directly. `Graph::Builder`
-    /// is the configuration surface (defaults, overrides) -- this just
-    /// builds what it resolves.
-    pub(crate) fn new(store: Arc<dyn ObjectStore>, prefix: String, threshold: u64) -> Self {
+impl Flushing {
+    /// Builds `Flushing` for `Graph` to hold directly. `Graph::Builder`
+    /// is the configuration surface, resolving defaults and overrides;
+    /// this just builds what it resolves.
+    pub(crate) fn new(threshold: u64) -> Self {
         Self {
-            prefix,
-            flushing: Arc::new(tokio::sync::Mutex::new(())),
-            flush_failures: Arc::new(AtomicU32::new(0)),
-            store,
+            mutex: Arc::new(tokio::sync::Mutex::new(())),
+            failures: Arc::new(AtomicU32::new(0)),
             threshold,
         }
     }
@@ -188,70 +133,77 @@ impl Packing {
 
 /// Where an entry currently lives.
 enum Entry {
-    /// Still staged: the raw bytes themselves -- opaque here, but
-    /// really `[payload][ContentFlags]`, as `Codec::encode`
-    /// produced it.
+    /// Still staged: the raw bytes themselves, opaque here but really
+    /// `[payload][ContentFlags]`, as `Codec::encode` produced it.
     Inline(Bytes),
     /// Migrated: where to find it in an already-durable pack.
     Packed { pack_id: Digest, offset: u64, length: u64 },
 }
 
 /// The blob-storage facet of a `Graph`: chunking, encoding/decoding, and
-/// physical storage of blobs staged in `db` and packed into `packing`'s
-/// `store` over time. A borrowed view, not an owned type -- `Graph`
-/// holds `db`/`packing`/`chunking`/`codec` itself and builds one of
-/// these fresh per call via `Graph::cas()`. `Copy`, since every field
-/// either is a reference or is itself `Copy` -- cheap to pass around by
-/// value.
+/// physical storage of blobs, addressed by digest.
+/// A borrowed view, not an owned type. Construct one fresh per call via
+/// `Graph::cas()` rather than holding onto one.
 #[derive(Clone, Copy)]
 pub struct Cas<'a> {
-    db:       &'a slatedb::Db,
-    packing:  &'a Packing,
-    chunking: Chunking,
-    codec:    Codec,
+    db:         &'a slatedb::Db,
+    store:      &'a Arc<dyn ObjectStore>,
+    cas_prefix: &'a str,
+    flushing:   &'a Flushing,
+    chunking:   Chunking,
+    codec:      Codec,
 }
 
 impl<'a> Cas<'a> {
     /// How many consecutive `flush_pending` failures `put_blob` tolerates.
     const MAX_CONSECUTIVE_FLUSH_FAILURES: u32 = 3;
 
-    /// Builds a view over `db`/`packing`/`chunking`/`codec` -- only
-    /// `Graph::cas()` calls this, see the module doc.
+    /// Only `Graph::cas()` calls this.
     pub(crate) fn new(
         db: &'a slatedb::Db,
-        packing: &'a Packing,
+        store: &'a Arc<dyn ObjectStore>,
+        cas_prefix: &'a str,
+        flushing: &'a Flushing,
         chunking: Chunking,
         codec: Codec,
     ) -> Self {
-        Self { db, packing, chunking, codec }
+        Self { db, store, cas_prefix, flushing, chunking, codec }
     }
 
-    // --- key layout (formerly on `Stage`) ---
-
     fn entry_key(&self, key: Digest) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(self.packing.prefix.len() + 7 + 32);
-        buf.extend_from_slice(self.packing.prefix.as_bytes());
+        let mut buf = Vec::with_capacity(self.cas_prefix.len() + 7 + 32);
+        buf.extend_from_slice(self.cas_prefix.as_bytes());
         buf.extend_from_slice(b"sha256/");
         buf.extend_from_slice(key.as_ref());
         buf
     }
 
     fn pending_bytes_key(&self) -> Vec<u8> {
-        format!("{}pending_bytes", self.packing.prefix).into_bytes()
+        format!("{}pending_bytes", self.cas_prefix).into_bytes()
     }
 
     fn pending_keys_key(&self) -> Vec<u8> {
-        format!("{}pending_keys", self.packing.prefix).into_bytes()
+        format!("{}pending_keys", self.cas_prefix).into_bytes()
     }
 
     /// Test-only: `staged` finds pending entries via `pending_keys_key`,
     /// not by scanning this range.
     #[cfg(test)]
     fn entry_prefix(&self) -> Vec<u8> {
-        format!("{}sha256/", self.packing.prefix).into_bytes()
+        format!("{}sha256/", self.cas_prefix).into_bytes()
     }
 
-    // --- staging (formerly on `Stage`) ---
+    /// How many distinct keys have ever been staged or packed
+    /// under this store's prefix.
+    #[cfg(test)]
+    pub(crate) async fn entry_count(&self) -> io::Result<usize> {
+        let mut iter = self.db.scan_prefix(self.entry_prefix(), ..).await.map_err(other)?;
+        let mut n = 0;
+        while iter.next().await.map_err(other)?.is_some() {
+            n += 1;
+        }
+        Ok(n)
+    }
 
     async fn pending_bytes(&self) -> io::Result<u64> {
         match self.db.get(self.pending_bytes_key()).await.map_err(other)? {
@@ -280,9 +232,9 @@ impl<'a> Cas<'a> {
         Entry::decode(&raw).map(Some)
     }
 
-    /// Currently-staged entries (per `pending_keys_key` -- not a scan
-    /// over every entry ever held, packed or not), with their still-
-    /// `Inline` bytes.
+    /// Currently-staged entries, with their still-`Inline` bytes, found
+    /// via `pending_keys_key` rather than by scanning every entry ever
+    /// held, packed or not.
     async fn staged(&self) -> io::Result<Vec<(Digest, Bytes)>> {
         let mut staged = Vec::new();
         for digest in self.pending_keys().await? {
@@ -295,10 +247,11 @@ impl<'a> Cas<'a> {
                 continue;
             };
             let Entry::Inline(bytes) = entry else {
-                // `flushing` ensures only one `flush_pending` call runs
-                // at a time, and only `commit_packed` flips Inline to Packed,
-                // so reaching here would mean that serialization itself broke.
-                // Still safe to skip. Nothing to do for an already packed entry.
+                // `flushing.mutex` ensures only one `flush_pending` call
+                // runs at a time, and only `commit_packed` flips Inline
+                // to Packed, so reaching here would mean that
+                // serialization itself broke. Still safe to skip.
+                // Nothing to do for an already packed entry.
                 continue;
             };
             staged.push((digest, bytes));
@@ -307,7 +260,7 @@ impl<'a> Cas<'a> {
     }
 
     /// Atomically flips `entries` to `Packed` and resets the pending
-    /// counters -- called once their bytes are durable in a pack object.
+    /// counters. Called once their bytes are durable in a pack object.
     async fn commit_packed(&self, entries: Vec<(Digest, Entry)>) -> io::Result<()> {
         let mut batch = slatedb::WriteBatch::new();
         for (digest, entry) in entries {
@@ -322,32 +275,24 @@ impl<'a> Cas<'a> {
         Ok(())
     }
 
-    // --- packs (formerly on `Packs`) ---
-
     fn pack_path(&self, pack_id: Digest) -> Path {
-        Path::from(self.packing.prefix.as_str()).join("sha256").join(format!("{pack_id:x}"))
+        Path::from(self.cas_prefix).join("sha256").join(format!("{pack_id:x}"))
     }
 
     /// Fetch `length` bytes at `offset` from pack `pack_id`.
     async fn get_range(&self, pack_id: Digest, offset: u64, length: u64) -> io::Result<Bytes> {
         let range: Range<u64> = offset..offset + length;
         let opts = GetOptions { range: Some(range.into()), ..Default::default() };
-        let result = self
-            .packing
-            .store
-            .get_opts(&self.pack_path(pack_id), opts)
-            .await
-            .map_err(io::Error::from)?;
+        let result =
+            self.store.get_opts(&self.pack_path(pack_id), opts).await.map_err(io::Error::from)?;
         Ok(result.bytes().await?)
     }
 
     /// Write `payload` as one new pack object identified by `pack_id`.
     async fn write_pack(&self, pack_id: Digest, payload: PutPayload) -> io::Result<()> {
-        self.packing.store.put(&self.pack_path(pack_id), payload).await.map_err(io::Error::from)?;
+        self.store.put(&self.pack_path(pack_id), payload).await.map_err(io::Error::from)?;
         Ok(())
     }
-
-    // --- blob-level operations ---
 
     /// Whether `key` is already stored, without fetching its value.
     async fn contains_blob(&self, key: Digest) -> io::Result<bool> {
@@ -369,17 +314,17 @@ impl<'a> Cas<'a> {
 
     /// Store `bytes` under `key`.
     ///
-    /// If enough is already staged to cross `packing.threshold`,
+    /// If enough is already staged to cross `flushing.threshold`,
     /// flushes first before staging `bytes` itself.
     ///
     /// Tolerates up to `MAX_CONSECUTIVE_FLUSH_FAILURES` consecutive
     /// flush failures this way; past that, propagates the error
     /// instead of continuing to accept writes that would never get packed.
     async fn put_blob(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
-        if self.pending_bytes().await? >= self.packing.threshold
+        if self.pending_bytes().await? >= self.flushing.threshold
             && let Err(e) = self.flush_pending().await
         {
-            let failures = self.packing.flush_failures.load(Ordering::Relaxed);
+            let failures = self.flushing.failures.load(Ordering::Relaxed);
             if failures >= Self::MAX_CONSECUTIVE_FLUSH_FAILURES {
                 return Err(e);
             }
@@ -394,37 +339,25 @@ impl<'a> Cas<'a> {
         Ok(())
     }
 
-    /// How many distinct keys have ever been staged or packed
-    /// under this store's prefix. Test-only.
-    #[cfg(test)]
-    pub(crate) async fn entry_count(&self) -> io::Result<usize> {
-        let mut iter = self.db.scan_prefix(self.entry_prefix(), ..).await.map_err(other)?;
-        let mut n = 0;
-        while iter.next().await.map_err(other)?.is_some() {
-            n += 1;
-        }
-        Ok(n)
-    }
-
     /// Consolidates all currently-staged entries into one new pack object.
     ///
     /// If another call is already in progress, this returns immediately
     /// without doing anything, rather than waiting its turn.
     pub async fn flush_pending(&self) -> io::Result<()> {
-        let Ok(_guard) = self.packing.flushing.try_lock() else {
+        let Ok(_guard) = self.flushing.mutex.try_lock() else {
             return Ok(());
         };
 
         let staged = self.staged().await?;
         if staged.is_empty() {
-            self.packing.flush_failures.store(0, Ordering::Relaxed);
+            self.flushing.failures.store(0, Ordering::Relaxed);
             return Ok(());
         }
 
         // Each `Inline` value is kept as its own `Bytes`, not copied into
-        // one contiguous buffer -- `PutPayload` is a cheaply cloneable
-        // sequence of `Bytes` (`Arc<[Bytes]>`), so `write_pack` below
-        // takes them as-is.
+        // one contiguous buffer, since `PutPayload` is itself a cheaply
+        // cloneable sequence of `Bytes`, so `write_pack` below takes
+        // them as-is.
         let pack_id = Hasher::new().parts(staged.iter().map(|(_, b)| b.as_ref())).digest();
         let mut entries = Vec::with_capacity(staged.len());
         let mut chunks = Vec::with_capacity(staged.len());
@@ -441,9 +374,9 @@ impl<'a> Cas<'a> {
             Err(e) => Err(e),
         };
         match &result {
-            Ok(()) => self.packing.flush_failures.store(0, Ordering::Relaxed),
+            Ok(()) => self.flushing.failures.store(0, Ordering::Relaxed),
             Err(_) => {
-                self.packing.flush_failures.fetch_add(1, Ordering::Relaxed);
+                self.flushing.failures.fetch_add(1, Ordering::Relaxed);
             }
         }
         result
@@ -604,8 +537,8 @@ impl<'a> Cas<'a> {
 
         if chunks_bytes.len() == 36 {
             // Exactly one chunk was emitted, so its own digest is already
-            // the blob digest -- already written above under that key,
-            // so there's nothing left to do. This also means a small blob
+            // the blob digest, already written above under that key, and
+            // there's nothing left to do. This also means a small blob
             // and the same content appearing as one chunk inside a larger
             // blob dedup against each other.
             Ok(last_chunk_digest.expect("len() == 36 implies last_digest was set"))
