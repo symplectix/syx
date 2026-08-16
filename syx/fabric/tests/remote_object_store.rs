@@ -63,7 +63,11 @@ async fn s3_graph(
     );
 
     let db_backend: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let graph = fabric::Graph::builder("test", db_backend)
+    // Leaked, not returned: `Bitcask` keeps writing into this directory
+    // for as long as `graph` lives, and these tests never outlive the
+    // process, so there's nothing to clean up on drop that matters here.
+    let bitcask_dir = testing::tempdir().keep();
+    let graph = fabric::Graph::builder("test", db_backend, bitcask_dir)
         .packs(remote.clone())
         .packs_threshold(packs_threshold)
         .build()
@@ -87,23 +91,29 @@ async fn get_returns_what_was_put() {
 }
 
 #[tokio::test]
-async fn a_full_pack_flushes_on_the_next_write_and_stays_readable() {
+async fn crossing_the_threshold_eventually_flushes_and_stays_readable() {
     let s3_server = s3::Server::spawn(testing::tempdir()).unwrap();
     // Small enough that a single chunk's write crosses the threshold.
     let (graph, remote) = s3_graph(&s3_server, 8).await;
 
-    // `put_blob` checks the threshold, and flushes if crossed, *before*
-    // staging its own bytes -- so a flush failure never makes an
-    // otherwise-successful write look like it failed. That means the
-    // write that crosses the threshold isn't the one that gets packed;
-    // the next one is.
+    // Crossing `packs_threshold` triggers `flush_pending` in the
+    // background rather than waiting on it, so the pack shows up on
+    // `remote` at some point after this returns, not necessarily before
+    // it does. Content stays readable throughout either way, since `get`
+    // checks the still-staged copy first and falls through to the pack
+    // once it exists.
     let v1 = cas::Bytes::from_static(b"abcdefg1");
     let d1 = graph.cas().put(&v1).await.unwrap();
-    assert_eq!(remote.list(None).count().await, 0);
-
     let v2 = cas::Bytes::from_static(b"abcdefg2");
     let d2 = graph.cas().put(&v2).await.unwrap();
-    assert_eq!(remote.list(None).count().await, 1);
+
+    for _ in 0..100 {
+        if remote.list(None).count().await > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(remote.list(None).count().await > 0, "pack never showed up on remote");
 
     assert_eq!(graph.cas().get::<cas::Bytes>(&d1).await.unwrap(), Some(v1));
     assert_eq!(graph.cas().get::<cas::Bytes>(&d2).await.unwrap(), Some(v2));

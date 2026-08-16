@@ -43,7 +43,8 @@ pub struct Graph {
     /// source, leaving old ones intact.
     db:         slatedb::Db,
     store:      Arc<dyn ObjectStore>,
-    cas_prefix: String,
+    bitcask:    Arc<storage::Bitcask>,
+    cas_prefix: Arc<str>,
     flushing:   storage::Flushing,
     chunking:   content_addressing::Chunking,
     codec:      content_addressing::Codec,
