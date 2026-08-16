@@ -99,6 +99,11 @@ pub(crate) const DEFAULT_PACKS_THRESHOLD: u64 = Chunking::AVG_SIZE as u64 * 64;
 /// never crosses `packs_threshold` on its own.
 pub(crate) const DEFAULT_MAX_STAGING_DURATION: Duration = Duration::from_secs(30);
 
+/// The default `max_pending_segments`: bounds `bitcask`'s local disk
+/// usage, at this default roughly `16 * packs_threshold`, to a finite
+/// amount even if `flush_pending` fails indefinitely.
+pub(crate) const DEFAULT_MAX_PENDING_SEGMENTS: u16 = 16;
+
 /// Flush behavior: when to consolidate staged entries into a pack, and
 /// bookkeeping for that process. A plain data container; the operations
 /// that use it live on `Cas`.

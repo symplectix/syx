@@ -18,13 +18,28 @@
 //! starts a fresh active segment; every file found on disk becomes a
 //! pending segment, so recovering from a crash needs no special case
 //! beyond what a failed flush already handles.
+//!
+//! # Concurrency
+//!
+//! Writes use position-addressed I/O (`write_at`/Windows' `seek_write`),
+//! not a shared cursor, so concurrent `put`s never contend on a lock:
+//! each one reserves its own byte range with a single atomic add, then
+//! writes into that range independently. `get`/`contains` only ever
+//! touch a separate index lock, so they never wait behind a `put`'s
+//! `fsync` either. `state` (which segment is active, which are pending)
+//! still needs real exclusion, but only `rotate`/`finish` take it as a
+//! writer; `put` takes it as a reader for as long as its write is in
+//! flight, purely so `rotate` waits for every in-flight `put` against
+//! the segment it's about to seal before treating it as immutable.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::fs::File;
 use std::path::{
     Path,
     PathBuf,
 };
+use std::sync::Arc;
 use std::sync::atomic::{
     AtomicU64,
     Ordering,
@@ -44,18 +59,11 @@ use content_addressing::{
     Digest,
     Hasher,
 };
-use tokio::fs::{
-    self,
-    File,
-    OpenOptions,
-};
-use tokio::io::{
-    AsyncReadExt,
-    AsyncSeekExt,
-    AsyncWriteExt,
-};
 use tokio::sync::RwLock;
-use tokio::task;
+use tokio::{
+    fs,
+    task,
+};
 
 #[cfg(test)]
 mod tests;
@@ -93,28 +101,42 @@ struct Location {
 
 struct Active {
     /// This segment's id.
-    id:     Segment,
-    /// Open for appending.
-    file:   File,
-    /// Bytes written to `file` so far.
-    offset: u64,
+    id:   Segment,
+    /// Open for appending. Shared, not exclusive: every write targets
+    /// its own reserved byte range (see the module doc), so handing out
+    /// clones of this `Arc` costs nothing and needs no lock of its own.
+    file: Arc<File>,
 }
 
 struct Inner {
     /// The segment currently being appended to.
     active:  Active,
-    /// Segments rotated out, not yet `finish`ed.
-    pending: Vec<Segment>,
-    /// Every staged key's location, across `active` and `pending`.
-    index:   HashMap<Digest, Location>,
+    /// Segments rotated out, not yet `finish`ed, each with its own open
+    /// handle so `get` never has to reopen a file it's already read
+    /// from.
+    pending: Vec<(Segment, Arc<File>)>,
 }
 
 pub(crate) struct Bitcask {
     /// The directory segments live in.
-    dir:        PathBuf,
-    inner:      RwLock<Inner>,
-    /// Mirrors `inner.active.offset`, readable without locking.
-    active_len: AtomicU64,
+    dir:         PathBuf,
+    /// Structural changes only: which segment is active, which are
+    /// pending. `put` holds this as a reader for its whole write, purely
+    /// so `rotate` (a writer) waits for every write in flight against
+    /// the segment it's about to seal.
+    state:       RwLock<Inner>,
+    /// Every staged key's location, across `active` and `pending`. A
+    /// separate lock from `state`, so `get`/`contains` never wait behind
+    /// a `put`'s `fsync`.
+    index:       RwLock<HashMap<Digest, Location>>,
+    /// The next unwritten offset in the active segment. A `put` reserves
+    /// its byte range by adding to this atomically, before it writes
+    /// anything, which is also what makes concurrent `put`s lock-free.
+    active_len:  AtomicU64,
+    /// `put` refuses new writes once `pending` reaches this many segments,
+    /// so a persistently failing `flush_pending` bounds local disk usage
+    /// instead of growing it without limit.
+    max_pending: u16,
 }
 
 impl Bitcask {
@@ -122,8 +144,15 @@ impl Bitcask {
     /// replays whatever segments are already there. `codec` decodes each
     /// replayed record to verify it against its own key; it must match
     /// whatever `Cas` itself uses, since a value's digest is only
-    /// meaningful once decoded back to its original content.
-    pub(crate) async fn open(dir: impl Into<PathBuf>, codec: Codec) -> io::Result<Self> {
+    /// meaningful once decoded back to its original content. `max_pending`
+    /// is enforced from this point on, even if replay already found more
+    /// pending segments than that: `put` refuses further writes until
+    /// enough of the backlog clears.
+    pub(crate) async fn open(
+        dir: impl Into<PathBuf>,
+        codec: Codec,
+        max_pending: u16,
+    ) -> io::Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir).await?;
 
@@ -163,7 +192,8 @@ impl Bitcask {
                 fs::remove_file(&path).await?;
                 continue;
             }
-            pending.push(segment);
+            let file = open_shared(&path).await?;
+            pending.push((segment, file));
             for (key, offset, length) in records {
                 index.insert(key, Location { segment, offset, length });
             }
@@ -175,48 +205,84 @@ impl Bitcask {
         Ok(Self {
             dir,
             active_len: AtomicU64::new(0),
-            inner: RwLock::new(Inner {
-                active: Active { id: next, file, offset: 0 },
-                pending,
-                index,
-            }),
+            max_pending,
+            state: RwLock::new(Inner { active: Active { id: next, file }, pending }),
+            index: RwLock::new(index),
         })
     }
 
     /// Durably appends `value` under `key` to the active segment. Once
     /// this returns, `value` survives a crash of this node.
+    ///
+    /// Refuses the write if `pending` already holds `max_pending`
+    /// segments: at that point `flush_pending` isn't keeping up, and
+    /// accepting more would grow local disk usage without bound.
     pub(crate) async fn put(&self, key: Digest, value: Bytes) -> io::Result<()> {
-        let mut inner = self.inner.write().await;
-        let record = encode_record(key, &value);
-        let offset = inner.active.offset;
-        inner.active.file.write_all(&record).await?;
-        inner.active.file.sync_all().await?;
-        inner.active.offset += record.len() as u64;
+        let guard = self.state.read().await;
+        if guard.pending.len() >= self.max_pending as usize {
+            return Err(io::Error::other(format!(
+                "bitcask: {} segments already pending (max {})",
+                guard.pending.len(),
+                self.max_pending
+            )));
+        }
+        let file = Arc::clone(&guard.active.file);
+        let segment = guard.active.id;
 
-        let segment = inner.active.id;
-        inner.index.insert(
+        let record = encode_record(key, &value);
+        let offset = self.active_len.fetch_add(record.len() as u64, Ordering::SeqCst);
+
+        task::spawn_blocking(move || -> io::Result<()> {
+            write_all_at(&file, &record, offset)?;
+            file.sync_all()
+        })
+        .await
+        .expect("write should not panic")?;
+
+        // Only released once the write above is durable: `rotate` takes
+        // `state` as a writer to seal `guard.active`, so it can't
+        // observe this segment as immutable while this `put` still has
+        // it open as a reader.
+        drop(guard);
+
+        self.index.write().await.insert(
             key,
             Location { segment, offset: offset + RECORD_HEADER_LEN, length: value.len() as u32 },
         );
-        self.active_len.store(inner.active.offset, Ordering::Relaxed);
         Ok(())
     }
 
     /// Fetches the value staged under `key`, if any.
     pub(crate) async fn get(&self, key: Digest) -> io::Result<Option<Bytes>> {
-        let Some(location) = self.inner.read().await.index.get(&key).copied() else {
+        let Some(location) = self.index.read().await.get(&key).copied() else {
             return Ok(None);
         };
-        let mut file = File::open(self.segment_path(location.segment)).await?;
-        file.seek(io::SeekFrom::Start(location.offset)).await?;
+        let file = {
+            let state = self.state.read().await;
+            if location.segment == state.active.id {
+                Arc::clone(&state.active.file)
+            } else {
+                let (_, file) = state
+                    .pending
+                    .iter()
+                    .find(|(segment, _)| *segment == location.segment)
+                    .expect("an indexed key's segment is always still open");
+                Arc::clone(file)
+            }
+        };
         let mut buf = vec![0u8; location.length as usize];
-        file.read_exact(&mut buf).await?;
-        Ok(Some(Bytes::from(buf)))
+        task::spawn_blocking(move || -> io::Result<Vec<u8>> {
+            read_exact_at(&file, &mut buf, location.offset)?;
+            Ok(buf)
+        })
+        .await
+        .expect("read should not panic")
+        .map(|buf| Some(Bytes::from(buf)))
     }
 
     /// Whether `key` is currently staged, without reading its value.
     pub(crate) async fn contains(&self, key: Digest) -> bool {
-        self.inner.read().await.index.contains_key(&key)
+        self.index.read().await.contains_key(&key)
     }
 
     /// How many bytes the active segment currently holds. Lock-free, so
@@ -228,14 +294,16 @@ impl Bitcask {
 
     /// Closes the active segment out as a new pending segment and starts
     /// a fresh one. Returns the segment that was just closed out, for
-    /// `entries`/`finish`.
+    /// `entries`/`finish`. Waits for every `put` already in flight
+    /// against that segment before treating it as sealed.
     pub(crate) async fn rotate(&self) -> io::Result<Segment> {
-        let mut inner = self.inner.write().await;
+        let mut inner = self.state.write().await;
         let old = inner.active.id;
+        let old_file = Arc::clone(&inner.active.file);
         let next = old.next();
         let file = create_segment(&self.dir, next).await?;
-        inner.active = Active { id: next, file, offset: 0 };
-        inner.pending.push(old);
+        inner.active = Active { id: next, file };
+        inner.pending.push((old, old_file));
         self.active_len.store(0, Ordering::Relaxed);
         Ok(old)
     }
@@ -244,14 +312,31 @@ impl Bitcask {
     /// both a previous flush that failed partway and, after a restart,
     /// whatever `open` found already on disk.
     pub(crate) async fn pending_segments(&self) -> Vec<Segment> {
-        self.inner.read().await.pending.clone()
+        self.state.read().await.pending.iter().map(|(segment, _)| *segment).collect()
     }
 
     /// Every `(key, value)` pair in `segment`, in the order they were
     /// written. `segment` must have come from `rotate` or
     /// `pending_segments`; it is never the active segment.
     pub(crate) async fn entries(&self, segment: Segment) -> io::Result<Vec<(Digest, Bytes)>> {
-        let buf = read_bytes(&self.segment_path(segment)).await?;
+        let file = {
+            let state = self.state.read().await;
+            let (_, file) = state
+                .pending
+                .iter()
+                .find(|(s, _)| *s == segment)
+                .expect("entries is only ever called on a pending segment");
+            Arc::clone(file)
+        };
+        let buf = task::spawn_blocking(move || -> io::Result<Bytes> {
+            let len = file.metadata()?.len() as usize;
+            let mut buf = vec![0u8; len];
+            read_exact_at(&file, &mut buf, 0)?;
+            Ok(Bytes::from(buf))
+        })
+        .await
+        .expect("read should not panic")?;
+
         let records = {
             let buf = buf.clone();
             task::spawn_blocking(move || parse(&buf, None).1).await.expect("parse should not panic")
@@ -268,10 +353,10 @@ impl Bitcask {
     /// call this once `segment`'s content is durably packed elsewhere.
     pub(crate) async fn finish(&self, segment: Segment) -> io::Result<()> {
         {
-            let mut inner = self.inner.write().await;
-            inner.pending.retain(|&id| id != segment);
-            inner.index.retain(|_, location| location.segment != segment);
+            let mut state = self.state.write().await;
+            state.pending.retain(|(id, _)| *id != segment);
         }
+        self.index.write().await.retain(|_, location| location.segment != segment);
         fs::remove_file(self.segment_path(segment)).await
     }
 
@@ -288,6 +373,58 @@ fn encode_record(key: Digest, value: &Bytes) -> Bytes {
     buf.put_u32(value.len() as u32);
     buf.extend_from_slice(value);
     buf.freeze()
+}
+
+#[cfg(unix)]
+fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::write_at(file, buf, offset)
+}
+#[cfg(windows)]
+fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_write(file, buf, offset)
+}
+
+#[cfg(unix)]
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buf, offset)
+}
+#[cfg(windows)]
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+}
+
+/// Writes `buf` to `file` starting at `offset`, retrying on a short
+/// write. Never touches a shared cursor, so this is safe to call
+/// concurrently from multiple tasks against the same `file`, as long as
+/// their `[offset, offset + buf.len())` ranges don't overlap.
+fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = write_at(file, buf, offset)?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "failed to write whole record"));
+        }
+        buf = &buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+/// Reads exactly `buf.len()` bytes from `file` starting at `offset`,
+/// retrying on a short read. Same concurrency property as
+/// [`write_all_at`]: safe to call from multiple tasks at once.
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = read_at(file, buf, offset)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "failed to read whole record",
+            ));
+        }
+        buf = &mut buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
 }
 
 /// Parses records from `buf` in order, returning each one's key and the
@@ -325,8 +462,23 @@ fn parse(buf: &Bytes, codec: Option<Codec>) -> (u64, Vec<(Digest, u64, u32)>) {
     (offset as u64, records)
 }
 
-async fn create_segment(dir: &Path, segment: Segment) -> io::Result<File> {
-    OpenOptions::new().write(true).create_new(true).open(segment_path(dir, segment)).await
+async fn create_segment(dir: &Path, segment: Segment) -> io::Result<Arc<File>> {
+    let std_opts = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true).create_new(true);
+        opts
+    };
+    let path = segment_path(dir, segment);
+    task::spawn_blocking(move || std_opts.open(path).map(Arc::new))
+        .await
+        .expect("open should not panic")
+}
+
+async fn open_shared(path: &Path) -> io::Result<Arc<File>> {
+    let path = path.to_owned();
+    task::spawn_blocking(move || std::fs::File::open(path).map(Arc::new))
+        .await
+        .expect("open should not panic")
 }
 
 async fn read_bytes(path: &Path) -> io::Result<Bytes> {

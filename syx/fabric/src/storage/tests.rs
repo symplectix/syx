@@ -45,7 +45,8 @@ impl Env {
     async fn with_threshold(packs_backend: Arc<dyn ObjectStore>, threshold: u64) -> Self {
         let db = slatedb::Db::builder("test", in_memory()).build().await.unwrap();
         let bitcask_dir = testing::tempdir();
-        let bitcask = Arc::new(Bitcask::open(bitcask_dir.path(), Codec::new()).await.unwrap());
+        let bitcask =
+            Arc::new(Bitcask::open(bitcask_dir.path(), Codec::new(), u16::MAX).await.unwrap());
         let flushing = Flushing::new(threshold, std::time::Duration::from_secs(3600));
         Self { _bitcask_dir: bitcask_dir, db, store: packs_backend, bitcask, flushing }
     }

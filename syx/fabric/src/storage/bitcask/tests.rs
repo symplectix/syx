@@ -1,4 +1,7 @@
+use std::path::Path;
+
 use content_addressing::ContentFlags;
+use tokio::io::AsyncWriteExt as _;
 
 use super::*;
 
@@ -11,10 +14,17 @@ fn encode(payload: &[u8]) -> (Digest, Bytes) {
     (key, Bytes::from(value))
 }
 
+/// `Bitcask::open` with a `max_pending` high enough that no test other
+/// than `put_refuses_once_max_pending_segments_are_stuck` needs to think
+/// about it.
+async fn open(dir: impl AsRef<Path>) -> Bitcask {
+    Bitcask::open(dir.as_ref(), Codec::new(), u16::MAX).await.unwrap()
+}
+
 #[tokio::test]
 async fn put_then_get_returns_the_same_bytes() {
     let dir = testing::tempdir();
-    let bitcask = Bitcask::open(dir.path(), Codec::new()).await.unwrap();
+    let bitcask = open(dir.path()).await;
     let (key, value) = encode(b"hello");
 
     bitcask.put(key, value.clone()).await.unwrap();
@@ -25,7 +35,7 @@ async fn put_then_get_returns_the_same_bytes() {
 #[tokio::test]
 async fn contains_reflects_whether_a_key_is_staged() {
     let dir = testing::tempdir();
-    let bitcask = Bitcask::open(dir.path(), Codec::new()).await.unwrap();
+    let bitcask = open(dir.path()).await;
     let (key, value) = encode(b"hello");
 
     assert!(!bitcask.contains(key).await);
@@ -36,7 +46,7 @@ async fn contains_reflects_whether_a_key_is_staged() {
 #[tokio::test]
 async fn active_len_tracks_bytes_written_to_the_active_segment() {
     let dir = testing::tempdir();
-    let bitcask = Bitcask::open(dir.path(), Codec::new()).await.unwrap();
+    let bitcask = open(dir.path()).await;
     let (key, value) = encode(b"hello");
     let expected = RECORD_HEADER_LEN + value.len() as u64;
 
@@ -48,7 +58,7 @@ async fn active_len_tracks_bytes_written_to_the_active_segment() {
 #[tokio::test]
 async fn rotate_moves_the_active_segment_into_pending_and_resets_active_len() {
     let dir = testing::tempdir();
-    let bitcask = Bitcask::open(dir.path(), Codec::new()).await.unwrap();
+    let bitcask = open(dir.path()).await;
     let (key, value) = encode(b"hello");
     bitcask.put(key, value).await.unwrap();
 
@@ -62,7 +72,7 @@ async fn rotate_moves_the_active_segment_into_pending_and_resets_active_len() {
 #[tokio::test]
 async fn entries_returns_everything_written_to_a_pending_segment() {
     let dir = testing::tempdir();
-    let bitcask = Bitcask::open(dir.path(), Codec::new()).await.unwrap();
+    let bitcask = open(dir.path()).await;
     let (key_a, value_a) = encode(b"a");
     let (key_b, value_b) = encode(b"bb");
     bitcask.put(key_a, value_a.clone()).await.unwrap();
@@ -77,7 +87,7 @@ async fn entries_returns_everything_written_to_a_pending_segment() {
 #[tokio::test]
 async fn finish_deletes_the_segment_and_evicts_its_entries() {
     let dir = testing::tempdir();
-    let bitcask = Bitcask::open(dir.path(), Codec::new()).await.unwrap();
+    let bitcask = open(dir.path()).await;
     let (key, value) = encode(b"hello");
     bitcask.put(key, value).await.unwrap();
     let segment = bitcask.rotate().await.unwrap();
@@ -93,12 +103,12 @@ async fn reopening_finds_pending_segments_left_by_a_previous_instance() {
     let dir = testing::tempdir();
     let (key, value) = encode(b"hello");
     let segment = {
-        let bitcask = Bitcask::open(dir.path(), Codec::new()).await.unwrap();
+        let bitcask = open(dir.path()).await;
         bitcask.put(key, value.clone()).await.unwrap();
         bitcask.rotate().await.unwrap()
     };
 
-    let reopened = Bitcask::open(dir.path(), Codec::new()).await.unwrap();
+    let reopened = open(dir.path()).await;
 
     assert_eq!(reopened.pending_segments().await, vec![segment]);
     assert_eq!(reopened.get(key).await.unwrap(), Some(value));
@@ -109,7 +119,7 @@ async fn reopening_drops_a_torn_tail_record_and_keeps_the_valid_ones() {
     let dir = testing::tempdir();
     let (key, value) = encode(b"hello");
     {
-        let bitcask = Bitcask::open(dir.path(), Codec::new()).await.unwrap();
+        let bitcask = open(dir.path()).await;
         bitcask.put(key, value.clone()).await.unwrap();
     }
 
@@ -131,7 +141,7 @@ async fn reopening_drops_a_torn_tail_record_and_keeps_the_valid_ones() {
     drop(f);
     assert!(fs::metadata(&path).await.unwrap().len() > valid_len);
 
-    let reopened = Bitcask::open(dir.path(), Codec::new()).await.unwrap();
+    let reopened = open(dir.path()).await;
 
     assert_eq!(reopened.get(key).await.unwrap(), Some(value));
     // The file on disk was truncated back to just the valid record.
@@ -142,4 +152,29 @@ async fn reopening_drops_a_torn_tail_record_and_keeps_the_valid_ones() {
     let (key2, value2) = encode(b"world");
     reopened.put(key2, value2.clone()).await.unwrap();
     assert_eq!(reopened.get(key2).await.unwrap(), Some(value2));
+}
+
+#[tokio::test]
+async fn put_refuses_once_max_pending_segments_are_stuck() {
+    let dir = testing::tempdir();
+    let bitcask = Bitcask::open(dir.path(), Codec::new(), 2).await.unwrap();
+
+    // Stage and rotate twice, reaching the cap without ever `finish`ing
+    // a segment -- as if `flush_pending` were failing persistently.
+    for payload in [&b"a"[..], &b"b"[..]] {
+        let (key, value) = encode(payload);
+        bitcask.put(key, value).await.unwrap();
+        bitcask.rotate().await.unwrap();
+    }
+    assert_eq!(bitcask.pending_segments().await.len(), 2);
+
+    let (key, value) = encode(b"c");
+    let err = bitcask.put(key, value.clone()).await.unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::Other);
+
+    // Finishing one segment frees a slot for the next write.
+    let oldest = bitcask.pending_segments().await[0];
+    bitcask.finish(oldest).await.unwrap();
+    bitcask.put(key, value.clone()).await.unwrap();
+    assert_eq!(bitcask.get(key).await.unwrap(), Some(value));
 }

@@ -23,6 +23,7 @@ pub struct Builder {
     cas_prefix: Option<String>,
     packs_threshold: Option<u64>,
     max_staging_duration: Option<Duration>,
+    max_pending_segments: Option<u16>,
     chunking: Option<cas::Chunking>,
     codec: Option<cas::Codec>,
 }
@@ -41,6 +42,7 @@ impl Builder {
             cas_prefix: None,
             packs_threshold: None,
             max_staging_duration: None,
+            max_pending_segments: None,
             chunking: None,
             codec: None,
         }
@@ -72,6 +74,15 @@ impl Builder {
     /// stays invisible to every other reader of this `Graph`.
     pub fn max_staging_duration(mut self, max_staging_duration: Duration) -> Self {
         self.max_staging_duration = Some(max_staging_duration);
+        self
+    }
+
+    /// How many pending (rotated, not yet packed) segments `bitcask` lets
+    /// accumulate before refusing further writes. Bounds local disk usage
+    /// if `flush_pending` starts failing persistently, e.g. once this
+    /// node is fenced.
+    pub fn max_pending_segments(mut self, max_pending_segments: u16) -> Self {
+        self.max_pending_segments = Some(max_pending_segments);
         self
     }
 
@@ -108,7 +119,10 @@ impl Builder {
             .map_err(io::Error::other)?;
 
         let codec = self.codec.unwrap_or_default();
-        let bitcask = Arc::new(storage::Bitcask::open(self.bitcask_dir, codec).await?);
+        let max_pending_segments =
+            self.max_pending_segments.unwrap_or(storage::DEFAULT_MAX_PENDING_SEGMENTS);
+        let bitcask =
+            Arc::new(storage::Bitcask::open(self.bitcask_dir, codec, max_pending_segments).await?);
 
         let packs_backend = self.packs_backend.unwrap_or_else(|| self.db_backend.clone());
         let packs_threshold = self.packs_threshold.unwrap_or(storage::DEFAULT_PACKS_THRESHOLD);
