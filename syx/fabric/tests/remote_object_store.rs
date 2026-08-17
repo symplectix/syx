@@ -63,11 +63,11 @@ async fn s3_graph(
     );
 
     let db_backend: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    // Leaked, not returned: `Bitcask` keeps writing into this directory
+    // Leaked, not returned: `Staging` keeps writing into this directory
     // for as long as `graph` lives, and these tests never outlive the
     // process, so there's nothing to clean up on drop that matters here.
-    let bitcask_dir = testing::tempdir().keep();
-    let graph = fabric::Graph::builder("test", db_backend, bitcask_dir)
+    let staging_dir = testing::tempdir().keep();
+    let graph = fabric::Graph::builder("test", db_backend, staging_dir)
         .packs(remote.clone())
         .packs_threshold(packs_threshold)
         .build()

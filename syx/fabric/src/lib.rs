@@ -7,6 +7,7 @@ use object_store::ObjectStore;
 mod blob;
 mod function;
 mod graph;
+mod staging;
 mod storage;
 
 pub use blob::{
@@ -43,7 +44,7 @@ pub struct Graph {
     /// source, leaving old ones intact.
     db:         slatedb::Db,
     store:      Arc<dyn ObjectStore>,
-    bitcask:    Arc<storage::Bitcask>,
+    staging:    Arc<staging::Staging>,
     cas_prefix: Arc<str>,
     flushing:   storage::Flushing,
     chunking:   content_addressing::Chunking,

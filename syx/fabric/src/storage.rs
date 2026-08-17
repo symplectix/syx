@@ -5,9 +5,9 @@
 //!
 //! ## Staging
 //!
-//! Not-yet-packed blobs are staged in `bitcask`, a local durable log, not
+//! Not-yet-packed blobs are staged in `staging`, a local durable log, not
 //! in `db`. `db` only ever holds pointers to already-packed content; see
-//! `bitcask`'s own module doc for why.
+//! `staging`'s own module doc for why.
 //!
 //! ## Packing
 //!
@@ -21,7 +21,7 @@
 //!   not hex; `sha256` names the hashing scheme so a future switch to a different one, e.g.
 //!   `blake3`, can live alongside these keys instead of colliding with them). The value is
 //!   [`Entry::encode`]'s output: `[pack_id: 32 bytes][offset: u64][length: u64]`. Written once,
-//!   when `flush_pending` consolidates a bitcask segment into a pack.
+//!   when `flush_pending` consolidates a staging segment into a pack.
 //!
 //! ## Object Store
 //!
@@ -71,12 +71,13 @@ use tokio::io::{
 };
 use tokio::task;
 
-mod bitcask;
-
 #[cfg(test)]
 mod tests;
 
-pub(crate) use bitcask::Bitcask;
+use crate::staging::{
+    self,
+    Staging,
+};
 
 fn invalid_data(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
@@ -99,7 +100,7 @@ pub(crate) const DEFAULT_PACKS_THRESHOLD: u64 = Chunking::AVG_SIZE as u64 * 64;
 /// never crosses `packs_threshold` on its own.
 pub(crate) const DEFAULT_MAX_STAGING_DURATION: Duration = Duration::from_secs(30);
 
-/// The default `max_pending_segments`: bounds `bitcask`'s local disk
+/// The default `max_pending_segments`: bounds `staging`'s local disk
 /// usage, at this default roughly `16 * packs_threshold`, to a finite
 /// amount even if `flush_pending` fails indefinitely.
 pub(crate) const DEFAULT_MAX_PENDING_SEGMENTS: u16 = 16;
@@ -176,7 +177,7 @@ impl Entry {
 pub struct Cas<'a> {
     db:         &'a slatedb::Db,
     store:      &'a Arc<dyn ObjectStore>,
-    bitcask:    &'a Arc<Bitcask>,
+    staging:    &'a Arc<Staging>,
     cas_prefix: &'a str,
     flushing:   &'a Flushing,
     chunking:   Chunking,
@@ -193,13 +194,13 @@ impl<'a> Cas<'a> {
     pub(crate) fn new(
         db: &'a slatedb::Db,
         store: &'a Arc<dyn ObjectStore>,
-        bitcask: &'a Arc<Bitcask>,
+        staging: &'a Arc<Staging>,
         cas_prefix: &'a str,
         flushing: &'a Flushing,
         chunking: Chunking,
         codec: Codec,
     ) -> Self {
-        Self { db, store, bitcask, cas_prefix, flushing, chunking, codec }
+        Self { db, store, staging, cas_prefix, flushing, chunking, codec }
     }
 
     fn entry_key(&self, key: Digest) -> Vec<u8> {
@@ -248,7 +249,7 @@ impl<'a> Cas<'a> {
 
     /// Whether `key` is already stored, without fetching its value.
     async fn contains_blob(&self, key: Digest) -> io::Result<bool> {
-        if self.bitcask.contains(key).await {
+        if self.staging.contains(key).await {
             return Ok(true);
         }
         Ok(self.db.get(self.entry_key(key)).await.map_err(other)?.is_some())
@@ -256,7 +257,7 @@ impl<'a> Cas<'a> {
 
     /// Fetch bytes stored under `key`, if present.
     async fn get_blob(&self, key: Digest) -> io::Result<Option<Bytes>> {
-        if let Some(bytes) = self.bitcask.get(key).await? {
+        if let Some(bytes) = self.staging.get(key).await? {
             return Ok(Some(bytes));
         }
         let Some(entry) = self.get_entry(key).await? else {
@@ -265,7 +266,7 @@ impl<'a> Cas<'a> {
         Ok(Some(self.get_range(entry.pack_id, entry.offset, entry.length).await?))
     }
 
-    /// Stages `bytes` under `key` durably in `bitcask`.
+    /// Stages `bytes` under `key` durably in `staging`.
     ///
     /// If enough has accumulated since the last flush, by size
     /// (`flushing.threshold`) or by time (`flushing.max_staging_duration`),
@@ -274,11 +275,11 @@ impl<'a> Cas<'a> {
     /// Once `flush_pending` has failed `MAX_CONSECUTIVE_FLUSH_FAILURES`
     /// times in a row, switches to waiting on it and propagating its
     /// error instead, so a persistently broken flush path is surfaced to
-    /// callers rather than growing `bitcask` without bound.
+    /// callers rather than growing `staging` without bound.
     async fn put_blob(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
-        self.bitcask.put(key, bytes).await?;
+        self.staging.put(key, bytes).await?;
 
-        let due = self.bitcask.active_len() >= self.flushing.threshold
+        let due = self.staging.active_len() >= self.flushing.threshold
             || self.staging_elapsed() >= self.flushing.max_staging_duration;
         if !due {
             return Ok(());
@@ -290,11 +291,11 @@ impl<'a> Cas<'a> {
 
         let db = self.db.clone();
         let store = Arc::clone(self.store);
-        let bitcask = Arc::clone(self.bitcask);
+        let staging = Arc::clone(self.staging);
         let cas_prefix = self.cas_prefix.to_string();
         let flushing = self.flushing.clone();
         tokio::spawn(async move {
-            let _ = flush_pending(&db, &store, &bitcask, &cas_prefix, &flushing).await;
+            let _ = flush_pending(&db, &store, &staging, &cas_prefix, &flushing).await;
         });
         Ok(())
     }
@@ -308,7 +309,7 @@ impl<'a> Cas<'a> {
     /// If another call is already in progress, this returns immediately
     /// without doing anything, rather than waiting its turn.
     pub async fn flush_pending(&self) -> io::Result<()> {
-        flush_pending(self.db, self.store, self.bitcask, self.cas_prefix, self.flushing).await
+        flush_pending(self.db, self.store, self.staging, self.cas_prefix, self.flushing).await
     }
 
     /// Fetch and decode chunk(s).
@@ -491,7 +492,7 @@ fn pack_path(cas_prefix: &str, pack_id: Digest) -> Path {
     Path::from(cas_prefix).join("sha256").join(format!("{pack_id:x}"))
 }
 
-/// Consolidates every currently-pending `bitcask` segment into pack
+/// Consolidates every currently-pending `staging` segment into pack
 /// objects, taking owned references so `put_blob`'s background trigger
 /// can run this after the `Cas<'_>` that requested it has gone out of
 /// scope.
@@ -501,7 +502,7 @@ fn pack_path(cas_prefix: &str, pack_id: Digest) -> Path {
 async fn flush_pending(
     db: &slatedb::Db,
     store: &Arc<dyn ObjectStore>,
-    bitcask: &Bitcask,
+    staging: &Staging,
     cas_prefix: &str,
     flushing: &Flushing,
 ) -> io::Result<()> {
@@ -509,9 +510,9 @@ async fn flush_pending(
         return Ok(());
     };
 
-    let mut segments = bitcask.pending_segments().await;
-    if bitcask.active_len() > 0 {
-        segments.push(bitcask.rotate().await?);
+    let mut segments = staging.pending_segments().await;
+    if staging.active_len() > 0 {
+        segments.push(staging.rotate().await?);
         *flushing.staging_since.lock().unwrap() = Instant::now();
     }
     if segments.is_empty() {
@@ -519,7 +520,7 @@ async fn flush_pending(
         return Ok(());
     }
 
-    let result = flush_segments(db, store, bitcask, cas_prefix, segments).await;
+    let result = flush_segments(db, store, staging, cas_prefix, segments).await;
     match &result {
         Ok(()) => flushing.failures.store(0, Ordering::Relaxed),
         Err(_) => {
@@ -532,14 +533,14 @@ async fn flush_pending(
 async fn flush_segments(
     db: &slatedb::Db,
     store: &Arc<dyn ObjectStore>,
-    bitcask: &Bitcask,
+    staging: &Staging,
     cas_prefix: &str,
-    segments: Vec<bitcask::Segment>,
+    segments: Vec<staging::Segment>,
 ) -> io::Result<()> {
     for segment in segments {
-        let staged = bitcask.entries(segment).await?;
+        let staged = staging.entries(segment).await?;
         if staged.is_empty() {
-            bitcask.finish(segment).await?;
+            staging.finish(segment).await?;
             continue;
         }
 
@@ -566,7 +567,7 @@ async fn flush_segments(
         }
         db.write(batch).await.map_err(other)?;
 
-        bitcask.finish(segment).await?;
+        staging.finish(segment).await?;
     }
     Ok(())
 }

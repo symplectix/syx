@@ -6,7 +6,7 @@
 //! same segment after a failed flush, is always a safe no-op.
 //!
 //! Records are framed as `[key: 32 bytes][value_len: u32 BE][value]`, with
-//! no separate checksum. `Bitcask::open` verifies the records it replays
+//! no separate checksum. `Staging::open` verifies the records it replays
 //! by decoding them and recomputing their digest, which is a stronger
 //! check than a CRC would be, and only needs to run against the one file
 //! that could have been mid-write when a crash happened; every earlier
@@ -68,7 +68,7 @@ use tokio::{
 #[cfg(test)]
 mod tests;
 
-/// One append-only file's identity: `{id:020}.log` in `Bitcask`'s
+/// One append-only file's identity: `{id:020}.log` in `Staging`'s
 /// directory. A segment is created empty, then appended to sequentially
 /// while it's the active one; once rotated out it never changes again
 /// until `finish` deletes it.
@@ -99,32 +99,32 @@ struct Location {
     length:  u32,
 }
 
-struct Active {
-    /// This segment's id.
+/// A segment's open file, whether it's the one currently being appended
+/// to or one already rotated out. Shared, not exclusive: every write
+/// targets its own reserved byte range (see the module doc), so handing
+/// out clones of this `Arc` costs nothing and needs no lock of its own.
+struct Handle {
     id:   Segment,
-    /// Open for appending. Shared, not exclusive: every write targets
-    /// its own reserved byte range (see the module doc), so handing out
-    /// clones of this `Arc` costs nothing and needs no lock of its own.
     file: Arc<File>,
 }
 
-struct Inner {
+struct State {
     /// The segment currently being appended to.
-    active:  Active,
+    active:  Handle,
     /// Segments rotated out, not yet `finish`ed, each with its own open
     /// handle so `get` never has to reopen a file it's already read
     /// from.
-    pending: Vec<(Segment, Arc<File>)>,
+    pending: Vec<Handle>,
 }
 
-pub(crate) struct Bitcask {
+pub(crate) struct Staging {
     /// The directory segments live in.
     dir:         PathBuf,
     /// Structural changes only: which segment is active, which are
     /// pending. `put` holds this as a reader for its whole write, purely
     /// so `rotate` (a writer) waits for every write in flight against
     /// the segment it's about to seal.
-    state:       RwLock<Inner>,
+    state:       RwLock<State>,
     /// Every staged key's location, across `active` and `pending`. A
     /// separate lock from `state`, so `get`/`contains` never wait behind
     /// a `put`'s `fsync`.
@@ -139,7 +139,7 @@ pub(crate) struct Bitcask {
     max_pending: u16,
 }
 
-impl Bitcask {
+impl Staging {
     /// Opens the staging directory at `dir`, creating it if needed, and
     /// replays whatever segments are already there. `codec` decodes each
     /// replayed record to verify it against its own key; it must match
@@ -193,7 +193,7 @@ impl Bitcask {
                 continue;
             }
             let file = open_shared(&path).await?;
-            pending.push((segment, file));
+            pending.push(Handle { id: segment, file });
             for (key, offset, length) in records {
                 index.insert(key, Location { segment, offset, length });
             }
@@ -206,7 +206,7 @@ impl Bitcask {
             dir,
             active_len: AtomicU64::new(0),
             max_pending,
-            state: RwLock::new(Inner { active: Active { id: next, file }, pending }),
+            state: RwLock::new(State { active: Handle { id: next, file }, pending }),
             index: RwLock::new(index),
         })
     }
@@ -221,7 +221,7 @@ impl Bitcask {
         let guard = self.state.read().await;
         if guard.pending.len() >= self.max_pending as usize {
             return Err(io::Error::other(format!(
-                "bitcask: {} segments already pending (max {})",
+                "staging: {} segments already pending (max {})",
                 guard.pending.len(),
                 self.max_pending
             )));
@@ -262,12 +262,12 @@ impl Bitcask {
             if location.segment == state.active.id {
                 Arc::clone(&state.active.file)
             } else {
-                let (_, file) = state
+                let handle = state
                     .pending
                     .iter()
-                    .find(|(segment, _)| *segment == location.segment)
+                    .find(|handle| handle.id == location.segment)
                     .expect("an indexed key's segment is always still open");
-                Arc::clone(file)
+                Arc::clone(&handle.file)
             }
         };
         let mut buf = vec![0u8; location.length as usize];
@@ -297,22 +297,21 @@ impl Bitcask {
     /// `entries`/`finish`. Waits for every `put` already in flight
     /// against that segment before treating it as sealed.
     pub(crate) async fn rotate(&self) -> io::Result<Segment> {
-        let mut inner = self.state.write().await;
-        let old = inner.active.id;
-        let old_file = Arc::clone(&inner.active.file);
-        let next = old.next();
+        let mut state = self.state.write().await;
+        let next = state.active.id.next();
         let file = create_segment(&self.dir, next).await?;
-        inner.active = Active { id: next, file };
-        inner.pending.push((old, old_file));
+        let old = std::mem::replace(&mut state.active, Handle { id: next, file });
+        let old_id = old.id;
+        state.pending.push(old);
         self.active_len.store(0, Ordering::Relaxed);
-        Ok(old)
+        Ok(old_id)
     }
 
     /// Segments rotated out but not yet `finish`ed, oldest first. Covers
     /// both a previous flush that failed partway and, after a restart,
     /// whatever `open` found already on disk.
     pub(crate) async fn pending_segments(&self) -> Vec<Segment> {
-        self.state.read().await.pending.iter().map(|(segment, _)| *segment).collect()
+        self.state.read().await.pending.iter().map(|handle| handle.id).collect()
     }
 
     /// Every `(key, value)` pair in `segment`, in the order they were
@@ -321,12 +320,12 @@ impl Bitcask {
     pub(crate) async fn entries(&self, segment: Segment) -> io::Result<Vec<(Digest, Bytes)>> {
         let file = {
             let state = self.state.read().await;
-            let (_, file) = state
+            let handle = state
                 .pending
                 .iter()
-                .find(|(s, _)| *s == segment)
+                .find(|handle| handle.id == segment)
                 .expect("entries is only ever called on a pending segment");
-            Arc::clone(file)
+            Arc::clone(&handle.file)
         };
         let buf = task::spawn_blocking(move || -> io::Result<Bytes> {
             let len = file.metadata()?.len() as usize;
@@ -354,7 +353,7 @@ impl Bitcask {
     pub(crate) async fn finish(&self, segment: Segment) -> io::Result<()> {
         {
             let mut state = self.state.write().await;
-            state.pending.retain(|(id, _)| *id != segment);
+            state.pending.retain(|handle| handle.id != segment);
         }
         self.index.write().await.retain(|_, location| location.segment != segment);
         fs::remove_file(self.segment_path(segment)).await

@@ -18,7 +18,7 @@ use crate::{
 pub struct Builder {
     db_prefix: String,
     db_backend: Arc<dyn ObjectStore>,
-    bitcask_dir: PathBuf,
+    staging_dir: PathBuf,
     packs_backend: Option<Arc<dyn ObjectStore>>,
     cas_prefix: Option<String>,
     packs_threshold: Option<u64>,
@@ -32,12 +32,12 @@ impl Builder {
     fn new(
         db_prefix: impl Into<String>,
         db_backend: Arc<dyn ObjectStore>,
-        bitcask_dir: impl Into<PathBuf>,
+        staging_dir: impl Into<PathBuf>,
     ) -> Self {
         Self {
             db_prefix: db_prefix.into(),
             db_backend,
-            bitcask_dir: bitcask_dir.into(),
+            staging_dir: staging_dir.into(),
             packs_backend: None,
             cas_prefix: None,
             packs_threshold: None,
@@ -77,7 +77,7 @@ impl Builder {
         self
     }
 
-    /// How many pending (rotated, not yet packed) segments `bitcask` lets
+    /// How many pending (rotated, not yet packed) segments `staging` lets
     /// accumulate before refusing further writes. Bounds local disk usage
     /// if `flush_pending` starts failing persistently, e.g. once this
     /// node is fenced.
@@ -103,12 +103,12 @@ impl Builder {
         self
     }
 
-    /// Opens `db` and `bitcask`, and builds the `Graph`.
+    /// Opens `db` and `staging`, and builds the `Graph`.
     // TODO: `Graph`'s own relation storage will need its own merge
     // operator eventually, e.g. for growable reference sets, see
     // hypergraph.md. Nothing registers one on `db` today, since the blob
     // storage engine no longer needs merge semantics now that staging
-    // lives in `bitcask`, not `db`.
+    // lives in `staging`, not `db`.
     pub async fn build(self) -> io::Result<Graph> {
         let cas_prefix: Arc<str> =
             Arc::from(self.cas_prefix.unwrap_or_else(|| storage::DEFAULT_CAS_PREFIX.to_string()));
@@ -121,8 +121,9 @@ impl Builder {
         let codec = self.codec.unwrap_or_default();
         let max_pending_segments =
             self.max_pending_segments.unwrap_or(storage::DEFAULT_MAX_PENDING_SEGMENTS);
-        let bitcask =
-            Arc::new(storage::Bitcask::open(self.bitcask_dir, codec, max_pending_segments).await?);
+        let staging = Arc::new(
+            crate::staging::Staging::open(self.staging_dir, codec, max_pending_segments).await?,
+        );
 
         let packs_backend = self.packs_backend.unwrap_or_else(|| self.db_backend.clone());
         let packs_threshold = self.packs_threshold.unwrap_or(storage::DEFAULT_PACKS_THRESHOLD);
@@ -131,20 +132,20 @@ impl Builder {
         let chunking = self.chunking.unwrap_or_default();
 
         let flushing = storage::Flushing::new(packs_threshold, max_staging_duration);
-        Ok(Graph::new(db, packs_backend, bitcask, cas_prefix, flushing, chunking, codec))
+        Ok(Graph::new(db, packs_backend, staging, cas_prefix, flushing, chunking, codec))
     }
 }
 
 impl Graph {
     /// Starts building a `Graph`, which will open its own `db` at
     /// `db_prefix` in `db_backend`, and stage not-yet-packed blobs in
-    /// `bitcask_dir`, a local directory only this `Graph` should use.
+    /// `staging_dir`, a local directory only this `Graph` should use.
     pub fn builder(
         db_prefix: impl Into<String>,
         db_backend: Arc<dyn ObjectStore>,
-        bitcask_dir: impl Into<PathBuf>,
+        staging_dir: impl Into<PathBuf>,
     ) -> Builder {
-        Builder::new(db_prefix, db_backend, bitcask_dir)
+        Builder::new(db_prefix, db_backend, staging_dir)
     }
 
     /// Only `Builder::build` calls this. Construct a `Graph` via
@@ -153,13 +154,13 @@ impl Graph {
     const fn new(
         db: slatedb::Db,
         store: Arc<dyn ObjectStore>,
-        bitcask: Arc<storage::Bitcask>,
+        staging: Arc<crate::staging::Staging>,
         cas_prefix: Arc<str>,
         flushing: storage::Flushing,
         chunking: cas::Chunking,
         codec: cas::Codec,
     ) -> Self {
-        Self { db, store, bitcask, cas_prefix, flushing, chunking, codec }
+        Self { db, store, staging, cas_prefix, flushing, chunking, codec }
     }
 
     /// The blob-storage facet of this `Graph`: `get`/`put`/`read_into`/
@@ -169,7 +170,7 @@ impl Graph {
         Cas::new(
             &self.db,
             &self.store,
-            &self.bitcask,
+            &self.staging,
             &self.cas_prefix,
             &self.flushing,
             self.chunking,

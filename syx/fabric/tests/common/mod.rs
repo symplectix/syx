@@ -11,12 +11,12 @@ pub fn command(program: &str, args: &[&str]) -> fabric::Command {
 }
 
 /// A `Graph` backed by a local-filesystem `ObjectStore` rooted at `root`,
-/// staging not-yet-packed blobs in a `bitcask` subdirectory of `root`.
+/// staging not-yet-packed blobs in a `staging` subdirectory of `root`.
 pub async fn graph(root: impl AsRef<Path>) -> fabric::Graph {
     let root = root.as_ref();
     let backend: Arc<dyn ObjectStore> =
         Arc::new(object_store::local::LocalFileSystem::new_with_prefix(root).unwrap());
-    fabric::Graph::builder("test", backend, root.join("bitcask")).build().await.unwrap()
+    fabric::Graph::builder("test", backend, root.join("staging")).build().await.unwrap()
 }
 
 /// A `Graph` backed by a local temporary directory.

@@ -14,88 +14,88 @@ fn encode(payload: &[u8]) -> (Digest, Bytes) {
     (key, Bytes::from(value))
 }
 
-/// `Bitcask::open` with a `max_pending` high enough that no test other
+/// `Staging::open` with a `max_pending` high enough that no test other
 /// than `put_refuses_once_max_pending_segments_are_stuck` needs to think
 /// about it.
-async fn open(dir: impl AsRef<Path>) -> Bitcask {
-    Bitcask::open(dir.as_ref(), Codec::new(), u16::MAX).await.unwrap()
+async fn open(dir: impl AsRef<Path>) -> Staging {
+    Staging::open(dir.as_ref(), Codec::new(), u16::MAX).await.unwrap()
 }
 
 #[tokio::test]
 async fn put_then_get_returns_the_same_bytes() {
     let dir = testing::tempdir();
-    let bitcask = open(dir.path()).await;
+    let staging = open(dir.path()).await;
     let (key, value) = encode(b"hello");
 
-    bitcask.put(key, value.clone()).await.unwrap();
+    staging.put(key, value.clone()).await.unwrap();
 
-    assert_eq!(bitcask.get(key).await.unwrap(), Some(value));
+    assert_eq!(staging.get(key).await.unwrap(), Some(value));
 }
 
 #[tokio::test]
 async fn contains_reflects_whether_a_key_is_staged() {
     let dir = testing::tempdir();
-    let bitcask = open(dir.path()).await;
+    let staging = open(dir.path()).await;
     let (key, value) = encode(b"hello");
 
-    assert!(!bitcask.contains(key).await);
-    bitcask.put(key, value).await.unwrap();
-    assert!(bitcask.contains(key).await);
+    assert!(!staging.contains(key).await);
+    staging.put(key, value).await.unwrap();
+    assert!(staging.contains(key).await);
 }
 
 #[tokio::test]
 async fn active_len_tracks_bytes_written_to_the_active_segment() {
     let dir = testing::tempdir();
-    let bitcask = open(dir.path()).await;
+    let staging = open(dir.path()).await;
     let (key, value) = encode(b"hello");
     let expected = RECORD_HEADER_LEN + value.len() as u64;
 
-    assert_eq!(bitcask.active_len(), 0);
-    bitcask.put(key, value).await.unwrap();
-    assert_eq!(bitcask.active_len(), expected);
+    assert_eq!(staging.active_len(), 0);
+    staging.put(key, value).await.unwrap();
+    assert_eq!(staging.active_len(), expected);
 }
 
 #[tokio::test]
 async fn rotate_moves_the_active_segment_into_pending_and_resets_active_len() {
     let dir = testing::tempdir();
-    let bitcask = open(dir.path()).await;
+    let staging = open(dir.path()).await;
     let (key, value) = encode(b"hello");
-    bitcask.put(key, value).await.unwrap();
+    staging.put(key, value).await.unwrap();
 
-    let segment = bitcask.rotate().await.unwrap();
+    let segment = staging.rotate().await.unwrap();
 
-    assert_eq!(bitcask.active_len(), 0);
-    assert_eq!(bitcask.pending_segments().await, vec![segment]);
-    assert!(bitcask.contains(key).await);
+    assert_eq!(staging.active_len(), 0);
+    assert_eq!(staging.pending_segments().await, vec![segment]);
+    assert!(staging.contains(key).await);
 }
 
 #[tokio::test]
 async fn entries_returns_everything_written_to_a_pending_segment() {
     let dir = testing::tempdir();
-    let bitcask = open(dir.path()).await;
+    let staging = open(dir.path()).await;
     let (key_a, value_a) = encode(b"a");
     let (key_b, value_b) = encode(b"bb");
-    bitcask.put(key_a, value_a.clone()).await.unwrap();
-    bitcask.put(key_b, value_b.clone()).await.unwrap();
+    staging.put(key_a, value_a.clone()).await.unwrap();
+    staging.put(key_b, value_b.clone()).await.unwrap();
 
-    let segment = bitcask.rotate().await.unwrap();
+    let segment = staging.rotate().await.unwrap();
 
-    let entries = bitcask.entries(segment).await.unwrap();
+    let entries = staging.entries(segment).await.unwrap();
     assert_eq!(entries, vec![(key_a, value_a), (key_b, value_b)]);
 }
 
 #[tokio::test]
 async fn finish_deletes_the_segment_and_evicts_its_entries() {
     let dir = testing::tempdir();
-    let bitcask = open(dir.path()).await;
+    let staging = open(dir.path()).await;
     let (key, value) = encode(b"hello");
-    bitcask.put(key, value).await.unwrap();
-    let segment = bitcask.rotate().await.unwrap();
+    staging.put(key, value).await.unwrap();
+    let segment = staging.rotate().await.unwrap();
 
-    bitcask.finish(segment).await.unwrap();
+    staging.finish(segment).await.unwrap();
 
-    assert!(bitcask.pending_segments().await.is_empty());
-    assert!(!bitcask.contains(key).await);
+    assert!(staging.pending_segments().await.is_empty());
+    assert!(!staging.contains(key).await);
 }
 
 #[tokio::test]
@@ -103,9 +103,9 @@ async fn reopening_finds_pending_segments_left_by_a_previous_instance() {
     let dir = testing::tempdir();
     let (key, value) = encode(b"hello");
     let segment = {
-        let bitcask = open(dir.path()).await;
-        bitcask.put(key, value.clone()).await.unwrap();
-        bitcask.rotate().await.unwrap()
+        let staging = open(dir.path()).await;
+        staging.put(key, value.clone()).await.unwrap();
+        staging.rotate().await.unwrap()
     };
 
     let reopened = open(dir.path()).await;
@@ -119,8 +119,8 @@ async fn reopening_drops_a_torn_tail_record_and_keeps_the_valid_ones() {
     let dir = testing::tempdir();
     let (key, value) = encode(b"hello");
     {
-        let bitcask = open(dir.path()).await;
-        bitcask.put(key, value.clone()).await.unwrap();
+        let staging = open(dir.path()).await;
+        staging.put(key, value.clone()).await.unwrap();
     }
 
     // Simulate a crash mid-write: append a record whose declared length
@@ -157,24 +157,24 @@ async fn reopening_drops_a_torn_tail_record_and_keeps_the_valid_ones() {
 #[tokio::test]
 async fn put_refuses_once_max_pending_segments_are_stuck() {
     let dir = testing::tempdir();
-    let bitcask = Bitcask::open(dir.path(), Codec::new(), 2).await.unwrap();
+    let staging = Staging::open(dir.path(), Codec::new(), 2).await.unwrap();
 
     // Stage and rotate twice, reaching the cap without ever `finish`ing
     // a segment -- as if `flush_pending` were failing persistently.
     for payload in [&b"a"[..], &b"b"[..]] {
         let (key, value) = encode(payload);
-        bitcask.put(key, value).await.unwrap();
-        bitcask.rotate().await.unwrap();
+        staging.put(key, value).await.unwrap();
+        staging.rotate().await.unwrap();
     }
-    assert_eq!(bitcask.pending_segments().await.len(), 2);
+    assert_eq!(staging.pending_segments().await.len(), 2);
 
     let (key, value) = encode(b"c");
-    let err = bitcask.put(key, value.clone()).await.unwrap_err();
+    let err = staging.put(key, value.clone()).await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::Other);
 
     // Finishing one segment frees a slot for the next write.
-    let oldest = bitcask.pending_segments().await[0];
-    bitcask.finish(oldest).await.unwrap();
-    bitcask.put(key, value.clone()).await.unwrap();
-    assert_eq!(bitcask.get(key).await.unwrap(), Some(value));
+    let oldest = staging.pending_segments().await[0];
+    staging.finish(oldest).await.unwrap();
+    staging.put(key, value.clone()).await.unwrap();
+    assert_eq!(staging.get(key).await.unwrap(), Some(value));
 }
