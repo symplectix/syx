@@ -59,7 +59,10 @@ use content_addressing::{
     Digest,
     Hasher,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{
+    RwLock,
+    RwLockReadGuard,
+};
 use tokio::{
     fs,
     task,
@@ -108,32 +111,55 @@ struct Handle {
     file: Arc<File>,
 }
 
+/// Which segment is active and which are pending. Plain data: `Staging`
+/// owns the lock this lives behind and every operation on it.
 struct State {
-    /// The segment currently being appended to.
     active:  Handle,
-    /// Segments rotated out, not yet `finish`ed, each with its own open
-    /// handle so `get` never has to reopen a file it's already read
-    /// from.
+    /// Rotated out, not yet `finish`ed. Structurally can never contain
+    /// the active segment, so nothing removing from it needs to guard
+    /// against accidentally sealing the one still being written to.
     pending: Vec<Handle>,
+}
+
+/// A view onto the active segment, holding the read guard that grants
+/// it. `put` holds the one it gets across its own write, so `rotate`
+/// (which needs the write lock to seal a segment) waits for every `put`
+/// already in flight against it before treating it as immutable.
+struct Active<'a> {
+    guard: RwLockReadGuard<'a, State>,
+    id:    Segment,
+    file:  Arc<File>,
+}
+
+impl Active<'_> {
+    fn id(&self) -> Segment {
+        self.id
+    }
+
+    fn file(&self) -> Arc<File> {
+        Arc::clone(&self.file)
+    }
+
+    /// How many segments are pending. Reads through the still-held
+    /// guard, so this never needs its own separate lock acquisition.
+    fn pending_len(&self) -> usize {
+        self.guard.pending.len()
+    }
 }
 
 pub(crate) struct Staging {
     /// The directory segments live in.
     dir:         PathBuf,
-    /// Structural changes only: which segment is active, which are
-    /// pending. `put` holds this as a reader for its whole write, purely
-    /// so `rotate` (a writer) waits for every write in flight against
-    /// the segment it's about to seal.
-    state:       RwLock<State>,
-    /// Every staged key's location, across `active` and `pending`. A
-    /// separate lock from `state`, so `get`/`contains` never wait behind
-    /// a `put`'s `fsync`.
-    index:       RwLock<HashMap<Digest, Location>>,
     /// The next unwritten offset in the active segment. A `put` reserves
     /// its byte range by adding to this atomically, before it writes
     /// anything, which is also what makes concurrent `put`s lock-free.
     active_len:  AtomicU64,
-    /// `put` refuses new writes once `pending` reaches this many segments,
+    state:       RwLock<State>,
+    /// Every staged key's location, across every segment. A separate
+    /// lock from `state`, so `get`/`contains` never wait behind a
+    /// `put`'s `fsync`.
+    index:       RwLock<HashMap<Digest, Location>>,
+    /// `put` refuses new writes once pending segments reach this many,
     /// so a persistently failing `flush_pending` bounds local disk usage
     /// instead of growing it without limit.
     max_pending: u16,
@@ -211,23 +237,49 @@ impl Staging {
         })
     }
 
+    /// A view onto the active segment, for `put` to hold across its own
+    /// write.
+    async fn active(&self) -> Active<'_> {
+        let guard = self.state.read().await;
+        let id = guard.active.id;
+        let file = Arc::clone(&guard.active.file);
+        Active { guard, id, file }
+    }
+
+    /// The file for `segment`. Panics if it isn't tracked: every caller
+    /// only ever asks for one it already knows must still be open,
+    /// either from `Cas`'s own index or from `pending_segments`/`rotate`'s
+    /// own return value.
+    async fn find(&self, segment: Segment) -> Arc<File> {
+        let state = self.state.read().await;
+        if state.active.id == segment {
+            return Arc::clone(&state.active.file);
+        }
+        state
+            .pending
+            .iter()
+            .find(|handle| handle.id == segment)
+            .map(|handle| Arc::clone(&handle.file))
+            .unwrap_or_else(|| panic!("segment {segment} is no longer tracked"))
+    }
+
     /// Durably appends `value` under `key` to the active segment. Once
     /// this returns, `value` survives a crash of this node.
     ///
-    /// Refuses the write if `pending` already holds `max_pending`
-    /// segments: at that point `flush_pending` isn't keeping up, and
-    /// accepting more would grow local disk usage without bound.
+    /// Refuses the write if pending segments already number `max_pending`:
+    /// at that point `flush_pending` isn't keeping up, and accepting more
+    /// would grow local disk usage without bound.
     pub(crate) async fn put(&self, key: Digest, value: Bytes) -> io::Result<()> {
-        let guard = self.state.read().await;
-        if guard.pending.len() >= self.max_pending as usize {
+        let active = self.active().await;
+        if active.pending_len() >= self.max_pending as usize {
             return Err(io::Error::other(format!(
                 "staging: {} segments already pending (max {})",
-                guard.pending.len(),
+                active.pending_len(),
                 self.max_pending
             )));
         }
-        let file = Arc::clone(&guard.active.file);
-        let segment = guard.active.id;
+        let segment = active.id();
+        let file = active.file();
 
         let record = encode_record(key, &value);
         let offset = self.active_len.fetch_add(record.len() as u64, Ordering::SeqCst);
@@ -240,10 +292,10 @@ impl Staging {
         .expect("write should not panic")?;
 
         // Only released once the write above is durable: `rotate` takes
-        // `state` as a writer to seal `guard.active`, so it can't
-        // observe this segment as immutable while this `put` still has
-        // it open as a reader.
-        drop(guard);
+        // `state` as a writer to seal the active segment, so it can't
+        // observe this segment as immutable while this `put` still holds
+        // `active`'s read guard.
+        drop(active);
 
         self.index.write().await.insert(
             key,
@@ -257,19 +309,7 @@ impl Staging {
         let Some(location) = self.index.read().await.get(&key).copied() else {
             return Ok(None);
         };
-        let file = {
-            let state = self.state.read().await;
-            if location.segment == state.active.id {
-                Arc::clone(&state.active.file)
-            } else {
-                let handle = state
-                    .pending
-                    .iter()
-                    .find(|handle| handle.id == location.segment)
-                    .expect("an indexed key's segment is always still open");
-                Arc::clone(&handle.file)
-            }
-        };
+        let file = self.find(location.segment).await;
         let mut buf = vec![0u8; location.length as usize];
         task::spawn_blocking(move || -> io::Result<Vec<u8>> {
             read_exact_at(&file, &mut buf, location.offset)?;
@@ -318,15 +358,7 @@ impl Staging {
     /// written. `segment` must have come from `rotate` or
     /// `pending_segments`; it is never the active segment.
     pub(crate) async fn entries(&self, segment: Segment) -> io::Result<Vec<(Digest, Bytes)>> {
-        let file = {
-            let state = self.state.read().await;
-            let handle = state
-                .pending
-                .iter()
-                .find(|handle| handle.id == segment)
-                .expect("entries is only ever called on a pending segment");
-            Arc::clone(&handle.file)
-        };
+        let file = self.find(segment).await;
         let buf = task::spawn_blocking(move || -> io::Result<Bytes> {
             let len = file.metadata()?.len() as usize;
             let mut buf = vec![0u8; len];
@@ -350,11 +382,11 @@ impl Staging {
 
     /// Deletes `segment` and evicts its entries from the index. Only
     /// call this once `segment`'s content is durably packed elsewhere.
+    /// `segment` must be pending, never the active segment: `pending`
+    /// structurally can't hold that one, so there's nothing to guard
+    /// against here.
     pub(crate) async fn finish(&self, segment: Segment) -> io::Result<()> {
-        {
-            let mut state = self.state.write().await;
-            state.pending.retain(|handle| handle.id != segment);
-        }
+        self.state.write().await.pending.retain(|handle| handle.id != segment);
         self.index.write().await.retain(|_, location| location.segment != segment);
         fs::remove_file(self.segment_path(segment)).await
     }
