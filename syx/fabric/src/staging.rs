@@ -139,7 +139,11 @@ struct State {
 struct PutMsg {
     key:   Digest,
     value: Bytes,
-    reply: oneshot::Sender<io::Result<()>>,
+    /// Replied with the active segment's length once this `put`'s bytes
+    /// have landed in it, so a caller that needs to react to that (e.g.
+    /// `Cas::put_blob` checking it against `Flushing`) doesn't need a
+    /// separate `active_len` call right after.
+    reply: oneshot::Sender<io::Result<u64>>,
 }
 
 /// One `rotate` waiting on the committer.
@@ -252,8 +256,8 @@ impl Committer {
                         index.insert(msg.key, *location);
                     }
                 }
-                for (msg, _) in batch.into_iter().zip(locations) {
-                    let _ = msg.reply.send(Ok(()));
+                for msg in batch {
+                    let _ = msg.reply.send(Ok(offset));
                 }
             }
             Err(e) => {
@@ -289,9 +293,10 @@ pub(crate) struct Staging {
     /// The directory segments live in.
     dir:         PathBuf,
     /// The active segment's current length, published by the committer
-    /// after every batch it commits. Lock-free, so `Cas::put_blob` can
-    /// check it against `Flushing`'s threshold on every call without
-    /// contending with concurrent `put`s.
+    /// after every batch it commits. Lock-free, so `flush_pending` can
+    /// check whether anything is staged without contending with
+    /// concurrent `put`s. `put` itself doesn't need this: it gets the
+    /// same value back directly from the committer.
     active_len:  Arc<AtomicU64>,
     state:       Arc<RwLock<State>>,
     /// Every staged key's location, across every segment. A separate
@@ -411,12 +416,15 @@ impl Staging {
     }
 
     /// Durably appends `value` under `key` to the active segment. Once
-    /// this returns, `value` survives a crash of this node.
+    /// this returns, `value` survives a crash of this node. Returns the
+    /// active segment's length immediately after, so a caller that needs
+    /// that (e.g. to compare against a flush threshold) gets it for free
+    /// instead of making a separate `active_len` call.
     ///
     /// Refuses the write if pending segments already number `max_pending`:
     /// at that point `flush_pending` isn't keeping up, and accepting more
     /// would grow local disk usage without bound.
-    pub(crate) async fn put(&self, key: Digest, value: Bytes) -> io::Result<()> {
+    pub(crate) async fn put(&self, key: Digest, value: Bytes) -> io::Result<u64> {
         let pending_len = self.state.read().await.pending.len();
         if pending_len >= self.max_pending as usize {
             return Err(io::Error::other(format!(
@@ -453,7 +461,10 @@ impl Staging {
         self.index.read().await.contains_key(&key)
     }
 
-    /// How many bytes the active segment currently holds.
+    /// How many bytes the active segment currently holds. `put` already
+    /// returns this for its own caller; this is for querying it
+    /// independently of any particular write, e.g. `flush_pending`
+    /// checking whether the active segment has anything worth rotating.
     pub(crate) fn active_len(&self) -> u64 {
         self.active_len.load(Ordering::Relaxed)
     }

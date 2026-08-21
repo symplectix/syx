@@ -69,6 +69,7 @@ use tokio::io::{
     AsyncWrite,
     AsyncWriteExt as _,
 };
+use tokio::sync::OwnedMutexGuard;
 use tokio::task;
 
 #[cfg(test)]
@@ -110,8 +111,7 @@ pub(crate) const DEFAULT_MAX_STAGING_DURATION: Duration = Duration::from_secs(30
 pub(crate) const DEFAULT_MAX_PENDING_SEGMENTS: u16 = 16;
 
 /// Flush behavior: when to consolidate staged entries into a pack, and
-/// bookkeeping for that process. A plain data container; the operations
-/// that use it live on `Cas`.
+/// bookkeeping for that process.
 #[derive(Clone)]
 pub(crate) struct Flushing {
     /// Serializes `flush_pending`.
@@ -121,10 +121,10 @@ pub(crate) struct Flushing {
     /// the background or wait on it and propagate its error.
     failures: Arc<AtomicU32>,
     /// How many bytes to stage before consolidating into a pack.
-    threshold: u64,
+    bytes_threshold: u64,
     /// How long to let a blob sit staged, unpacked, before consolidating
-    /// regardless of `threshold`.
-    max_staging_duration: Duration,
+    /// regardless of `bytes_threshold`.
+    duration_threshold: Duration,
     /// When the active segment currently being staged into started.
     staging_since: Arc<std::sync::Mutex<Instant>>,
 }
@@ -133,14 +133,56 @@ impl Flushing {
     /// Builds `Flushing` for `Graph` to hold directly. `Graph::Builder`
     /// is the configuration surface, resolving defaults and overrides;
     /// this just builds what it resolves.
-    pub(crate) fn new(threshold: u64, max_staging_duration: Duration) -> Self {
+    pub(crate) fn new(bytes_threshold: u64, duration_threshold: Duration) -> Self {
         Self {
             mutex: Arc::new(tokio::sync::Mutex::new(())),
             failures: Arc::new(AtomicU32::new(0)),
-            threshold,
-            max_staging_duration,
+            bytes_threshold,
+            duration_threshold,
             staging_since: Arc::new(std::sync::Mutex::new(Instant::now())),
         }
+    }
+
+    /// Whether enough has accumulated since the last flush to make one
+    /// due now: `active_len` crossing `bytes_threshold`, or enough time
+    /// having passed since `staging_since` regardless of `active_len`.
+    fn is_due(&self, active_len: u64) -> bool {
+        active_len >= self.bytes_threshold
+            || self.staging_since.lock().unwrap().elapsed() >= self.duration_threshold
+    }
+
+    /// Restarts the clock `is_due` measures elapsed time against, for
+    /// the segment that just became active.
+    fn reset_staging_since(&self) {
+        *self.staging_since.lock().unwrap() = Instant::now();
+    }
+
+    /// Consecutive `flush_pending` failures so far.
+    fn failures(&self) -> u32 {
+        self.failures.load(Ordering::Relaxed)
+    }
+
+    fn record_success(&self) {
+        self.failures.store(0, Ordering::Relaxed);
+    }
+
+    fn record_failure(&self) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Claims exclusive rights to run a flush right now, or `None` if
+    /// another one is already in progress. An owned guard (not tied to
+    /// `&self`'s lifetime), so a winning caller can carry it into a
+    /// `tokio::spawn`ed task.
+    ///
+    /// Callers should claim before deciding to spawn or wait on a flush
+    /// at all, not just before doing the flush's actual work: group
+    /// commit can report the same crossed threshold to every `put_blob`
+    /// call that landed in the same batch, and claiming early means only
+    /// the one that actually wins bothers spawning anything, instead of
+    /// every one of them spawning a task that mostly just loses a race.
+    fn try_claim(&self) -> Option<OwnedMutexGuard<()>> {
+        self.mutex.clone().try_lock_owned().ok()
     }
 }
 
@@ -272,25 +314,38 @@ impl<'a> Cas<'a> {
 
     /// Stages `bytes` under `key` durably in `staging`.
     ///
-    /// If enough has accumulated since the last flush, by size
-    /// (`flushing.threshold`) or by time (`flushing.max_staging_duration`),
-    /// triggers `flush_pending` in the background rather than waiting on
-    /// it, so this call returns as soon as `bytes` is durable locally.
-    /// Once `flush_pending` has failed `MAX_CONSECUTIVE_FLUSH_FAILURES`
-    /// times in a row, switches to waiting on it and propagating its
-    /// error instead, so a persistently broken flush path is surfaced to
-    /// callers rather than growing `staging` without bound.
+    /// If enough has accumulated since the last flush, by size or by
+    /// time (see `Flushing::is_due`), triggers `flush_pending` in the
+    /// background rather than waiting on it, so this call returns as
+    /// soon as `bytes` is durable locally. Once `flush_pending` has
+    /// failed `MAX_CONSECUTIVE_FLUSH_FAILURES` times in a row, switches
+    /// to waiting on it and propagating its error instead, so a
+    /// persistently broken flush path is surfaced to callers rather than
+    /// growing `staging` without bound.
     async fn put_blob(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
-        self.staging.put(key, bytes).await?;
+        let active_len = self.staging.put(key, bytes).await?;
 
-        let due = self.staging.active_len() >= self.flushing.threshold
-            || self.staging_elapsed() >= self.flushing.max_staging_duration;
-        if !due {
+        if !self.flushing.is_due(active_len) {
             return Ok(());
         }
 
-        if self.flushing.failures.load(Ordering::Relaxed) >= Self::MAX_CONSECUTIVE_FLUSH_FAILURES {
-            return self.flush_pending().await;
+        // Group commit can report this same crossed threshold to every
+        // `put_blob` call batched into the same write; only the one that
+        // wins this claim spawns (or waits on) a flush at all.
+        let Some(guard) = self.flushing.try_claim() else {
+            return Ok(());
+        };
+
+        if self.flushing.failures() >= Self::MAX_CONSECUTIVE_FLUSH_FAILURES {
+            return flush_pending(
+                self.db,
+                self.blobs,
+                self.staging,
+                self.cas_prefix,
+                self.flushing,
+                guard,
+            )
+            .await;
         }
 
         let db = self.db.clone();
@@ -299,13 +354,9 @@ impl<'a> Cas<'a> {
         let cas_prefix = self.cas_prefix.to_string();
         let flushing = self.flushing.clone();
         tokio::spawn(async move {
-            let _ = flush_pending(&db, &blobs, &staging, &cas_prefix, &flushing).await;
+            let _ = flush_pending(&db, &blobs, &staging, &cas_prefix, &flushing, guard).await;
         });
         Ok(())
-    }
-
-    fn staging_elapsed(&self) -> Duration {
-        self.flushing.staging_since.lock().unwrap().elapsed()
     }
 
     /// Consolidates all currently-staged entries into pack objects.
@@ -313,7 +364,11 @@ impl<'a> Cas<'a> {
     /// If another call is already in progress, this returns immediately
     /// without doing anything, rather than waiting its turn.
     pub async fn flush_pending(&self) -> io::Result<()> {
-        flush_pending(self.db, self.blobs, self.staging, self.cas_prefix, self.flushing).await
+        let Some(guard) = self.flushing.try_claim() else {
+            return Ok(());
+        };
+        flush_pending(self.db, self.blobs, self.staging, self.cas_prefix, self.flushing, guard)
+            .await
     }
 
     /// Fetch and decode chunk(s).
@@ -501,35 +556,31 @@ fn pack_path(cas_prefix: &str, pack_id: Digest) -> Path {
 /// can run this after the `Cas<'_>` that requested it has gone out of
 /// scope.
 ///
-/// If another call is already in progress, this returns immediately
-/// without doing anything, rather than waiting its turn.
+/// `_guard` must come from `Flushing::try_claim`: callers claim it
+/// before deciding whether to spawn or wait on this at all, not just
+/// before running it, so it's held for this call's whole duration.
 async fn flush_pending(
     db: &slatedb::Db,
     blobs: &Arc<dyn ObjectStore>,
     staging: &Staging,
     cas_prefix: &str,
     flushing: &Flushing,
+    _guard: OwnedMutexGuard<()>,
 ) -> io::Result<()> {
-    let Ok(_guard) = flushing.mutex.try_lock() else {
-        return Ok(());
-    };
-
     let mut segments = staging.pending_segments().await;
     if staging.active_len() > 0 {
         segments.push(staging.rotate().await?);
-        *flushing.staging_since.lock().unwrap() = Instant::now();
+        flushing.reset_staging_since();
     }
     if segments.is_empty() {
-        flushing.failures.store(0, Ordering::Relaxed);
+        flushing.record_success();
         return Ok(());
     }
 
     let result = flush_segments(db, blobs, staging, cas_prefix, segments).await;
     match &result {
-        Ok(()) => flushing.failures.store(0, Ordering::Relaxed),
-        Err(_) => {
-            flushing.failures.fetch_add(1, Ordering::Relaxed);
-        }
+        Ok(()) => flushing.record_success(),
+        Err(_) => flushing.record_failure(),
     }
     result
 }
