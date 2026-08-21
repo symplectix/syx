@@ -1,16 +1,15 @@
 //! `Cas`'s local staging area: an append-only log written to a private
-//! directory, not to `db` or `store`. Every `put` fsyncs before returning,
+//! directory, not to `db` or `blobs`. Every `put` fsyncs before returning,
 //! so what's staged here survives this node's own crash, unlike
 //! `slatedb`'s in-memory WAL buffer. Content is keyed by its own digest,
 //! so replaying the same (key, value) pair after a crash, or retrying the
 //! same segment after a failed flush, is always a safe no-op.
 //!
 //! Records are framed as `[key: 32 bytes][value_len: u32 BE][value]`, with
-//! no separate checksum. `Staging::open` verifies the records it replays
-//! by decoding them and recomputing their digest, which is a stronger
-//! check than a CRC would be, and only needs to run against the one file
-//! that could have been mid-write when a crash happened; every earlier
-//! file was already durable before this process ever rotated past it.
+//! no separate checksum. Verifying a segment means decoding each record
+//! and recomputing its digest, which is a stronger check than a CRC would
+//! be; `revalidate_segment` runs this whenever a segment's tail might be
+//! torn, truncating away anything from the first bad record on.
 //!
 //! Puts append to one active segment. Once a caller rotates it out, it
 //! becomes a pending segment: readable through `entries`, and removed via
@@ -41,6 +40,27 @@
 //! ever touch a separate index lock and read via position-addressed I/O
 //! (`read_at`/Windows' `seek_read`), so they never wait behind the
 //! committer's `write`/`sync_data` either.
+//!
+//! Each `index` entry carries its own segment file handle, not just a
+//! segment id to look up later, so once `put` hands one out, reading it
+//! back never depends on that segment still being tracked in `state`.
+//! `finish` evicts a segment from `index` before `state`, but the order
+//! doesn't matter for correctness either way: a `get` that already read
+//! the old `index` entry keeps working (its own `Arc<File>` clone stays
+//! valid even after the file is unlinked), and one that reads after
+//! eviction just misses cleanly, no different from the key never having
+//! been staged.
+//!
+//! A `commit` that fails partway poisons the segment it was writing to:
+//! `O_APPEND` guarantees every successful `write` lands at the file's
+//! true end regardless of what this module believes that end is, so a
+//! partial write (or one that landed but whose `sync_data` then failed)
+//! can leave the file longer than `self.offset` accounts for. Rather
+//! than let later commits compute offsets against that stale belief, the
+//! committer starts a fresh segment immediately and, best-effort,
+//! re-derives the old one's true contents the same way `open` recovers
+//! from a crash (`revalidate_segment`, truncating any torn tail) so
+//! nothing durably written is silently lost.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -104,11 +124,16 @@ impl fmt::Display for Segment {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Location {
-    /// Which segment the value lives in.
+    /// Which segment the value lives in. Only `finish` needs this, to
+    /// know which entries to evict when a segment goes away; reads use
+    /// `file` directly and never need to ask `state` about it.
     segment: Segment,
-    /// Byte offset of the value within that segment's file.
+    /// The segment's own file, captured at insert time so a read never
+    /// races a concurrent `finish` tearing that segment out of `state`.
+    file:    Arc<File>,
+    /// Byte offset of the value within `file`.
     offset:  u64,
     /// How many bytes the value is.
     length:  u32,
@@ -170,6 +195,9 @@ struct Committer {
     /// committer itself ever advances this; `Staging::active_len` reads
     /// the published copy in `active_len` instead.
     offset:     u64,
+    /// Verifies a poisoned segment's recovered tail the same way `open`
+    /// verifies a crash-torn one; see `poison`.
+    codec:      Codec,
     active_len: Arc<AtomicU64>,
     state:      Arc<RwLock<State>>,
     index:      Arc<RwLock<HashMap<Digest, Location>>>,
@@ -231,6 +259,7 @@ impl Committer {
             buf.extend_from_slice(&record);
             locations.push(Location {
                 segment: self.segment,
+                file:    Arc::clone(&self.file),
                 offset:  value_offset,
                 length:  msg.value.len() as u32,
             });
@@ -253,7 +282,7 @@ impl Committer {
                 {
                     let mut index = self.index.write().await;
                     for (msg, location) in batch.iter().zip(&locations) {
-                        index.insert(msg.key, *location);
+                        index.insert(msg.key, location.clone());
                     }
                 }
                 for msg in batch {
@@ -264,6 +293,9 @@ impl Committer {
                 for msg in batch {
                     let _ = msg.reply.send(Err(io::Error::new(e.kind(), e.to_string())));
                 }
+                // See the module doc's last paragraph: this segment's
+                // true tail is no longer known from `self.offset` alone.
+                let _ = self.poison().await;
             }
         }
     }
@@ -273,19 +305,56 @@ impl Committer {
     /// free: both run inside the same single-consumer loop, so a
     /// `Rotate` can never jump ahead of `Put`s that were sent first.
     async fn rotate(&mut self) -> io::Result<Segment> {
+        let old_id = self.segment;
+        let old_file = Arc::clone(&self.file);
+        self.start_fresh_segment().await?;
+
+        self.state.write().await.pending.push(Handle { id: old_id, file: old_file });
+        Ok(old_id)
+    }
+
+    /// Handles a `commit` that failed partway. Starts a fresh segment
+    /// immediately so later commits don't inherit a stale `self.offset`,
+    /// then, best-effort, re-derives what actually landed durably in the
+    /// old one (the same recovery `Staging::open` runs at startup) and
+    /// publishes whatever of it is valid. If that recovery itself fails,
+    /// the old segment's valid prefix isn't lost -- it's still on disk,
+    /// and the next `open` will find and replay it like any other
+    /// segment left over from a previous run.
+    async fn poison(&mut self) -> io::Result<()> {
+        let old_id = self.segment;
+        self.start_fresh_segment().await?;
+
+        let path = segment_path(&self.dir, old_id);
+        if let Some((file, records)) = revalidate_segment(&path, Some(self.codec)).await? {
+            {
+                let mut index = self.index.write().await;
+                for (key, offset, length) in records {
+                    index.insert(
+                        key,
+                        Location { segment: old_id, file: Arc::clone(&file), offset, length },
+                    );
+                }
+            }
+            self.state.write().await.pending.push(Handle { id: old_id, file });
+        }
+        Ok(())
+    }
+
+    /// Starts a brand new active segment. Doesn't touch `state`/`index`
+    /// for whatever segment was active before -- callers decide what,
+    /// if anything, becomes visible for it.
+    async fn start_fresh_segment(&mut self) -> io::Result<()> {
         let next = self.segment.next();
         let file = create_segment(&self.dir, next).await?;
-        let old_id = self.segment;
-        let old_file = std::mem::replace(&mut self.file, Arc::clone(&file));
 
         self.segment = next;
         self.offset = 0;
         self.active_len.store(0, Ordering::Relaxed);
+        self.file = Arc::clone(&file);
 
-        let mut state = self.state.write().await;
-        state.pending.push(Handle { id: old_id, file: old_file });
-        state.active = Handle { id: next, file };
-        Ok(old_id)
+        self.state.write().await.active = Handle { id: next, file };
+        Ok(())
     }
 }
 
@@ -301,7 +370,9 @@ pub(crate) struct Staging {
     state:       Arc<RwLock<State>>,
     /// Every staged key's location, across every segment. A separate
     /// lock from `state`, so `get`/`contains` never wait behind the
-    /// committer's `write`/`sync_data`.
+    /// committer's `write`/`sync_data` -- and self-sufficient (each
+    /// entry carries its own file handle), so `get` never needs `state`
+    /// at all.
     index:       Arc<RwLock<HashMap<Digest, Location>>>,
     /// `put` refuses new writes once pending segments reach this many,
     /// so a persistently failing `flush_pending` bounds local disk usage
@@ -343,34 +414,18 @@ impl Staging {
         let mut pending = Vec::new();
         for (i, &segment) in ids.iter().enumerate() {
             let path = segment_path(&dir, segment);
-            let buf = read_bytes(&path).await?;
-            let len = buf.len() as u64;
-
+            // Every earlier file was already durable before this
+            // process ever rotated past it; only the one that could
+            // have been active when the previous run stopped needs
+            // verifying.
             let verify = (i + 1 == ids.len()).then_some(codec);
-            let (valid_len, records) = {
-                let buf = buf.clone();
-                task::spawn_blocking(move || parse(&buf, verify))
-                    .await
-                    .expect("parse should not panic")
-            };
-            if valid_len < len {
-                fs::OpenOptions::new().write(true).open(&path).await?.set_len(valid_len).await?;
-            }
-            // A file with no valid records is either the empty active
-            // segment a previous run's `rotate` created but never wrote
-            // to, or one torn so badly by a crash that not even its
-            // first record survived. Either way, there's nothing to
-            // pend; clean it up rather than tracking an empty segment
-            // forever.
-            if records.is_empty() {
-                fs::remove_file(&path).await?;
+            let Some((file, records)) = revalidate_segment(&path, verify).await? else {
                 continue;
-            }
-            let file = open_shared(&path).await?;
-            pending.push(Handle { id: segment, file });
+            };
             for (key, offset, length) in records {
-                index.insert(key, Location { segment, offset, length });
+                index.insert(key, Location { segment, file: Arc::clone(&file), offset, length });
             }
+            pending.push(Handle { id: segment, file });
         }
 
         let next = ids.last().map_or(Segment::FIRST, |id| id.next());
@@ -389,6 +444,7 @@ impl Staging {
             file,
             segment: next,
             offset: 0,
+            codec,
             active_len: Arc::clone(&active_len),
             state: Arc::clone(&state),
             index: Arc::clone(&index),
@@ -398,10 +454,12 @@ impl Staging {
         Ok(Self { dir, active_len, state, index, max_pending, commands })
     }
 
-    /// The file for `segment`. Panics if it isn't tracked: every caller
-    /// only ever asks for one it already knows must still be open,
-    /// either from `Cas`'s own index or from `pending_segments`/`rotate`'s
-    /// own return value.
+    /// The file for `segment`. Panics if it isn't tracked: its only
+    /// caller (`entries`) only ever asks for one it already knows must
+    /// still be open, from `pending_segments`/`rotate`'s own return
+    /// value. `get` doesn't call this -- its `Location`s carry their own
+    /// file handle, so a read never needs to ask `state` about a segment
+    /// at all.
     async fn find(&self, segment: Segment) -> Arc<File> {
         let state = self.state.read().await;
         if state.active.id == segment {
@@ -442,13 +500,12 @@ impl Staging {
 
     /// Fetches the value staged under `key`, if any.
     pub(crate) async fn get(&self, key: Digest) -> io::Result<Option<Bytes>> {
-        let Some(location) = self.index.read().await.get(&key).copied() else {
+        let Some(location) = self.index.read().await.get(&key).cloned() else {
             return Ok(None);
         };
-        let file = self.find(location.segment).await;
         let mut buf = vec![0u8; location.length as usize];
         task::spawn_blocking(move || -> io::Result<Vec<u8>> {
-            read_exact_at(&file, &mut buf, location.offset)?;
+            read_exact_at(&location.file, &mut buf, location.offset)?;
             Ok(buf)
         })
         .await
@@ -519,8 +576,8 @@ impl Staging {
     /// structurally can't hold that one, so there's nothing to guard
     /// against here.
     pub(crate) async fn finish(&self, segment: Segment) -> io::Result<()> {
-        self.state.write().await.pending.retain(|handle| handle.id != segment);
         self.index.write().await.retain(|_, location| location.segment != segment);
+        self.state.write().await.pending.retain(|handle| handle.id != segment);
         fs::remove_file(self.segment_path(segment)).await
     }
 
@@ -572,12 +629,12 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result
 /// the start of `buf` are valid.
 ///
 /// `codec` is `None` for a segment already known to be fully durable, in
-/// which case only the length framing is trusted. It's `Some` only for
-/// replaying the one segment that could have been active during a crash:
-/// each record is then decoded and its digest recomputed against its own
-/// key, and the first record that fails this, or that the file simply
-/// doesn't have enough bytes left for, is treated as a crash-torn tail.
-/// Everything from that point on is dropped rather than trusted.
+/// which case only the length framing is trusted. It's `Some` whenever
+/// the segment's tail might be torn (see `revalidate_segment`): each
+/// record is then decoded and its digest recomputed against its own key,
+/// and the first record that fails this, or that the file simply doesn't
+/// have enough bytes left for, is treated as a torn tail. Everything from
+/// that point on is dropped rather than trusted.
 fn parse(buf: &Bytes, codec: Option<Codec>) -> (u64, Vec<(Digest, u64, u32)>) {
     let mut records = Vec::new();
     let mut offset = 0usize;
@@ -600,6 +657,43 @@ fn parse(buf: &Bytes, codec: Option<Codec>) -> (u64, Vec<(Digest, u64, u32)>) {
         offset = value_end;
     }
     (offset as u64, records)
+}
+
+/// Re-reads the segment file at `path`, verifying and truncating away any
+/// torn tail. Used both by `open` (recovering from a crash) and by
+/// `Committer::poison` (recovering from a commit that failed partway) --
+/// both situations where a segment's recorded length can no longer be
+/// trusted and has to be re-derived from the file itself.
+///
+/// `verify` is `Some` to also recompute and check each record's digest;
+/// `None` trusts the length framing alone, for a segment already known to
+/// be fully durable (every segment but the one that could have been
+/// active, when called from `open`).
+///
+/// Returns `None` (after deleting the file) if nothing valid remains --
+/// either an empty active segment that was created but never written to,
+/// or one torn so badly not even its first record survived.
+async fn revalidate_segment(
+    path: &Path,
+    verify: Option<Codec>,
+) -> io::Result<Option<(Arc<File>, Vec<(Digest, u64, u32)>)>> {
+    let buf = read_bytes(path).await?;
+    let len = buf.len() as u64;
+
+    let (valid_len, records) = {
+        let buf = buf.clone();
+        task::spawn_blocking(move || parse(&buf, verify)).await.expect("parse should not panic")
+    };
+    if valid_len < len {
+        fs::OpenOptions::new().write(true).open(path).await?.set_len(valid_len).await?;
+    }
+    if records.is_empty() {
+        fs::remove_file(path).await?;
+        return Ok(None);
+    }
+
+    let file = open_shared(path).await?;
+    Ok(Some((file, records)))
 }
 
 async fn create_segment(dir: &Path, segment: Segment) -> io::Result<Arc<File>> {
