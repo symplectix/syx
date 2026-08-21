@@ -16,7 +16,12 @@ pub async fn graph(root: impl AsRef<Path>) -> fabric::Graph {
     let root = root.as_ref();
     let backend: Arc<dyn ObjectStore> =
         Arc::new(object_store::local::LocalFileSystem::new_with_prefix(root).unwrap());
-    fabric::Graph::builder("test", backend, root.join("staging")).build().await.unwrap()
+    fabric::Graph::builder(root.join("staging"))
+        .db_prefix("test")
+        .db_backend(backend)
+        .build()
+        .await
+        .unwrap()
 }
 
 /// A `Graph` backed by a local temporary directory.

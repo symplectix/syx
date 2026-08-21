@@ -87,7 +87,11 @@ fn other(e: impl std::error::Error + Send + Sync + 'static) -> io::Error {
     io::Error::other(e)
 }
 
-/// The default `cas_prefix`, for the common case of `store` existing
+/// The default `db_prefix`, for the common case of `db_backend` existing
+/// solely for this `Graph`'s own `db`.
+pub(crate) const DEFAULT_DB_PREFIX: &str = "";
+
+/// The default `cas_prefix`, for the common case of `blobs` existing
 /// solely for this `Graph`'s own blob storage.
 pub(crate) const DEFAULT_CAS_PREFIX: &str = "cas/";
 
@@ -176,7 +180,7 @@ impl Entry {
 #[derive(Clone, Copy)]
 pub struct Cas<'a> {
     db:         &'a slatedb::Db,
-    store:      &'a Arc<dyn ObjectStore>,
+    blobs:      &'a Arc<dyn ObjectStore>,
     staging:    &'a Arc<Staging>,
     cas_prefix: &'a str,
     flushing:   &'a Flushing,
@@ -193,14 +197,14 @@ impl<'a> Cas<'a> {
     /// Only `Graph::cas()` calls this.
     pub(crate) fn new(
         db: &'a slatedb::Db,
-        store: &'a Arc<dyn ObjectStore>,
+        blobs: &'a Arc<dyn ObjectStore>,
         staging: &'a Arc<Staging>,
         cas_prefix: &'a str,
         flushing: &'a Flushing,
         chunking: Chunking,
         codec: Codec,
     ) -> Self {
-        Self { db, store, staging, cas_prefix, flushing, chunking, codec }
+        Self { db, blobs, staging, cas_prefix, flushing, chunking, codec }
     }
 
     fn entry_key(&self, key: Digest) -> Vec<u8> {
@@ -243,7 +247,7 @@ impl<'a> Cas<'a> {
         let range: Range<u64> = offset..offset + length;
         let opts = GetOptions { range: Some(range.into()), ..Default::default() };
         let result =
-            self.store.get_opts(&self.pack_path(pack_id), opts).await.map_err(io::Error::from)?;
+            self.blobs.get_opts(&self.pack_path(pack_id), opts).await.map_err(io::Error::from)?;
         Ok(result.bytes().await?)
     }
 
@@ -290,12 +294,12 @@ impl<'a> Cas<'a> {
         }
 
         let db = self.db.clone();
-        let store = Arc::clone(self.store);
+        let blobs = Arc::clone(self.blobs);
         let staging = Arc::clone(self.staging);
         let cas_prefix = self.cas_prefix.to_string();
         let flushing = self.flushing.clone();
         tokio::spawn(async move {
-            let _ = flush_pending(&db, &store, &staging, &cas_prefix, &flushing).await;
+            let _ = flush_pending(&db, &blobs, &staging, &cas_prefix, &flushing).await;
         });
         Ok(())
     }
@@ -309,7 +313,7 @@ impl<'a> Cas<'a> {
     /// If another call is already in progress, this returns immediately
     /// without doing anything, rather than waiting its turn.
     pub async fn flush_pending(&self) -> io::Result<()> {
-        flush_pending(self.db, self.store, self.staging, self.cas_prefix, self.flushing).await
+        flush_pending(self.db, self.blobs, self.staging, self.cas_prefix, self.flushing).await
     }
 
     /// Fetch and decode chunk(s).
@@ -501,7 +505,7 @@ fn pack_path(cas_prefix: &str, pack_id: Digest) -> Path {
 /// without doing anything, rather than waiting its turn.
 async fn flush_pending(
     db: &slatedb::Db,
-    store: &Arc<dyn ObjectStore>,
+    blobs: &Arc<dyn ObjectStore>,
     staging: &Staging,
     cas_prefix: &str,
     flushing: &Flushing,
@@ -520,7 +524,7 @@ async fn flush_pending(
         return Ok(());
     }
 
-    let result = flush_segments(db, store, staging, cas_prefix, segments).await;
+    let result = flush_segments(db, blobs, staging, cas_prefix, segments).await;
     match &result {
         Ok(()) => flushing.failures.store(0, Ordering::Relaxed),
         Err(_) => {
@@ -532,7 +536,7 @@ async fn flush_pending(
 
 async fn flush_segments(
     db: &slatedb::Db,
-    store: &Arc<dyn ObjectStore>,
+    blobs: &Arc<dyn ObjectStore>,
     staging: &Staging,
     cas_prefix: &str,
     segments: Vec<staging::Segment>,
@@ -559,7 +563,7 @@ async fn flush_segments(
         }
 
         let path = pack_path(cas_prefix, pack_id);
-        store.put(&path, PutPayload::from_iter(chunks)).await.map_err(io::Error::from)?;
+        blobs.put(&path, PutPayload::from_iter(chunks)).await.map_err(io::Error::from)?;
 
         let mut batch = slatedb::WriteBatch::new();
         for (digest, entry) in entries {

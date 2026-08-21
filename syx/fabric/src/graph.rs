@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use content_addressing as cas;
 use object_store::ObjectStore;
+use object_store::local::LocalFileSystem;
+use tokio::fs;
 
 use crate::{
     Cas,
@@ -15,58 +17,47 @@ use crate::{
 
 /// Builds a `Graph`, opening the `slatedb::Db` it and its blob-storage
 /// parts share.
+///
+/// `staging_dir` is the only thing that must be specified: a local
+/// directory `Graph` stages not-yet-packed blobs in. Everything else --
+/// where `db`/`blobs` physically live -- defaults to also living under
+/// `staging_dir` via a local `object_store`, so a `Graph` works
+/// standalone with zero external setup; override `db_backend`/`blobs`
+/// to point at S3 (or any other `object_store` backend) instead.
 pub struct Builder {
-    db_prefix: String,
-    db_backend: Arc<dyn ObjectStore>,
-    staging_dir: PathBuf,
-    packs_backend: Option<Arc<dyn ObjectStore>>,
-    cas_prefix: Option<String>,
-    packs_threshold: Option<u64>,
+    // staging
+    staging_dir:          PathBuf,
     max_staging_duration: Option<Duration>,
     max_pending_segments: Option<u16>,
-    chunking: Option<cas::Chunking>,
-    codec: Option<cas::Codec>,
+
+    // db
+    db_prefix:  Option<String>,
+    db_backend: Option<Arc<dyn ObjectStore>>,
+
+    // blobs
+    blobs_backend:   Option<Arc<dyn ObjectStore>>,
+    packs_threshold: Option<u64>,
+
+    // content addressing
+    cas_prefix: Option<String>,
+    chunking:   Option<cas::Chunking>,
+    codec:      Option<cas::Codec>,
 }
 
 impl Builder {
-    fn new(
-        db_prefix: impl Into<String>,
-        db_backend: Arc<dyn ObjectStore>,
-        staging_dir: impl Into<PathBuf>,
-    ) -> Self {
+    fn new(staging_dir: impl Into<PathBuf>) -> Self {
         Self {
-            db_prefix: db_prefix.into(),
-            db_backend,
             staging_dir: staging_dir.into(),
-            packs_backend: None,
-            cas_prefix: None,
-            packs_threshold: None,
             max_staging_duration: None,
             max_pending_segments: None,
+            db_prefix: None,
+            db_backend: None,
+            blobs_backend: None,
+            packs_threshold: None,
+            cas_prefix: None,
             chunking: None,
             codec: None,
         }
-    }
-
-    /// The key prefix blobs are staged and packed under. Named
-    /// `cas_prefix`, not just `prefix`, to avoid confusion with
-    /// `db_prefix`, the unrelated prefix `slatedb::Db` itself is opened
-    /// under.
-    pub fn cas_prefix(mut self, cas_prefix: impl Into<String>) -> Self {
-        self.cas_prefix = Some(cas_prefix.into());
-        self
-    }
-
-    /// Writes pack objects to `packs` instead of `db`'s own backend.
-    pub fn packs(mut self, packs: Arc<dyn ObjectStore>) -> Self {
-        self.packs_backend = Some(packs);
-        self
-    }
-
-    /// How many bytes to stage before consolidating into a pack.
-    pub fn packs_threshold(mut self, packs_threshold: u64) -> Self {
-        self.packs_threshold = Some(packs_threshold);
-        self
     }
 
     /// How long to let a blob sit staged, unpacked, before consolidating
@@ -83,6 +74,43 @@ impl Builder {
     /// node is fenced.
     pub fn max_pending_segments(mut self, max_pending_segments: u16) -> Self {
         self.max_pending_segments = Some(max_pending_segments);
+        self
+    }
+
+    /// The key prefix `db` itself is opened under, within `db_backend`.
+    /// Only needed when `db_backend` is shared with something else that
+    /// also needs a prefix of its own.
+    pub fn db_prefix(mut self, db_prefix: impl Into<String>) -> Self {
+        self.db_prefix = Some(db_prefix.into());
+        self
+    }
+
+    /// Where `db` (the pointer/relation store) lives. Defaults to a
+    /// local `object_store` under `staging_dir` when not set.
+    pub fn db_backend(mut self, db_backend: Arc<dyn ObjectStore>) -> Self {
+        self.db_backend = Some(db_backend);
+        self
+    }
+
+    /// Where packed blob objects live. Defaults to `db_backend` (the
+    /// resolved one, whether explicit or defaulted) when not set.
+    pub fn blobs(mut self, blobs: Arc<dyn ObjectStore>) -> Self {
+        self.blobs_backend = Some(blobs);
+        self
+    }
+
+    /// How many bytes to stage before consolidating into a pack.
+    pub fn packs_threshold(mut self, packs_threshold: u64) -> Self {
+        self.packs_threshold = Some(packs_threshold);
+        self
+    }
+
+    /// The key prefix blobs are staged and packed under. Named
+    /// `cas_prefix`, not just `prefix`, to avoid confusion with
+    /// `db_prefix`, the unrelated prefix `slatedb::Db` itself is opened
+    /// under.
+    pub fn cas_prefix(mut self, cas_prefix: impl Into<String>) -> Self {
+        self.cas_prefix = Some(cas_prefix.into());
         self
     }
 
@@ -110,57 +138,74 @@ impl Builder {
     // storage engine no longer needs merge semantics now that staging
     // lives in `staging`, not `db`.
     pub async fn build(self) -> io::Result<Graph> {
-        let cas_prefix: Arc<str> =
-            Arc::from(self.cas_prefix.unwrap_or_else(|| storage::DEFAULT_CAS_PREFIX.to_string()));
+        let Self {
+            staging_dir,
+            max_staging_duration,
+            max_pending_segments,
+            db_prefix,
+            db_backend,
+            blobs_backend,
+            packs_threshold,
+            cas_prefix,
+            chunking,
+            codec,
+        } = self;
 
-        let db = slatedb::Db::builder(self.db_prefix, self.db_backend.clone())
+        let db_backend = match db_backend {
+            Some(backend) => backend,
+            None => {
+                let dir = staging_dir.join("db");
+                fs::create_dir_all(&dir).await?;
+                let local = LocalFileSystem::new_with_prefix(dir).map_err(io::Error::other)?;
+                Arc::new(local) as Arc<dyn ObjectStore>
+            }
+        };
+        let db_prefix = db_prefix.unwrap_or_else(|| storage::DEFAULT_DB_PREFIX.to_string());
+        let db = slatedb::Db::builder(db_prefix, db_backend.clone())
             .build()
             .await
             .map_err(io::Error::other)?;
 
-        let codec = self.codec.unwrap_or_default();
+        let codec = codec.unwrap_or_default();
         let max_pending_segments =
-            self.max_pending_segments.unwrap_or(storage::DEFAULT_MAX_PENDING_SEGMENTS);
+            max_pending_segments.unwrap_or(storage::DEFAULT_MAX_PENDING_SEGMENTS);
         let staging = Arc::new(
-            crate::staging::Staging::open(self.staging_dir, codec, max_pending_segments).await?,
+            crate::staging::Staging::open(staging_dir, codec, max_pending_segments).await?,
         );
 
-        let packs_backend = self.packs_backend.unwrap_or_else(|| self.db_backend.clone());
-        let packs_threshold = self.packs_threshold.unwrap_or(storage::DEFAULT_PACKS_THRESHOLD);
+        let blobs = blobs_backend.unwrap_or_else(|| db_backend.clone());
+        let packs_threshold = packs_threshold.unwrap_or(storage::DEFAULT_PACKS_THRESHOLD);
         let max_staging_duration =
-            self.max_staging_duration.unwrap_or(storage::DEFAULT_MAX_STAGING_DURATION);
-        let chunking = self.chunking.unwrap_or_default();
+            max_staging_duration.unwrap_or(storage::DEFAULT_MAX_STAGING_DURATION);
+        let chunking = chunking.unwrap_or_default();
+        let cas_prefix: Arc<str> =
+            Arc::from(cas_prefix.unwrap_or_else(|| storage::DEFAULT_CAS_PREFIX.to_string()));
 
         let flushing = storage::Flushing::new(packs_threshold, max_staging_duration);
-        Ok(Graph::new(db, packs_backend, staging, cas_prefix, flushing, chunking, codec))
+        Ok(Graph::new(staging, db, blobs, flushing, cas_prefix, chunking, codec))
     }
 }
 
 impl Graph {
-    /// Starts building a `Graph`, which will open its own `db` at
-    /// `db_prefix` in `db_backend`, and stage not-yet-packed blobs in
-    /// `staging_dir`, a local directory only this `Graph` should use.
-    pub fn builder(
-        db_prefix: impl Into<String>,
-        db_backend: Arc<dyn ObjectStore>,
-        staging_dir: impl Into<PathBuf>,
-    ) -> Builder {
-        Builder::new(db_prefix, db_backend, staging_dir)
+    /// Starts building a `Graph`. See [`Builder`]'s own doc for what's
+    /// required vs. defaulted.
+    pub fn builder(staging_dir: impl Into<PathBuf>) -> Builder {
+        Builder::new(staging_dir)
     }
 
     /// Only `Builder::build` calls this. Construct a `Graph` via
     /// `Graph::builder` instead of opening `db`/building these parts
     /// yourself.
     const fn new(
-        db: slatedb::Db,
-        store: Arc<dyn ObjectStore>,
         staging: Arc<crate::staging::Staging>,
-        cas_prefix: Arc<str>,
+        db: slatedb::Db,
+        blobs: Arc<dyn ObjectStore>,
         flushing: storage::Flushing,
+        cas_prefix: Arc<str>,
         chunking: cas::Chunking,
         codec: cas::Codec,
     ) -> Self {
-        Self { db, store, staging, cas_prefix, flushing, chunking, codec }
+        Self { staging, db, blobs, flushing, cas_prefix, chunking, codec }
     }
 
     /// The blob-storage facet of this `Graph`: `get`/`put`/`read_into`/
@@ -169,7 +214,7 @@ impl Graph {
     pub fn cas(&self) -> Cas<'_> {
         Cas::new(
             &self.db,
-            &self.store,
+            &self.blobs,
             &self.staging,
             &self.cas_prefix,
             &self.flushing,

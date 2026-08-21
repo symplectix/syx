@@ -36,29 +36,29 @@ fn local_fs() -> (testing::TempDir, Arc<dyn ObjectStore>) {
 struct Env {
     _staging_dir: testing::TempDir,
     db:           slatedb::Db,
-    store:        Arc<dyn ObjectStore>,
+    blobs:        Arc<dyn ObjectStore>,
     staging:      Arc<Staging>,
     flushing:     Flushing,
 }
 
 impl Env {
-    async fn with_threshold(packs_backend: Arc<dyn ObjectStore>, threshold: u64) -> Self {
+    async fn with_threshold(blobs_backend: Arc<dyn ObjectStore>, threshold: u64) -> Self {
         let db = slatedb::Db::builder("test", in_memory()).build().await.unwrap();
         let staging_dir = testing::tempdir();
         let staging =
             Arc::new(Staging::open(staging_dir.path(), Codec::new(), u16::MAX).await.unwrap());
         let flushing = Flushing::new(threshold, std::time::Duration::from_secs(3600));
-        Self { _staging_dir: staging_dir, db, store: packs_backend, staging, flushing }
+        Self { _staging_dir: staging_dir, db, blobs: blobs_backend, staging, flushing }
     }
 
-    async fn new(packs_backend: Arc<dyn ObjectStore>) -> Self {
-        Self::with_threshold(packs_backend, DEFAULT_PACKS_THRESHOLD).await
+    async fn new(blobs_backend: Arc<dyn ObjectStore>) -> Self {
+        Self::with_threshold(blobs_backend, DEFAULT_PACKS_THRESHOLD).await
     }
 
     fn cas(&self) -> Cas<'_> {
         Cas::new(
             &self.db,
-            &self.store,
+            &self.blobs,
             &self.staging,
             DEFAULT_CAS_PREFIX,
             &self.flushing,

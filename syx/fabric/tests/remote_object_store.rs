@@ -67,8 +67,10 @@ async fn s3_graph(
     // for as long as `graph` lives, and these tests never outlive the
     // process, so there's nothing to clean up on drop that matters here.
     let staging_dir = testing::tempdir().keep();
-    let graph = fabric::Graph::builder("test", db_backend, staging_dir)
-        .packs(remote.clone())
+    let graph = fabric::Graph::builder(staging_dir)
+        .db_prefix("test")
+        .db_backend(db_backend)
+        .blobs(remote.clone())
         .packs_threshold(packs_threshold)
         .build()
         .await
