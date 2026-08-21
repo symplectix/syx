@@ -21,20 +21,31 @@
 //!
 //! # Concurrency
 //!
-//! Writes use position-addressed I/O (`write_at`/Windows' `seek_write`),
-//! not a shared cursor, so concurrent `put`s never contend on a lock:
-//! each one reserves its own byte range with a single atomic add, then
-//! writes into that range independently. `get`/`contains` only ever
-//! touch a separate index lock, so they never wait behind a `put`'s
-//! `fsync` either. `state` (which segment is active, which are pending)
-//! still needs real exclusion, but only `rotate`/`finish` take it as a
-//! writer; `put` takes it as a reader for as long as its write is in
-//! flight, purely so `rotate` waits for every in-flight `put` against
-//! the segment it's about to seal before treating it as immutable.
+//! `put` doesn't write directly. It sends its `(key, value)` to a single
+//! committer task over an unbounded channel and waits for that task to
+//! reply. The committer drains whatever else is already queued before
+//! writing, so however many `put`s happen to be ready at once share one
+//! `write`+`sync_data` call, instead of each paying for its own -- the
+//! same group-commit technique WAL implementations use to amortize
+//! `fsync`'s per-call cost under concurrent writers. This matters far
+//! more than avoiding write contention: on an SSD there's no seek
+//! penalty to dodge in the first place, so the previous position-
+//! addressed (`write_at`) design bought little there, while still paying
+//! for a separate `fsync`-equivalent call per `put`.
+//!
+//! Because `put`s and `rotate` funnel through the same single-consumer
+//! channel, in the order they were sent, `rotate` can never seal a
+//! segment out from under a `put` that was sent before it -- the
+//! ordering the committer already needs for its own batching gives this
+//! guarantee for free, no separate lock required. `get`/`contains` only
+//! ever touch a separate index lock and read via position-addressed I/O
+//! (`read_at`/Windows' `seek_read`), so they never wait behind the
+//! committer's `write`/`sync_data` either.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
+use std::io::Write as _;
 use std::path::{
     Path,
     PathBuf,
@@ -61,7 +72,8 @@ use content_addressing::{
 };
 use tokio::sync::{
     RwLock,
-    RwLockReadGuard,
+    mpsc,
+    oneshot,
 };
 use tokio::{
     fs,
@@ -103,16 +115,18 @@ struct Location {
 }
 
 /// A segment's open file, whether it's the one currently being appended
-/// to or one already rotated out. Shared, not exclusive: every write
-/// targets its own reserved byte range (see the module doc), so handing
-/// out clones of this `Arc` costs nothing and needs no lock of its own.
+/// to or one already rotated out. Cheap to clone (just bumps the `Arc`):
+/// the committer task is the only writer, so handing a clone to a reader
+/// costs nothing and needs no lock of its own -- positioned reads
+/// (`read_at`) never contend with the committer's own writes.
 struct Handle {
     id:   Segment,
     file: Arc<File>,
 }
 
-/// Which segment is active and which are pending. Plain data: `Staging`
-/// owns the lock this lives behind and every operation on it.
+/// Which segment is active and which are pending. Plain data, other than
+/// the committer's own writes (see `Committer::rotate`), nothing mutates
+/// this; readers just take a shared lock.
 struct State {
     active:  Handle,
     /// Rotated out, not yet `finish`ed. Structurally can never contain
@@ -121,48 +135,177 @@ struct State {
     pending: Vec<Handle>,
 }
 
-/// A view onto the active segment, holding the read guard that grants
-/// it. `put` holds the one it gets across its own write, so `rotate`
-/// (which needs the write lock to seal a segment) waits for every `put`
-/// already in flight against it before treating it as immutable.
-struct Active<'a> {
-    guard: RwLockReadGuard<'a, State>,
-    id:    Segment,
-    file:  Arc<File>,
+/// One `put` waiting on the committer.
+struct PutMsg {
+    key:   Digest,
+    value: Bytes,
+    reply: oneshot::Sender<io::Result<()>>,
 }
 
-impl Active<'_> {
-    fn id(&self) -> Segment {
-        self.id
+/// One `rotate` waiting on the committer.
+struct RotateMsg {
+    reply: oneshot::Sender<io::Result<Segment>>,
+}
+
+/// A request handed to the committer task over its `commands` channel.
+enum Command {
+    Put(PutMsg),
+    Rotate(RotateMsg),
+}
+
+/// Owns the active segment's write side -- the only thing that ever
+/// writes to a segment file. Every `Staging::put`/`rotate` funnels
+/// through its `commands` channel instead of writing directly, so many
+/// concurrent `put`s can share one `write`+`sync_data` call instead of
+/// each paying for its own (see the module doc's "Concurrency" section).
+struct Committer {
+    dir:        PathBuf,
+    file:       Arc<File>,
+    segment:    Segment,
+    /// The next unwritten offset in the active segment. Only the
+    /// committer itself ever advances this; `Staging::active_len` reads
+    /// the published copy in `active_len` instead.
+    offset:     u64,
+    active_len: Arc<AtomicU64>,
+    state:      Arc<RwLock<State>>,
+    index:      Arc<RwLock<HashMap<Digest, Location>>>,
+}
+
+impl Committer {
+    /// Runs until every `Staging` handle (and thus every `commands`
+    /// sender) is dropped.
+    async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
+        // A `Rotate` peeked while draining a batch, but not yet allowed
+        // to run, since everything sent before it still needs to land
+        // in the segment it's about to seal.
+        let mut carried: Option<Command> = None;
+        loop {
+            let command = match carried.take() {
+                Some(command) => command,
+                None => match commands.recv().await {
+                    Some(command) => command,
+                    None => return,
+                },
+            };
+
+            match command {
+                Command::Rotate(msg) => {
+                    let result = self.rotate().await;
+                    let _ = msg.reply.send(result);
+                }
+                Command::Put(first) => {
+                    let mut batch = vec![first];
+                    loop {
+                        match commands.try_recv() {
+                            Ok(Command::Put(msg)) => batch.push(msg),
+                            Ok(rotate @ Command::Rotate(_)) => {
+                                carried = Some(rotate);
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    self.commit(batch).await;
+                }
+            }
+        }
     }
 
-    fn file(&self) -> Arc<File> {
-        Arc::clone(&self.file)
+    /// Writes every record in `batch` with one `write`+`sync_data` call,
+    /// then publishes their locations and replies to every waiter. The
+    /// group commit itself: the cost of one `fsync`-equivalent call is
+    /// shared across however many `put`s happened to be ready when this
+    /// batch was drained.
+    async fn commit(&mut self, batch: Vec<PutMsg>) {
+        let mut buf = BytesMut::new();
+        let mut locations = Vec::with_capacity(batch.len());
+        let mut offset = self.offset;
+        for msg in &batch {
+            let record = encode_record(msg.key, &msg.value);
+            let value_offset = offset + RECORD_HEADER_LEN;
+            offset += record.len() as u64;
+            buf.extend_from_slice(&record);
+            locations.push(Location {
+                segment: self.segment,
+                offset:  value_offset,
+                length:  msg.value.len() as u32,
+            });
+        }
+        let buf = buf.freeze();
+
+        let file = Arc::clone(&self.file);
+        let result = task::spawn_blocking(move || -> io::Result<()> {
+            let mut w = &*file;
+            w.write_all(&buf)?;
+            file.sync_data()
+        })
+        .await
+        .expect("write should not panic");
+
+        match result {
+            Ok(()) => {
+                self.offset = offset;
+                self.active_len.store(offset, Ordering::Relaxed);
+                {
+                    let mut index = self.index.write().await;
+                    for (msg, location) in batch.iter().zip(&locations) {
+                        index.insert(msg.key, *location);
+                    }
+                }
+                for (msg, _) in batch.into_iter().zip(locations) {
+                    let _ = msg.reply.send(Ok(()));
+                }
+            }
+            Err(e) => {
+                for msg in batch {
+                    let _ = msg.reply.send(Err(io::Error::new(e.kind(), e.to_string())));
+                }
+            }
+        }
     }
 
-    /// How many segments are pending. Reads through the still-held
-    /// guard, so this never needs its own separate lock acquisition.
-    fn pending_len(&self) -> usize {
-        self.guard.pending.len()
+    /// Seals the active segment into a new pending one and starts a
+    /// fresh active segment. Correctly ordered against `commit` for
+    /// free: both run inside the same single-consumer loop, so a
+    /// `Rotate` can never jump ahead of `Put`s that were sent first.
+    async fn rotate(&mut self) -> io::Result<Segment> {
+        let next = self.segment.next();
+        let file = create_segment(&self.dir, next).await?;
+        let old_id = self.segment;
+        let old_file = std::mem::replace(&mut self.file, Arc::clone(&file));
+
+        self.segment = next;
+        self.offset = 0;
+        self.active_len.store(0, Ordering::Relaxed);
+
+        let mut state = self.state.write().await;
+        state.pending.push(Handle { id: old_id, file: old_file });
+        state.active = Handle { id: next, file };
+        Ok(old_id)
     }
 }
 
 pub(crate) struct Staging {
     /// The directory segments live in.
     dir:         PathBuf,
-    /// The next unwritten offset in the active segment. A `put` reserves
-    /// its byte range by adding to this atomically, before it writes
-    /// anything, which is also what makes concurrent `put`s lock-free.
-    active_len:  AtomicU64,
-    state:       RwLock<State>,
+    /// The active segment's current length, published by the committer
+    /// after every batch it commits. Lock-free, so `Cas::put_blob` can
+    /// check it against `Flushing`'s threshold on every call without
+    /// contending with concurrent `put`s.
+    active_len:  Arc<AtomicU64>,
+    state:       Arc<RwLock<State>>,
     /// Every staged key's location, across every segment. A separate
-    /// lock from `state`, so `get`/`contains` never wait behind a
-    /// `put`'s `fsync`.
-    index:       RwLock<HashMap<Digest, Location>>,
+    /// lock from `state`, so `get`/`contains` never wait behind the
+    /// committer's `write`/`sync_data`.
+    index:       Arc<RwLock<HashMap<Digest, Location>>>,
     /// `put` refuses new writes once pending segments reach this many,
     /// so a persistently failing `flush_pending` bounds local disk usage
     /// instead of growing it without limit.
     max_pending: u16,
+    /// Where `put`/`rotate` send their requests; the committer task
+    /// holds the matching receiver for as long as any `Staging` handle
+    /// (and thus any clone of this sender) is still alive.
+    commands:    mpsc::UnboundedSender<Command>,
 }
 
 impl Staging {
@@ -228,22 +371,26 @@ impl Staging {
         let next = ids.last().map_or(Segment::FIRST, |id| id.next());
         let file = create_segment(&dir, next).await?;
 
-        Ok(Self {
-            dir,
-            active_len: AtomicU64::new(0),
-            max_pending,
-            state: RwLock::new(State { active: Handle { id: next, file }, pending }),
-            index: RwLock::new(index),
-        })
-    }
+        let active_len = Arc::new(AtomicU64::new(0));
+        let state = Arc::new(RwLock::new(State {
+            active: Handle { id: next, file: Arc::clone(&file) },
+            pending,
+        }));
+        let index = Arc::new(RwLock::new(index));
 
-    /// A view onto the active segment, for `put` to hold across its own
-    /// write.
-    async fn active(&self) -> Active<'_> {
-        let guard = self.state.read().await;
-        let id = guard.active.id;
-        let file = Arc::clone(&guard.active.file);
-        Active { guard, id, file }
+        let (commands, rx) = mpsc::unbounded_channel();
+        let committer = Committer {
+            dir: dir.clone(),
+            file,
+            segment: next,
+            offset: 0,
+            active_len: Arc::clone(&active_len),
+            state: Arc::clone(&state),
+            index: Arc::clone(&index),
+        };
+        tokio::spawn(committer.run(rx));
+
+        Ok(Self { dir, active_len, state, index, max_pending, commands })
     }
 
     /// The file for `segment`. Panics if it isn't tracked: every caller
@@ -270,38 +417,19 @@ impl Staging {
     /// at that point `flush_pending` isn't keeping up, and accepting more
     /// would grow local disk usage without bound.
     pub(crate) async fn put(&self, key: Digest, value: Bytes) -> io::Result<()> {
-        let active = self.active().await;
-        if active.pending_len() >= self.max_pending as usize {
+        let pending_len = self.state.read().await.pending.len();
+        if pending_len >= self.max_pending as usize {
             return Err(io::Error::other(format!(
-                "staging: {} segments already pending (max {})",
-                active.pending_len(),
+                "staging: {pending_len} segments already pending (max {})",
                 self.max_pending
             )));
         }
-        let segment = active.id();
-        let file = active.file();
 
-        let record = encode_record(key, &value);
-        let offset = self.active_len.fetch_add(record.len() as u64, Ordering::SeqCst);
-
-        task::spawn_blocking(move || -> io::Result<()> {
-            write_all_at(&file, &record, offset)?;
-            file.sync_all()
-        })
-        .await
-        .expect("write should not panic")?;
-
-        // Only released once the write above is durable: `rotate` takes
-        // `state` as a writer to seal the active segment, so it can't
-        // observe this segment as immutable while this `put` still holds
-        // `active`'s read guard.
-        drop(active);
-
-        self.index.write().await.insert(
-            key,
-            Location { segment, offset: offset + RECORD_HEADER_LEN, length: value.len() as u32 },
-        );
-        Ok(())
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Put(PutMsg { key, value, reply }))
+            .map_err(|_| io::Error::other("staging: committer task is gone"))?;
+        response.await.map_err(|_| io::Error::other("staging: committer task is gone"))?
     }
 
     /// Fetches the value staged under `key`, if any.
@@ -325,26 +453,20 @@ impl Staging {
         self.index.read().await.contains_key(&key)
     }
 
-    /// How many bytes the active segment currently holds. Lock-free, so
-    /// `Cas::put_blob` can check it against `Flushing`'s threshold on
-    /// every call without contending with concurrent `put`s.
+    /// How many bytes the active segment currently holds.
     pub(crate) fn active_len(&self) -> u64 {
         self.active_len.load(Ordering::Relaxed)
     }
 
     /// Closes the active segment out as a new pending segment and starts
     /// a fresh one. Returns the segment that was just closed out, for
-    /// `entries`/`finish`. Waits for every `put` already in flight
-    /// against that segment before treating it as sealed.
+    /// `entries`/`finish`.
     pub(crate) async fn rotate(&self) -> io::Result<Segment> {
-        let mut state = self.state.write().await;
-        let next = state.active.id.next();
-        let file = create_segment(&self.dir, next).await?;
-        let old = std::mem::replace(&mut state.active, Handle { id: next, file });
-        let old_id = old.id;
-        state.pending.push(old);
-        self.active_len.store(0, Ordering::Relaxed);
-        Ok(old_id)
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Rotate(RotateMsg { reply }))
+            .map_err(|_| io::Error::other("staging: committer task is gone"))?;
+        response.await.map_err(|_| io::Error::other("staging: committer task is gone"))?
     }
 
     /// Segments rotated out but not yet `finish`ed, oldest first. Covers
@@ -407,15 +529,6 @@ fn encode_record(key: Digest, value: &Bytes) -> Bytes {
 }
 
 #[cfg(unix)]
-fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
-    std::os::unix::fs::FileExt::write_at(file, buf, offset)
-}
-#[cfg(windows)]
-fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
-    std::os::windows::fs::FileExt::seek_write(file, buf, offset)
-}
-
-#[cfg(unix)]
 fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     std::os::unix::fs::FileExt::read_at(file, buf, offset)
 }
@@ -424,25 +537,10 @@ fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     std::os::windows::fs::FileExt::seek_read(file, buf, offset)
 }
 
-/// Writes `buf` to `file` starting at `offset`, retrying on a short
-/// write. Never touches a shared cursor, so this is safe to call
-/// concurrently from multiple tasks against the same `file`, as long as
-/// their `[offset, offset + buf.len())` ranges don't overlap.
-fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
-    while !buf.is_empty() {
-        let n = write_at(file, buf, offset)?;
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::WriteZero, "failed to write whole record"));
-        }
-        buf = &buf[n..];
-        offset += n as u64;
-    }
-    Ok(())
-}
-
 /// Reads exactly `buf.len()` bytes from `file` starting at `offset`,
-/// retrying on a short read. Same concurrency property as
-/// [`write_all_at`]: safe to call from multiple tasks at once.
+/// retrying on a short read. Never touches a shared cursor, so this is
+/// safe to call concurrently from multiple tasks, including while the
+/// committer is appending to the same `file` through its own cursor.
 fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
     while !buf.is_empty() {
         let n = read_at(file, buf, offset)?;
@@ -496,7 +594,7 @@ fn parse(buf: &Bytes, codec: Option<Codec>) -> (u64, Vec<(Digest, u64, u32)>) {
 async fn create_segment(dir: &Path, segment: Segment) -> io::Result<Arc<File>> {
     let std_opts = {
         let mut opts = std::fs::OpenOptions::new();
-        opts.read(true).write(true).create_new(true);
+        opts.read(true).append(true).create_new(true);
         opts
     };
     let path = segment_path(dir, segment);
