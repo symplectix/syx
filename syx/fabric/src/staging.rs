@@ -41,15 +41,15 @@
 //! (`read_at`/Windows' `seek_read`), so they never wait behind the
 //! committer's `write`/`sync_data` either.
 //!
-//! Each `index` entry carries its own segment file handle, not just a
-//! segment id to look up later, so once `put` hands one out, reading it
-//! back never depends on that segment still being tracked in `state`.
-//! `finish` evicts a segment from `index` before `state`, but the order
-//! doesn't matter for correctness either way: a `get` that already read
-//! the old `index` entry keeps working (its own `Arc<File>` clone stays
-//! valid even after the file is unlinked), and one that reads after
-//! eviction just misses cleanly, no different from the key never having
-//! been staged.
+//! Each `index` entry carries its own clone of the segment's `Handle`,
+//! rather than a segment id to look up later, so once `put` hands one
+//! out, reading it back never depends on that segment still being
+//! tracked in `state`. `finish` evicts a segment from `index` before
+//! `state`, but the order doesn't matter for correctness either way: a
+//! `get` that already read the old `index` entry keeps working (its
+//! `Handle` clone's `Arc<File>` stays valid even after the file is
+//! unlinked), and one that reads after eviction just misses cleanly, no
+//! different from the key never having been staged.
 //!
 //! A `commit` that fails partway poisons the segment it was writing to:
 //! `O_APPEND` guarantees every successful `write` lands at the file's
@@ -124,26 +124,12 @@ impl fmt::Display for Segment {
     }
 }
 
-#[derive(Clone)]
-struct Location {
-    /// Which segment the value lives in. Only `finish` needs this, to
-    /// know which entries to evict when a segment goes away; reads use
-    /// `file` directly and never need to ask `state` about it.
-    segment: Segment,
-    /// The segment's own file, captured at insert time so a read never
-    /// races a concurrent `finish` tearing that segment out of `state`.
-    file:    Arc<File>,
-    /// Byte offset of the value within `file`.
-    offset:  u64,
-    /// How many bytes the value is.
-    length:  u32,
-}
-
-/// A segment's open file, whether it's the one currently being appended
-/// to or one already rotated out. Cheap to clone (just bumps the `Arc`):
-/// the committer task is the only writer, so handing a clone to a reader
-/// costs nothing and needs no lock of its own -- positioned reads
+/// A segment's identity and open file, whether it's the one currently
+/// being appended to or one already rotated out. Cheap to clone: `id` is
+/// `Copy` and `file` is an `Arc`, so `state` and `index` can each hold
+/// their own clone with no lock of its own required -- positioned reads
 /// (`read_at`) never contend with the committer's own writes.
+#[derive(Clone)]
 struct Handle {
     id:   Segment,
     file: Arc<File>,
@@ -158,6 +144,19 @@ struct State {
     /// the active segment, so nothing removing from it needs to guard
     /// against accidentally sealing the one still being written to.
     pending: Vec<Handle>,
+}
+
+#[derive(Clone)]
+struct Location {
+    /// The segment the value lives in and its file, cloned from
+    /// `state`'s own `Handle` at insert time. Reading through this never
+    /// needs to ask `state` about it, so a read never races a concurrent
+    /// `finish` tearing the segment out.
+    handle: Handle,
+    /// Byte offset of the value within `handle.file`.
+    offset: u64,
+    /// How many bytes the value is.
+    length: u32,
 }
 
 /// One `put` waiting on the committer.
@@ -189,8 +188,8 @@ enum Command {
 /// each paying for its own (see the module doc's "Concurrency" section).
 struct Committer {
     dir:        PathBuf,
-    file:       Arc<File>,
-    segment:    Segment,
+    /// The active segment.
+    handle:     Handle,
     /// The next unwritten offset in the active segment. Only the
     /// committer itself ever advances this; `Staging::active_len` reads
     /// the published copy in `active_len` instead.
@@ -226,6 +225,11 @@ impl Committer {
                     let _ = msg.reply.send(result);
                 }
                 Command::Put(first) => {
+                    // `try_recv` only grabs what's already queued, right
+                    // now -- there's no deliberate delay to let more
+                    // arrive, so the same burst of concurrent `put`s can
+                    // land in one commit or several depending on
+                    // scheduling.
                     let mut batch = vec![first];
                     loop {
                         match commands.try_recv() {
@@ -258,15 +262,14 @@ impl Committer {
             offset += record.len() as u64;
             buf.extend_from_slice(&record);
             locations.push(Location {
-                segment: self.segment,
-                file:    Arc::clone(&self.file),
-                offset:  value_offset,
-                length:  msg.value.len() as u32,
+                handle: self.handle.clone(),
+                offset: value_offset,
+                length: msg.value.len() as u32,
             });
         }
         let buf = buf.freeze();
 
-        let file = Arc::clone(&self.file);
+        let file = Arc::clone(&self.handle.file);
         let result = task::spawn_blocking(move || -> io::Result<()> {
             let mut w = &*file;
             w.write_all(&buf)?;
@@ -305,11 +308,11 @@ impl Committer {
     /// free: both run inside the same single-consumer loop, so a
     /// `Rotate` can never jump ahead of `Put`s that were sent first.
     async fn rotate(&mut self) -> io::Result<Segment> {
-        let old_id = self.segment;
-        let old_file = Arc::clone(&self.file);
+        let old = self.handle.clone();
         self.start_fresh_segment().await?;
 
-        self.state.write().await.pending.push(Handle { id: old_id, file: old_file });
+        let old_id = old.id;
+        self.state.write().await.pending.push(old);
         Ok(old_id)
     }
 
@@ -322,21 +325,19 @@ impl Committer {
     /// and the next `open` will find and replay it like any other
     /// segment left over from a previous run.
     async fn poison(&mut self) -> io::Result<()> {
-        let old_id = self.segment;
+        let old_id = self.handle.id;
         self.start_fresh_segment().await?;
 
         let path = segment_path(&self.dir, old_id);
         if let Some((file, records)) = revalidate_segment(&path, Some(self.codec)).await? {
+            let handle = Handle { id: old_id, file };
             {
                 let mut index = self.index.write().await;
                 for (key, offset, length) in records {
-                    index.insert(
-                        key,
-                        Location { segment: old_id, file: Arc::clone(&file), offset, length },
-                    );
+                    index.insert(key, Location { handle: handle.clone(), offset, length });
                 }
             }
-            self.state.write().await.pending.push(Handle { id: old_id, file });
+            self.state.write().await.pending.push(handle);
         }
         Ok(())
     }
@@ -345,15 +346,15 @@ impl Committer {
     /// for whatever segment was active before -- callers decide what,
     /// if anything, becomes visible for it.
     async fn start_fresh_segment(&mut self) -> io::Result<()> {
-        let next = self.segment.next();
+        let next = self.handle.id.next();
         let file = create_segment(&self.dir, next).await?;
+        let handle = Handle { id: next, file };
 
-        self.segment = next;
         self.offset = 0;
         self.active_len.store(0, Ordering::Relaxed);
-        self.file = Arc::clone(&file);
+        self.handle = handle.clone();
 
-        self.state.write().await.active = Handle { id: next, file };
+        self.state.write().await.active = handle;
         Ok(())
     }
 }
@@ -371,8 +372,8 @@ pub(crate) struct Staging {
     /// Every staged key's location, across every segment. A separate
     /// lock from `state`, so `get`/`contains` never wait behind the
     /// committer's `write`/`sync_data` -- and self-sufficient (each
-    /// entry carries its own file handle), so `get` never needs `state`
-    /// at all.
+    /// entry carries its own clone of its segment's `Handle`), so `get`
+    /// never needs `state` at all.
     index:       Arc<RwLock<HashMap<Digest, Location>>>,
     /// `put` refuses new writes once pending segments reach this many,
     /// so a persistently failing `flush_pending` bounds local disk usage
@@ -422,27 +423,25 @@ impl Staging {
             let Some((file, records)) = revalidate_segment(&path, verify).await? else {
                 continue;
             };
+            let handle = Handle { id: segment, file };
             for (key, offset, length) in records {
-                index.insert(key, Location { segment, file: Arc::clone(&file), offset, length });
+                index.insert(key, Location { handle: handle.clone(), offset, length });
             }
-            pending.push(Handle { id: segment, file });
+            pending.push(handle);
         }
 
         let next = ids.last().map_or(Segment::FIRST, |id| id.next());
         let file = create_segment(&dir, next).await?;
+        let handle = Handle { id: next, file };
 
         let active_len = Arc::new(AtomicU64::new(0));
-        let state = Arc::new(RwLock::new(State {
-            active: Handle { id: next, file: Arc::clone(&file) },
-            pending,
-        }));
+        let state = Arc::new(RwLock::new(State { active: handle.clone(), pending }));
         let index = Arc::new(RwLock::new(index));
 
         let (commands, rx) = mpsc::unbounded_channel();
         let committer = Committer {
             dir: dir.clone(),
-            file,
-            segment: next,
+            handle,
             offset: 0,
             codec,
             active_len: Arc::clone(&active_len),
@@ -458,8 +457,8 @@ impl Staging {
     /// caller (`entries`) only ever asks for one it already knows must
     /// still be open, from `pending_segments`/`rotate`'s own return
     /// value. `get` doesn't call this -- its `Location`s carry their own
-    /// file handle, so a read never needs to ask `state` about a segment
-    /// at all.
+    /// `Handle` clone, so a read never needs to ask `state` about a
+    /// segment at all.
     async fn find(&self, segment: Segment) -> Arc<File> {
         let state = self.state.read().await;
         if state.active.id == segment {
@@ -505,7 +504,7 @@ impl Staging {
         };
         let mut buf = vec![0u8; location.length as usize];
         task::spawn_blocking(move || -> io::Result<Vec<u8>> {
-            read_exact_at(&location.file, &mut buf, location.offset)?;
+            read_exact_at(&location.handle.file, &mut buf, location.offset)?;
             Ok(buf)
         })
         .await
@@ -576,7 +575,7 @@ impl Staging {
     /// structurally can't hold that one, so there's nothing to guard
     /// against here.
     pub(crate) async fn finish(&self, segment: Segment) -> io::Result<()> {
-        self.index.write().await.retain(|_, location| location.segment != segment);
+        self.index.write().await.retain(|_, location| location.handle.id != segment);
         self.state.write().await.pending.retain(|handle| handle.id != segment);
         fs::remove_file(self.segment_path(segment)).await
     }

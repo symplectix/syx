@@ -349,6 +349,11 @@ impl<'a> Cas<'a> {
             return Ok(());
         };
 
+        // The one deliberate exception to flushing staying off the write
+        // path: once it's failed this many times in a row, run it inline
+        // and propagate its error instead of spawning another background
+        // attempt, so a persistently broken flush surfaces to callers
+        // rather than growing `staging` unboundedly in silence.
         if self.flushing.failures() >= Self::MAX_CONSECUTIVE_FLUSH_FAILURES {
             return flush_pending(
                 self.db,
