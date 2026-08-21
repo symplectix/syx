@@ -57,6 +57,10 @@ use content_addressing::{
     ToBytes,
 };
 use futures::StreamExt as _;
+use futures::stream::{
+    self,
+    FuturesUnordered,
+};
 use object_store::path::Path;
 use object_store::{
     GetOptions,
@@ -235,6 +239,15 @@ impl<'a> Cas<'a> {
     /// before switching from running it in the background to waiting on
     /// it and propagating its error.
     const MAX_CONSECUTIVE_FLUSH_FAILURES: u32 = 3;
+
+    /// How many chunks `copy_from`/`read_into` keep in flight at once.
+    /// A large blob's chunks would otherwise be staged or fetched one at
+    /// a time, each fully awaited before the next starts: group commit
+    /// only batches writes that happen to be in flight together, so a
+    /// single caller awaiting its own chunks serially never benefits
+    /// from it. Bounded rather than unbounded, since each in-flight
+    /// chunk holds up to `Chunking::MAX_SIZE` bytes in memory.
+    const MAX_CONCURRENT_CHUNKS: usize = 8;
 
     /// Only `Graph::cas()` calls this.
     pub(crate) fn new(
@@ -451,8 +464,20 @@ impl<'a> Cas<'a> {
             return Err(invalid_data("chunks digest mismatch"));
         }
 
-        for chunk in chunks {
-            let Some((chunk_flags, bytes)) = self.load(&chunk.digest).await? else {
+        // Loads run up to `MAX_CONCURRENT_CHUNKS` ahead of the writer, so
+        // fetching one chunk overlaps with writing out the previous one.
+        // `buffered` (not `buffer_unordered`) keeps results in the original
+        // chunk order, which `w` needs.
+        let cas = *self;
+        let mut loads = stream::iter(chunks)
+            .map(move |chunk| async move {
+                let result = cas.load(&chunk.digest).await;
+                (chunk, result)
+            })
+            .buffered(Self::MAX_CONCURRENT_CHUNKS);
+
+        while let Some((chunk, result)) = loads.next().await {
+            let Some((chunk_flags, bytes)) = result? else {
                 return Err(invalid_data(format!("missing chunk {:x}", chunk.digest)));
             };
             if chunk_flags.contains(ContentFlags::CHUNKED) {
@@ -482,6 +507,17 @@ impl<'a> Cas<'a> {
         let mut chunks_bytes = Vec::new();
         let mut last_chunk_digest = None;
         let mut total: u64 = 0;
+
+        // `save`s run up to `MAX_CONCURRENT_CHUNKS` at a time instead of
+        // one at a time: chunking itself has to stay sequential (each
+        // chunk's boundary depends on a rolling hash over what came
+        // before it), but staging a chunk doesn't need to block finding
+        // the next one. This is also what lets group commit batch this
+        // call's own chunks together, which it otherwise never would --
+        // batching only happens across whatever's in flight at once, and
+        // a caller that awaits each of its own writes serially never has
+        // more than one in flight.
+        let mut saves = FuturesUnordered::new();
         while let Some(chunk) = chunks.next().await {
             let chunk = chunk?;
             total += chunk.length as u64;
@@ -490,7 +526,20 @@ impl<'a> Cas<'a> {
             chunks_bytes.put_u32(chunk.length as u32);
             chunks_hasher.part(digest.as_ref());
             last_chunk_digest = Some(digest);
-            self.save(digest, ContentFlags::empty(), chunk.data).await?;
+
+            // Keep at most `MAX_CONCURRENT_CHUNKS` in flight: wait for
+            // whichever finishes first before adding another, rather
+            // than capping how many chunks get read ahead.
+            if saves.len() >= Self::MAX_CONCURRENT_CHUNKS {
+                saves.next().await.expect("just checked saves is non-empty")?;
+            }
+            saves.push(self.save(digest, ContentFlags::empty(), chunk.data));
+        }
+        // Chunking is done, but up to `MAX_CONCURRENT_CHUNKS` saves from
+        // the last iterations are still in flight and were never waited
+        // on above.
+        while let Some(result) = saves.next().await {
+            result?;
         }
 
         if total != len {
