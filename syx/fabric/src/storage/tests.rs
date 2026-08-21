@@ -52,7 +52,7 @@ impl Env {
     }
 
     async fn new(blobs_backend: Arc<dyn ObjectStore>) -> Self {
-        Self::with_threshold(blobs_backend, DEFAULT_PACKS_THRESHOLD).await
+        Self::with_threshold(blobs_backend, DEFAULT_FLUSH_THRESHOLD).await
     }
 
     fn cas(&self) -> Cas<'_> {

@@ -95,17 +95,17 @@ pub(crate) const DEFAULT_DB_PREFIX: &str = "";
 /// solely for this `Graph`'s own blob storage.
 pub(crate) const DEFAULT_CAS_PREFIX: &str = "cas/";
 
-/// The default `packs_threshold`, 32 MiB, enough to consolidate several
+/// The default `flush_threshold`, 32 MiB, enough to consolidate several
 /// dozen chunks per pack.
-pub(crate) const DEFAULT_PACKS_THRESHOLD: u64 = Chunking::AVG_SIZE as u64 * 64;
+pub(crate) const DEFAULT_FLUSH_THRESHOLD: u64 = Chunking::AVG_SIZE as u64 * 64;
 
 /// The default `max_staging_duration`: bounds how long a blob can stay
 /// invisible to every other reader of `Graph` even when write volume
-/// never crosses `packs_threshold` on its own.
+/// never crosses `flush_threshold` on its own.
 pub(crate) const DEFAULT_MAX_STAGING_DURATION: Duration = Duration::from_secs(30);
 
 /// The default `max_pending_segments`: bounds `staging`'s local disk
-/// usage, at this default roughly `16 * packs_threshold`, to a finite
+/// usage, at this default roughly `16 * flush_threshold`, to a finite
 /// amount even if `flush_pending` fails indefinitely.
 pub(crate) const DEFAULT_MAX_PENDING_SEGMENTS: u16 = 16;
 

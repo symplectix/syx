@@ -36,7 +36,7 @@ pub struct Builder {
 
     // blobs
     blobs_backend:   Option<Arc<dyn ObjectStore>>,
-    packs_threshold: Option<u64>,
+    flush_threshold: Option<u64>,
 
     // content addressing
     cas_prefix: Option<String>,
@@ -53,7 +53,7 @@ impl Builder {
             db_prefix: None,
             db_backend: None,
             blobs_backend: None,
-            packs_threshold: None,
+            flush_threshold: None,
             cas_prefix: None,
             chunking: None,
             codec: None,
@@ -61,7 +61,7 @@ impl Builder {
     }
 
     /// How long to let a blob sit staged, unpacked, before consolidating
-    /// regardless of `packs_threshold`. Bounds how long staged content
+    /// regardless of `flush_threshold`. Bounds how long staged content
     /// stays invisible to every other reader of this `Graph`.
     pub fn max_staging_duration(mut self, max_staging_duration: Duration) -> Self {
         self.max_staging_duration = Some(max_staging_duration);
@@ -100,8 +100,8 @@ impl Builder {
     }
 
     /// How many bytes to stage before consolidating into a pack.
-    pub fn packs_threshold(mut self, packs_threshold: u64) -> Self {
-        self.packs_threshold = Some(packs_threshold);
+    pub fn flush_threshold(mut self, flush_threshold: u64) -> Self {
+        self.flush_threshold = Some(flush_threshold);
         self
     }
 
@@ -145,7 +145,7 @@ impl Builder {
             db_prefix,
             db_backend,
             blobs_backend,
-            packs_threshold,
+            flush_threshold,
             cas_prefix,
             chunking,
             codec,
@@ -174,14 +174,14 @@ impl Builder {
         );
 
         let blobs = blobs_backend.unwrap_or_else(|| db_backend.clone());
-        let packs_threshold = packs_threshold.unwrap_or(storage::DEFAULT_PACKS_THRESHOLD);
+        let flush_threshold = flush_threshold.unwrap_or(storage::DEFAULT_FLUSH_THRESHOLD);
         let max_staging_duration =
             max_staging_duration.unwrap_or(storage::DEFAULT_MAX_STAGING_DURATION);
         let chunking = chunking.unwrap_or_default();
         let cas_prefix: Arc<str> =
             Arc::from(cas_prefix.unwrap_or_else(|| storage::DEFAULT_CAS_PREFIX.to_string()));
 
-        let flushing = storage::Flushing::new(packs_threshold, max_staging_duration);
+        let flushing = storage::Flushing::new(flush_threshold, max_staging_duration);
         Ok(Graph::new(staging, db, blobs, flushing, cas_prefix, chunking, codec))
     }
 }

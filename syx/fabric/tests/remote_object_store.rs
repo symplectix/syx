@@ -26,7 +26,7 @@ const BUCKET: &str = "cas-test";
 /// pack objects directly.
 async fn s3_graph(
     s3_server: &s3::Server,
-    packs_threshold: u64,
+    flush_threshold: u64,
 ) -> (fabric::Graph, Arc<dyn ObjectStore>) {
     // A region is required by both clients below, but this server
     // doesn't validate it. "us-east-1" is just a conventional value.
@@ -71,7 +71,7 @@ async fn s3_graph(
         .db_prefix("test")
         .db_backend(db_backend)
         .blobs(remote.clone())
-        .packs_threshold(packs_threshold)
+        .flush_threshold(flush_threshold)
         .build()
         .await
         .unwrap();
@@ -98,7 +98,7 @@ async fn crossing_the_threshold_eventually_flushes_and_stays_readable() {
     // Small enough that a single chunk's write crosses the threshold.
     let (graph, remote) = s3_graph(&s3_server, 8).await;
 
-    // Crossing `packs_threshold` triggers `flush_pending` in the
+    // Crossing `flush_threshold` triggers `flush_pending` in the
     // background rather than waiting on it, so the pack shows up on
     // `remote` at some point after this returns, not necessarily before
     // it does. Content stays readable throughout either way, since `get`
