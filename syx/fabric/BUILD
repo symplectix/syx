@@ -19,6 +19,7 @@ rust.library(
         "@crates//:bytes",
         "@crates//:cbor2",
         "@crates//:futures",
+        "@crates//:memmap2",
         "@crates//:object_store",
         "@crates//:serde",
         "@crates//:slatedb",

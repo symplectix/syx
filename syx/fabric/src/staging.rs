@@ -41,15 +41,22 @@
 //! (`read_at`/Windows' `seek_read`), so they never wait behind the
 //! committer's `write`/`sync_data` either.
 //!
-//! Each `index` entry carries its own clone of the segment's `Handle`,
-//! rather than a segment id to look up later, so once `put` hands one
-//! out, reading it back never depends on that segment still being
-//! tracked in `state`. `finish` evicts a segment from `index` before
-//! `state`, but the order doesn't matter for correctness either way: a
-//! `get` that already read the old `index` entry keeps working (its
-//! `Handle` clone's `Arc<File>` stays valid even after the file is
+//! Each `index` entry carries its own clone of the `Segment` it lives in,
+//! rather than just an id to look up later, so once `put` hands one out,
+//! reading it back never depends on that segment still being tracked in
+//! `state`. `finish` evicts a segment from `index` before `state`, but
+//! the order doesn't matter for correctness either way: a `get` that
+//! already read the old `index` entry keeps working (its `Segment`
+//! clone's `File` stays valid even after the underlying path is
 //! unlinked), and one that reads after eviction just misses cleanly, no
 //! different from the key never having been staged.
+//!
+//! `get` starts out reading via `read_at`, the same as while the segment
+//! is still active, but switches to slicing a mapped view once one
+//! exists (see `Segment`'s `mmap` field) -- established once, by `seal`,
+//! at the moment a segment is sealed into `pending`, and from then on
+//! shared by every clone of that `Segment` value, including ones `index`
+//! already held from before sealing happened.
 //!
 //! A `commit` that fails partway poisons the segment it was writing to:
 //! `O_APPEND` guarantees every successful `write` lands at the file's
@@ -64,16 +71,18 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::fs::File;
 use std::io::Write as _;
 use std::path::{
     Path,
     PathBuf,
 };
-use std::sync::Arc;
 use std::sync::atomic::{
     AtomicU64,
     Ordering,
+};
+use std::sync::{
+    Arc,
+    OnceLock,
 };
 use std::{
     fmt,
@@ -108,55 +117,221 @@ mod tests;
 /// while it's the active one; once rotated out it never changes again
 /// until `finish` deletes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Segment(u64);
+pub(crate) struct FileId(u64);
 
-impl Segment {
-    const FIRST: Segment = Segment(0);
+impl FileId {
+    const FIRST: FileId = FileId(0);
 
-    fn next(self) -> Segment {
-        Segment(self.0 + 1)
+    fn next(self) -> FileId {
+        FileId(self.0 + 1)
     }
 }
 
-impl fmt::Display for Segment {
+impl fmt::Display for FileId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:020}", self.0)
     }
 }
 
+/// A segment's open file. Wraps `std::fs::File` behind position-
+/// independent operations only: `read_at` for concurrent reads, `append`
+/// for the one writer (relying on `O_APPEND`, so it never needs, or
+/// risks, an explicit seek), and `mmap` for a one-time whole-file
+/// mapping. The raw file's own `Read`/`Write`/`Seek` API shares a
+/// cursor and isn't safe to use this way, so it's never exposed -- this
+/// is the only thing in the module that ever touches `std::fs::File`
+/// directly. Cheap to clone: just bumps the `Arc`, so `Segment`s can
+/// share one without a lock of their own.
+#[derive(Clone)]
+struct File(Arc<std::fs::File>);
+
+impl File {
+    /// Creates a brand new segment file: readable and appendable, and
+    /// failing if `path` already exists (a segment id is only ever used
+    /// once).
+    async fn create(path: PathBuf) -> io::Result<Self> {
+        task::spawn_blocking(move || {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(true).append(true).create_new(true);
+            opts.open(path).map(Arc::new).map(File)
+        })
+        .await
+        .expect("open should not panic")
+    }
+
+    /// Opens an existing segment file read-only, for one `Staging::open`
+    /// found already on disk left over from a previous run.
+    async fn open(path: PathBuf) -> io::Result<Self> {
+        task::spawn_blocking(move || std::fs::File::open(path).map(Arc::new).map(File))
+            .await
+            .expect("open should not panic")
+    }
+
+    /// Appends `buf` and durably syncs it. The sole writer's job:
+    /// `O_APPEND` (see `create`) guarantees this lands at the file's
+    /// true end, with no seek of its own to race a reader's `read_at`.
+    async fn append(&self, buf: Bytes) -> io::Result<()> {
+        let file = Arc::clone(&self.0);
+        task::spawn_blocking(move || -> io::Result<()> {
+            let mut w = &*file;
+            w.write_all(&buf)?;
+            file.sync_data()
+        })
+        .await
+        .expect("write should not panic")
+    }
+
+    /// Reads exactly `length` bytes at `offset`. Safe to call
+    /// concurrently, including while another clone's `append` is
+    /// running against the same underlying file: `pread` never touches
+    /// a shared cursor.
+    async fn read_at(&self, offset: u64, length: u32) -> io::Result<Bytes> {
+        let file = Arc::clone(&self.0);
+        let mut buf = vec![0u8; length as usize];
+        task::spawn_blocking(move || -> io::Result<Vec<u8>> {
+            read_exact_at(&file, &mut buf, offset)?;
+            Ok(buf)
+        })
+        .await
+        .expect("read should not panic")
+        .map(Bytes::from)
+    }
+
+    /// Maps the whole file read-only. Unlike this type's other
+    /// operations, not blocking I/O worth moving off the calling task:
+    /// `mmap(2)` only sets up the mapping, faulting pages in lazily as
+    /// they're actually read, rather than reading the file itself.
+    fn mmap(&self) -> io::Result<Bytes> {
+        // Safety: only ever called on a segment that's already fully
+        // and durably written and sealed into `pending` -- nothing
+        // writes to it again from this point on (see the module doc).
+        unsafe { memmap2::Mmap::map(&*self.0) }.map(Bytes::from_owner)
+    }
+}
+
 /// A segment's identity and open file, whether it's the one currently
 /// being appended to or one already rotated out. Cheap to clone: `id` is
-/// `Copy` and `file` is an `Arc`, so `state` and `index` can each hold
-/// their own clone with no lock of its own required -- positioned reads
-/// (`read_at`) never contend with the committer's own writes.
+/// `Copy` and `file`/`mmap` each wrap an `Arc`, so `state` and `index`
+/// can each hold their own clone with no lock of its own required.
+///
+/// Every clone of a given `Segment` value -- the one `state` tracks, and
+/// the one each `Location` written while it was active captured for
+/// itself -- shares the same `mmap` cell. `seal` fills it in exactly
+/// once, when the segment is sealed into `pending`, and that update is
+/// then visible through every clone already out there, including
+/// `Location`s inserted before sealing ever happened: nothing needs to
+/// go back and update `index` itself.
 #[derive(Clone)]
-struct Handle {
-    id:   Segment,
-    file: Arc<File>,
+struct Segment {
+    id:   FileId,
+    /// This segment's open file. Every read goes through here (`read_at`)
+    /// until `mmap` is established; `mmap` itself, once sealing calls for
+    /// it, maps this same file. While this is the active segment, it's
+    /// also the one handle `Committer` appends through.
+    file: File,
+    /// A read-only, zero-copy view of this whole segment. Empty for the
+    /// active segment, which is never memory-mapped while still being
+    /// written; filled in once the segment is sealed into `pending`,
+    /// since from that point on it's never written to again. `get`
+    /// falls back to `read_at` when it's empty; `entries` maps the file
+    /// itself and fills it in.
+    mmap: Mmap,
+}
+
+/// A segment's whole-file mmap, established at most once and shared by
+/// every clone of the `Segment` it came from -- see `Segment`'s own doc.
+#[derive(Clone, Default)]
+struct Mmap(Arc<OnceLock<Bytes>>);
+
+impl Segment {
+    /// Reads `length` bytes at `offset`: sliced zero-copy from the
+    /// mapping if one's been established, or via a positioned read
+    /// against `file` if it isn't (not yet sealed, or sealing failed).
+    /// `Segment` is the only thing that ever reads `file` directly for
+    /// an actual read -- it owns both `file` and `mmap`, so it's the
+    /// one place that can decide between them without either being
+    /// passed around on its own.
+    async fn read(&self, offset: u64, length: u32) -> io::Result<Bytes> {
+        // `mmap.read_at`, not `seal`: this might still be the active
+        // segment (still being written to), and mapping that one is
+        // exactly what `seal` must never do -- only a sealed segment's
+        // `mmap` is safe to establish on demand.
+        if let Some(bytes) = self.mmap.read_at(offset, length) {
+            return Ok(bytes);
+        }
+        self.file.read_at(offset, length).await
+    }
+
+    /// Establishes this segment's whole-file mapping, for a segment
+    /// that's about to become (or already is) pending: from this point
+    /// it's never written to again (see the module doc), so mapping it
+    /// is safe. Idempotent, and, because `mmap` is shared, this update
+    /// is visible through every clone of this `Segment` value already
+    /// out there, including `Location`s `index` held from before
+    /// sealing happened -- nothing needs to go back and update `index`
+    /// itself.
+    fn seal(&self) -> io::Result<Bytes> {
+        self.mmap.get_or_map(&self.file)
+    }
+}
+
+impl Mmap {
+    /// The mapping, if it's been established already. Never maps the
+    /// file itself: callers that only want to peek (`read_at`, happy to
+    /// fall back to `File::read_at` on a miss) shouldn't pay for
+    /// mapping a whole segment just to read one small value from it.
+    fn get(&self) -> Option<Bytes> {
+        self.0.get().cloned()
+    }
+
+    /// Reads `length` bytes at `offset`, sliced zero-copy from the
+    /// mapping -- if one's been established. `None`, not an error, if
+    /// it hasn't: unlike `File::read_at`, there's nothing to actually
+    /// read here, just an in-memory slice of what's already there.
+    fn read_at(&self, offset: u64, length: u32) -> Option<Bytes> {
+        let bytes = self.get()?;
+        let start = offset as usize;
+        Some(bytes.slice(start..start + length as usize))
+    }
+
+    /// The mapping, establishing it first if it isn't there yet.
+    /// Idempotent: a mapping already established by another caller (or
+    /// concurrently by this one losing a race) is reused as-is.
+    fn get_or_map(&self, file: &File) -> io::Result<Bytes> {
+        if let Some(bytes) = self.get() {
+            return Ok(bytes);
+        }
+        let bytes = file.mmap()?;
+        // If another caller (or `seal`) won the race and already set
+        // this, keep their copy rather than ours -- either is a valid
+        // mapping of the same bytes, but `get` should always return the
+        // one every other reader is also seeing.
+        Ok(self.0.get_or_init(|| bytes.clone()).clone())
+    }
 }
 
 /// Which segment is active and which are pending. Plain data, other than
 /// the committer's own writes (see `Committer::rotate`), nothing mutates
 /// this; readers just take a shared lock.
 struct State {
-    active:  Handle,
+    active:  Segment,
     /// Rotated out, not yet `finish`ed. Structurally can never contain
     /// the active segment, so nothing removing from it needs to guard
     /// against accidentally sealing the one still being written to.
-    pending: Vec<Handle>,
+    pending: Vec<Segment>,
 }
 
 #[derive(Clone)]
 struct Location {
-    /// The segment the value lives in and its file, cloned from
-    /// `state`'s own `Handle` at insert time. Reading through this never
-    /// needs to ask `state` about it, so a read never races a concurrent
+    /// The segment the value lives in, cloned from `state`'s own
+    /// `Segment` value at insert time. Reading through this never needs
+    /// to ask `state` about it, so a read never races a concurrent
     /// `finish` tearing the segment out.
-    handle: Handle,
-    /// Byte offset of the value within `handle.file`.
-    offset: u64,
+    segment: Segment,
+    /// Byte offset of the value within `segment.file`.
+    offset:  u64,
     /// How many bytes the value is.
-    length: u32,
+    length:  u32,
 }
 
 /// One `put` waiting on the committer.
@@ -172,7 +347,7 @@ struct PutMsg {
 
 /// One `rotate` waiting on the committer.
 struct RotateMsg {
-    reply: oneshot::Sender<io::Result<Segment>>,
+    reply: oneshot::Sender<io::Result<FileId>>,
 }
 
 /// A request handed to the committer task over its `commands` channel.
@@ -189,7 +364,7 @@ enum Command {
 struct Committer {
     dir:        PathBuf,
     /// The active segment.
-    handle:     Handle,
+    segment:    Segment,
     /// The next unwritten offset in the active segment. Only the
     /// committer itself ever advances this; `Staging::active_len` reads
     /// the published copy in `active_len` instead.
@@ -211,6 +386,13 @@ impl Committer {
         // in the segment it's about to seal.
         let mut carried: Option<Command> = None;
         loop {
+            // Each iteration handles exactly one `Command`: a `Rotate`
+            // runs by itself, a `Put` drains whatever else is already
+            // queued into one batch and commits all of it together
+            // (below). `carried` is checked before the channel every
+            // time, so a `Rotate` peeked ahead of its turn during a
+            // drain still runs before anything new is pulled off the
+            // channel -- send order holds without a lock to enforce it.
             let command = match carried.take() {
                 Some(command) => command,
                 None => match commands.recv().await {
@@ -229,7 +411,10 @@ impl Committer {
                     // now -- there's no deliberate delay to let more
                     // arrive, so the same burst of concurrent `put`s can
                     // land in one commit or several depending on
-                    // scheduling.
+                    // scheduling. That's fine: under sustained load the
+                    // next commit's own write keeps the queue filling
+                    // while this one runs, so batches converge on their
+                    // own without ever adding latency to wait for one.
                     let mut batch = vec![first];
                     loop {
                         match commands.try_recv() {
@@ -262,21 +447,12 @@ impl Committer {
             offset += record.len() as u64;
             buf.extend_from_slice(&record);
             locations.push(Location {
-                handle: self.handle.clone(),
-                offset: value_offset,
-                length: msg.value.len() as u32,
+                segment: self.segment.clone(),
+                offset:  value_offset,
+                length:  msg.value.len() as u32,
             });
         }
-        let buf = buf.freeze();
-
-        let file = Arc::clone(&self.handle.file);
-        let result = task::spawn_blocking(move || -> io::Result<()> {
-            let mut w = &*file;
-            w.write_all(&buf)?;
-            file.sync_data()
-        })
-        .await
-        .expect("write should not panic");
+        let result = self.segment.file.append(buf.freeze()).await;
 
         match result {
             Ok(()) => {
@@ -307,11 +483,12 @@ impl Committer {
     /// fresh active segment. Correctly ordered against `commit` for
     /// free: both run inside the same single-consumer loop, so a
     /// `Rotate` can never jump ahead of `Put`s that were sent first.
-    async fn rotate(&mut self) -> io::Result<Segment> {
-        let old = self.handle.clone();
+    async fn rotate(&mut self) -> io::Result<FileId> {
+        let old = self.segment.clone();
         self.start_fresh_segment().await?;
 
         let old_id = old.id;
+        let _ = old.seal();
         self.state.write().await.pending.push(old);
         Ok(old_id)
     }
@@ -325,19 +502,20 @@ impl Committer {
     /// and the next `open` will find and replay it like any other
     /// segment left over from a previous run.
     async fn poison(&mut self) -> io::Result<()> {
-        let old_id = self.handle.id;
+        let old_id = self.segment.id;
         self.start_fresh_segment().await?;
 
         let path = segment_path(&self.dir, old_id);
         if let Some((file, records)) = revalidate_segment(&path, Some(self.codec)).await? {
-            let handle = Handle { id: old_id, file };
+            let segment = Segment { id: old_id, file, mmap: Mmap::default() };
+            let _ = segment.seal();
             {
                 let mut index = self.index.write().await;
                 for (key, offset, length) in records {
-                    index.insert(key, Location { handle: handle.clone(), offset, length });
+                    index.insert(key, Location { segment: segment.clone(), offset, length });
                 }
             }
-            self.state.write().await.pending.push(handle);
+            self.state.write().await.pending.push(segment);
         }
         Ok(())
     }
@@ -346,15 +524,15 @@ impl Committer {
     /// for whatever segment was active before -- callers decide what,
     /// if anything, becomes visible for it.
     async fn start_fresh_segment(&mut self) -> io::Result<()> {
-        let next = self.handle.id.next();
-        let file = create_segment(&self.dir, next).await?;
-        let handle = Handle { id: next, file };
+        let next = self.segment.id.next();
+        let file = File::create(segment_path(&self.dir, next)).await?;
+        let segment = Segment { id: next, file, mmap: Mmap::default() };
 
         self.offset = 0;
         self.active_len.store(0, Ordering::Relaxed);
-        self.handle = handle.clone();
+        self.segment = segment.clone();
 
-        self.state.write().await.active = handle;
+        self.state.write().await.active = segment;
         Ok(())
     }
 }
@@ -372,8 +550,8 @@ pub(crate) struct Staging {
     /// Every staged key's location, across every segment. A separate
     /// lock from `state`, so `get`/`contains` never wait behind the
     /// committer's `write`/`sync_data` -- and self-sufficient (each
-    /// entry carries its own clone of its segment's `Handle`), so `get`
-    /// never needs `state` at all.
+    /// entry carries its own clone of the `Segment` it lives in), so
+    /// `get` never needs `state` at all.
     index:       Arc<RwLock<HashMap<Digest, Location>>>,
     /// `put` refuses new writes once pending segments reach this many,
     /// so a persistently failing `flush_pending` bounds local disk usage
@@ -413,8 +591,8 @@ impl Staging {
 
         let mut index = HashMap::new();
         let mut pending = Vec::new();
-        for (i, &segment) in ids.iter().enumerate() {
-            let path = segment_path(&dir, segment);
+        for (i, &id) in ids.iter().enumerate() {
+            let path = segment_path(&dir, id);
             // Every earlier file was already durable before this
             // process ever rotated past it; only the one that could
             // have been active when the previous run stopped needs
@@ -423,25 +601,26 @@ impl Staging {
             let Some((file, records)) = revalidate_segment(&path, verify).await? else {
                 continue;
             };
-            let handle = Handle { id: segment, file };
+            let segment = Segment { id, file, mmap: Mmap::default() };
+            let _ = segment.seal();
             for (key, offset, length) in records {
-                index.insert(key, Location { handle: handle.clone(), offset, length });
+                index.insert(key, Location { segment: segment.clone(), offset, length });
             }
-            pending.push(handle);
+            pending.push(segment);
         }
 
-        let next = ids.last().map_or(Segment::FIRST, |id| id.next());
-        let file = create_segment(&dir, next).await?;
-        let handle = Handle { id: next, file };
+        let next = ids.last().map_or(FileId::FIRST, |id| id.next());
+        let file = File::create(segment_path(&dir, next)).await?;
+        let segment = Segment { id: next, file, mmap: Mmap::default() };
 
         let active_len = Arc::new(AtomicU64::new(0));
-        let state = Arc::new(RwLock::new(State { active: handle.clone(), pending }));
+        let state = Arc::new(RwLock::new(State { active: segment.clone(), pending }));
         let index = Arc::new(RwLock::new(index));
 
         let (commands, rx) = mpsc::unbounded_channel();
         let committer = Committer {
             dir: dir.clone(),
-            handle,
+            segment,
             offset: 0,
             codec,
             active_len: Arc::clone(&active_len),
@@ -453,23 +632,23 @@ impl Staging {
         Ok(Self { dir, active_len, state, index, max_pending, commands })
     }
 
-    /// The file for `segment`. Panics if it isn't tracked: its only
+    /// The `Segment` for `id`. Panics if it isn't tracked: its only
     /// caller (`entries`) only ever asks for one it already knows must
     /// still be open, from `pending_segments`/`rotate`'s own return
     /// value. `get` doesn't call this -- its `Location`s carry their own
-    /// `Handle` clone, so a read never needs to ask `state` about a
+    /// `Segment` clone, so a read never needs to ask `state` about a
     /// segment at all.
-    async fn find(&self, segment: Segment) -> Arc<File> {
+    async fn find(&self, id: FileId) -> Segment {
         let state = self.state.read().await;
-        if state.active.id == segment {
-            return Arc::clone(&state.active.file);
+        if state.active.id == id {
+            return state.active.clone();
         }
         state
             .pending
             .iter()
-            .find(|handle| handle.id == segment)
-            .map(|handle| Arc::clone(&handle.file))
-            .unwrap_or_else(|| panic!("segment {segment} is no longer tracked"))
+            .find(|segment| segment.id == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("segment {id} is no longer tracked"))
     }
 
     /// Durably appends `value` under `key` to the active segment. Once
@@ -502,14 +681,8 @@ impl Staging {
         let Some(location) = self.index.read().await.get(&key).cloned() else {
             return Ok(None);
         };
-        let mut buf = vec![0u8; location.length as usize];
-        task::spawn_blocking(move || -> io::Result<Vec<u8>> {
-            read_exact_at(&location.handle.file, &mut buf, location.offset)?;
-            Ok(buf)
-        })
-        .await
-        .expect("read should not panic")
-        .map(|buf| Some(Bytes::from(buf)))
+        let bytes = location.segment.read(location.offset, location.length).await?;
+        Ok(Some(bytes))
     }
 
     /// Whether `key` is currently staged, without reading its value.
@@ -528,7 +701,7 @@ impl Staging {
     /// Closes the active segment out as a new pending segment and starts
     /// a fresh one. Returns the segment that was just closed out, for
     /// `entries`/`finish`.
-    pub(crate) async fn rotate(&self) -> io::Result<Segment> {
+    pub(crate) async fn rotate(&self) -> io::Result<FileId> {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Rotate(RotateMsg { reply }))
@@ -539,23 +712,27 @@ impl Staging {
     /// Segments rotated out but not yet `finish`ed, oldest first. Covers
     /// both a previous flush that failed partway and, after a restart,
     /// whatever `open` found already on disk.
-    pub(crate) async fn pending_segments(&self) -> Vec<Segment> {
-        self.state.read().await.pending.iter().map(|handle| handle.id).collect()
+    pub(crate) async fn pending_segments(&self) -> Vec<FileId> {
+        self.state.read().await.pending.iter().map(|segment| segment.id).collect()
     }
 
-    /// Every `(key, value)` pair in `segment`, in the order they were
-    /// written. `segment` must have come from `rotate` or
+    /// Every `(key, value)` pair in `id`'s segment, in the order they
+    /// were written. `id` must have come from `rotate` or
     /// `pending_segments`; it is never the active segment.
-    pub(crate) async fn entries(&self, segment: Segment) -> io::Result<Vec<(Digest, Bytes)>> {
-        let file = self.find(segment).await;
-        let buf = task::spawn_blocking(move || -> io::Result<Bytes> {
-            let len = file.metadata()?.len() as usize;
-            let mut buf = vec![0u8; len];
-            read_exact_at(&file, &mut buf, 0)?;
-            Ok(Bytes::from(buf))
-        })
-        .await
-        .expect("read should not panic")?;
+    ///
+    /// Reads via mmap, not `read_at`: unlike the active segment, a
+    /// pending one is never written to again, so there's no writer to
+    /// race and no risk of the file growing out from under the mapping.
+    /// Each returned value is a zero-copy `Bytes` view into that mapping
+    /// (`Bytes::from_owner`), so bytes flow from the page cache straight
+    /// into whatever the caller does with them (e.g. `PutPayload` for a
+    /// pack upload) without an intermediate copy into a fresh buffer.
+    /// Usually reuses the mapping `seal` already established when this
+    /// segment was sealed into `pending`; only maps it itself if that
+    /// didn't happen or failed.
+    pub(crate) async fn entries(&self, id: FileId) -> io::Result<Vec<(Digest, Bytes)>> {
+        let segment = self.find(id).await;
+        let buf = segment.seal()?;
 
         let records = {
             let buf = buf.clone();
@@ -569,19 +746,18 @@ impl Staging {
             .collect())
     }
 
-    /// Deletes `segment` and evicts its entries from the index. Only
-    /// call this once `segment`'s content is durably packed elsewhere.
-    /// `segment` must be pending, never the active segment: `pending`
-    /// structurally can't hold that one, so there's nothing to guard
-    /// against here.
-    pub(crate) async fn finish(&self, segment: Segment) -> io::Result<()> {
-        self.index.write().await.retain(|_, location| location.handle.id != segment);
-        self.state.write().await.pending.retain(|handle| handle.id != segment);
-        fs::remove_file(self.segment_path(segment)).await
+    /// Deletes `id`'s segment and evicts its entries from the index.
+    /// Only call this once its content is durably packed elsewhere. `id`
+    /// must be pending, never the active segment: `pending` structurally
+    /// can't hold that one, so there's nothing to guard against here.
+    pub(crate) async fn finish(&self, id: FileId) -> io::Result<()> {
+        self.index.write().await.retain(|_, location| location.segment.id != id);
+        self.state.write().await.pending.retain(|segment| segment.id != id);
+        fs::remove_file(self.segment_path(id)).await
     }
 
-    fn segment_path(&self, segment: Segment) -> PathBuf {
-        segment_path(&self.dir, segment)
+    fn segment_path(&self, id: FileId) -> PathBuf {
+        segment_path(&self.dir, id)
     }
 }
 
@@ -596,11 +772,11 @@ fn encode_record(key: Digest, value: &Bytes) -> Bytes {
 }
 
 #[cfg(unix)]
-fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     std::os::unix::fs::FileExt::read_at(file, buf, offset)
 }
 #[cfg(windows)]
-fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     std::os::windows::fs::FileExt::seek_read(file, buf, offset)
 }
 
@@ -608,7 +784,7 @@ fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
 /// retrying on a short read. Never touches a shared cursor, so this is
 /// safe to call concurrently from multiple tasks, including while the
 /// committer is appending to the same `file` through its own cursor.
-fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
     while !buf.is_empty() {
         let n = read_at(file, buf, offset)?;
         if n == 0 {
@@ -675,7 +851,7 @@ fn parse(buf: &Bytes, codec: Option<Codec>) -> (u64, Vec<(Digest, u64, u32)>) {
 async fn revalidate_segment(
     path: &Path,
     verify: Option<Codec>,
-) -> io::Result<Option<(Arc<File>, Vec<(Digest, u64, u32)>)>> {
+) -> io::Result<Option<(File, Vec<(Digest, u64, u32)>)>> {
     let buf = read_bytes(path).await?;
     let len = buf.len() as u64;
 
@@ -691,37 +867,18 @@ async fn revalidate_segment(
         return Ok(None);
     }
 
-    let file = open_shared(path).await?;
+    let file = File::open(path.to_owned()).await?;
     Ok(Some((file, records)))
-}
-
-async fn create_segment(dir: &Path, segment: Segment) -> io::Result<Arc<File>> {
-    let std_opts = {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.read(true).append(true).create_new(true);
-        opts
-    };
-    let path = segment_path(dir, segment);
-    task::spawn_blocking(move || std_opts.open(path).map(Arc::new))
-        .await
-        .expect("open should not panic")
-}
-
-async fn open_shared(path: &Path) -> io::Result<Arc<File>> {
-    let path = path.to_owned();
-    task::spawn_blocking(move || std::fs::File::open(path).map(Arc::new))
-        .await
-        .expect("open should not panic")
 }
 
 async fn read_bytes(path: &Path) -> io::Result<Bytes> {
     fs::read(path).await.map(Bytes::from)
 }
 
-fn segment_path(dir: &Path, segment: Segment) -> PathBuf {
-    dir.join(format!("{segment}.log"))
+fn segment_path(dir: &Path, id: FileId) -> PathBuf {
+    dir.join(format!("{id}.log"))
 }
 
-fn parse_segment_name(name: &OsStr) -> Option<Segment> {
-    name.to_str()?.strip_suffix(".log")?.parse().ok().map(Segment)
+fn parse_segment_name(name: &OsStr) -> Option<FileId> {
+    name.to_str()?.strip_suffix(".log")?.parse().ok().map(FileId)
 }

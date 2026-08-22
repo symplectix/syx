@@ -70,6 +70,27 @@ async fn rotate_moves_the_active_segment_into_pending_and_resets_active_len() {
 }
 
 #[tokio::test]
+async fn rotate_seals_a_mapping_a_location_captured_before_it_can_see() {
+    let dir = testing::tempdir();
+    let staging = open(dir.path()).await;
+    let (key, value) = encode(b"hello");
+    staging.put(key, value.clone()).await.unwrap();
+
+    // `index`'s `Location` was captured while the segment was still
+    // active: no mapping yet.
+    assert!(staging.index.read().await.get(&key).unwrap().segment.mmap.get().is_none());
+
+    staging.rotate().await.unwrap();
+
+    // The same `Location` -- `index` was never touched again since the
+    // `put` above -- now sees the mapping `seal` established while
+    // rotating, proving it's a shared cell doing this and not a fresh
+    // lookup back into `state`.
+    assert!(staging.index.read().await.get(&key).unwrap().segment.mmap.get().is_some());
+    assert_eq!(staging.get(key).await.unwrap(), Some(value));
+}
+
+#[tokio::test]
 async fn entries_returns_everything_written_to_a_pending_segment() {
     let dir = testing::tempdir();
     let staging = open(dir.path()).await;
@@ -125,7 +146,7 @@ async fn reopening_drops_a_torn_tail_record_and_keeps_the_valid_ones() {
 
     // Simulate a crash mid-write: append a record whose declared length
     // promises more bytes than actually follow it in the file.
-    let path = segment_path(dir.path(), Segment::FIRST);
+    let path = segment_path(dir.path(), FileId::FIRST);
     let valid_len = fs::metadata(&path).await.unwrap().len();
     let mut torn = Vec::new();
     torn.extend_from_slice(Digest::new([0xaa; 32]).as_ref());

@@ -41,6 +41,14 @@ crate.spec(
     version = "1",
 )
 
+# Read-only memory-mapped files, for zero-copy reads of segments that are
+# already sealed (and so never written to again -- see syx/fabric's
+# staging.rs) into an `Arc`-shared, `Bytes::from_owner`-wrapped buffer.
+crate.spec(
+    package = "memmap2",
+    version = "0.9",
+)
+
 # (De)serialization framework.
 crate.spec(
     features = ["derive"],

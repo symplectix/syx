@@ -644,7 +644,7 @@ async fn flush_segments(
     blobs: &Arc<dyn ObjectStore>,
     staging: &Staging,
     cas_prefix: &str,
-    segments: Vec<staging::Segment>,
+    segments: Vec<staging::FileId>,
 ) -> io::Result<()> {
     for segment in segments {
         let staged = staging.entries(segment).await?;
