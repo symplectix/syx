@@ -158,6 +158,14 @@ impl fmt::Display for FileId {
 struct File(Arc<std::fs::File>);
 
 impl File {
+    /// Opens an existing segment file read-only, for one `Staging::open`
+    /// found already on disk left over from a previous run.
+    async fn open(path: PathBuf) -> io::Result<Self> {
+        task::spawn_blocking(move || std::fs::File::open(path).map(Arc::new).map(File))
+            .await
+            .expect("open should not panic")
+    }
+
     /// Creates a brand new segment file: readable and appendable, and
     /// failing if `path` already exists (a segment id is only ever used
     /// once).
@@ -169,14 +177,6 @@ impl File {
         })
         .await
         .expect("open should not panic")
-    }
-
-    /// Opens an existing segment file read-only, for one `Staging::open`
-    /// found already on disk left over from a previous run.
-    async fn open(path: PathBuf) -> io::Result<Self> {
-        task::spawn_blocking(move || std::fs::File::open(path).map(Arc::new).map(File))
-            .await
-            .expect("open should not panic")
     }
 
     /// Appends `buf` and durably syncs it. The sole writer's job:
