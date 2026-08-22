@@ -81,23 +81,15 @@
 //! nothing durably written is silently lost.
 
 use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::io::Write as _;
+use std::io;
 use std::path::{
     Path,
     PathBuf,
 };
+use std::sync::Arc;
 use std::sync::atomic::{
     AtomicU64,
     Ordering,
-};
-use std::sync::{
-    Arc,
-    OnceLock,
-};
-use std::{
-    fmt,
-    io,
 };
 
 use bytes::{
@@ -121,206 +113,17 @@ use tokio::{
     task,
 };
 
+mod segment;
+
+pub(crate) use segment::FileId;
+use segment::{
+    Segment,
+    parse_segment_name,
+    segment_path,
+};
+
 #[cfg(test)]
 mod tests;
-
-/// One append-only file's identity: `{id:020}.log` in `Staging`'s
-/// directory. A segment is created empty, then appended to sequentially
-/// while it's the active one; once rotated out it never changes again
-/// until `finish` deletes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct FileId(u64);
-
-impl FileId {
-    const FIRST: FileId = FileId(0);
-
-    fn next(self) -> FileId {
-        FileId(self.0 + 1)
-    }
-}
-
-impl fmt::Display for FileId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:020}", self.0)
-    }
-}
-
-/// A segment's open file. Wraps `std::fs::File` behind position-
-/// independent operations only: `read_at` for concurrent reads, `append`
-/// for the one writer (relying on `O_APPEND`, so it never needs, or
-/// risks, an explicit seek), and `mmap` for a one-time whole-file
-/// mapping. The raw file's own `Read`/`Write`/`Seek` API shares a
-/// cursor and isn't safe to use this way, so it's never exposed -- this
-/// is the only thing in the module that ever touches `std::fs::File`
-/// directly. Cheap to clone: just bumps the `Arc`, so `Segment`s can
-/// share one without a lock of their own.
-#[derive(Clone)]
-struct File(Arc<std::fs::File>);
-
-impl File {
-    /// Opens an existing segment file read-only, for one `Staging::open`
-    /// found already on disk left over from a previous run.
-    async fn open(path: PathBuf) -> io::Result<Self> {
-        task::spawn_blocking(move || std::fs::File::open(path).map(Arc::new).map(File))
-            .await
-            .expect("open should not panic")
-    }
-
-    /// Creates a brand new segment file: readable and appendable, and
-    /// failing if `path` already exists (a segment id is only ever used
-    /// once).
-    async fn create(path: PathBuf) -> io::Result<Self> {
-        task::spawn_blocking(move || {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.read(true).append(true).create_new(true);
-            opts.open(path).map(Arc::new).map(File)
-        })
-        .await
-        .expect("open should not panic")
-    }
-
-    /// Appends `buf` and durably syncs it. The sole writer's job:
-    /// `O_APPEND` (see `create`) guarantees this lands at the file's
-    /// true end, with no seek of its own to race a reader's `read_at`.
-    async fn append(&self, buf: Bytes) -> io::Result<()> {
-        let file = Arc::clone(&self.0);
-        task::spawn_blocking(move || -> io::Result<()> {
-            let mut w = &*file;
-            w.write_all(&buf)?;
-            file.sync_data()
-        })
-        .await
-        .expect("write should not panic")
-    }
-
-    /// Reads exactly `length` bytes at `offset`. Safe to call
-    /// concurrently, including while another clone's `append` is
-    /// running against the same underlying file: `pread` never touches
-    /// a shared cursor.
-    async fn read_at(&self, offset: u64, length: u32) -> io::Result<Bytes> {
-        let file = Arc::clone(&self.0);
-        let mut buf = vec![0u8; length as usize];
-        task::spawn_blocking(move || -> io::Result<Vec<u8>> {
-            read_exact_at(&file, &mut buf, offset)?;
-            Ok(buf)
-        })
-        .await
-        .expect("read should not panic")
-        .map(Bytes::from)
-    }
-
-    /// Maps the whole file read-only. Unlike this type's other
-    /// operations, not blocking I/O worth moving off the calling task:
-    /// `mmap(2)` only sets up the mapping, faulting pages in lazily as
-    /// they're actually read, rather than reading the file itself.
-    fn mmap(&self) -> io::Result<Bytes> {
-        // Safety: only ever called on a segment that's already fully
-        // and durably written and sealed into `pending` -- nothing
-        // writes to it again from this point on (see the module doc).
-        unsafe { memmap2::Mmap::map(&*self.0) }.map(Bytes::from_owner)
-    }
-}
-
-/// A segment's identity and open file, whether it's the one currently
-/// being appended to or one already rotated out. Cheap to clone: `id` is
-/// `Copy` and `file`/`mmap` each wrap an `Arc`, so `pending` and `index`
-/// can each hold their own clone with no lock of its own required.
-///
-/// Every clone of a given `Segment` value -- the one `pending` tracks
-/// once it's sealed, and the one each `Location` written while it was
-/// active captured for itself -- shares the same `mmap` cell. `seal`
-/// fills it in exactly once, when the segment is sealed into `pending`,
-/// and that update is then visible through every clone already out
-/// there, including `Location`s inserted before sealing ever happened:
-/// nothing needs to go back and update `index` itself.
-#[derive(Clone)]
-struct Segment {
-    id:   FileId,
-    /// This segment's open file. Every read goes through here (`read_at`)
-    /// until `mmap` is established; `mmap` itself, once sealing calls for
-    /// it, maps this same file. While this is the active segment, it's
-    /// also the one handle `Committer` appends through.
-    file: File,
-    /// A read-only, zero-copy view of this whole segment. Empty for the
-    /// active segment, which is never memory-mapped while still being
-    /// written; filled in once the segment is sealed into `pending`,
-    /// since from that point on it's never written to again. `get`
-    /// falls back to `read_at` when it's empty; `entries` maps the file
-    /// itself and fills it in.
-    mmap: Mmap,
-}
-
-/// A segment's whole-file mmap, established at most once and shared by
-/// every clone of the `Segment` it came from -- see `Segment`'s own doc.
-#[derive(Clone, Default)]
-struct Mmap(Arc<OnceLock<Bytes>>);
-
-impl Segment {
-    /// Reads `length` bytes at `offset`: sliced zero-copy from the
-    /// mapping if one's been established, or via a positioned read
-    /// against `file` if it isn't (not yet sealed, or sealing failed).
-    /// `Segment` is the only thing that ever reads `file` directly for
-    /// an actual read -- it owns both `file` and `mmap`, so it's the
-    /// one place that can decide between them without either being
-    /// passed around on its own.
-    async fn read(&self, offset: u64, length: u32) -> io::Result<Bytes> {
-        // `mmap.read_at`, not `seal`: this might still be the active
-        // segment (still being written to), and mapping that one is
-        // exactly what `seal` must never do -- only a sealed segment's
-        // `mmap` is safe to establish on demand.
-        if let Some(bytes) = self.mmap.read_at(offset, length) {
-            return Ok(bytes);
-        }
-        self.file.read_at(offset, length).await
-    }
-
-    /// Establishes this segment's whole-file mapping, for a segment
-    /// that's about to become (or already is) pending: from this point
-    /// it's never written to again (see the module doc), so mapping it
-    /// is safe. Idempotent, and, because `mmap` is shared, this update
-    /// is visible through every clone of this `Segment` value already
-    /// out there, including `Location`s `index` held from before
-    /// sealing happened -- nothing needs to go back and update `index`
-    /// itself.
-    fn seal(&self) -> io::Result<Bytes> {
-        self.mmap.get_or_map(&self.file)
-    }
-}
-
-impl Mmap {
-    /// The mapping, if it's been established already. Never maps the
-    /// file itself: callers that only want to peek (`read_at`, happy to
-    /// fall back to `File::read_at` on a miss) shouldn't pay for
-    /// mapping a whole segment just to read one small value from it.
-    fn get(&self) -> Option<Bytes> {
-        self.0.get().cloned()
-    }
-
-    /// Reads `length` bytes at `offset`, sliced zero-copy from the
-    /// mapping -- if one's been established. `None`, not an error, if
-    /// it hasn't: unlike `File::read_at`, there's nothing to actually
-    /// read here, just an in-memory slice of what's already there.
-    fn read_at(&self, offset: u64, length: u32) -> Option<Bytes> {
-        let bytes = self.get()?;
-        let start = offset as usize;
-        Some(bytes.slice(start..start + length as usize))
-    }
-
-    /// The mapping, establishing it first if it isn't there yet.
-    /// Idempotent: a mapping already established by another caller (or
-    /// concurrently by this one losing a race) is reused as-is.
-    fn get_or_map(&self, file: &File) -> io::Result<Bytes> {
-        if let Some(bytes) = self.get() {
-            return Ok(bytes);
-        }
-        let bytes = file.mmap()?;
-        // If another caller (or `seal`) won the race and already set
-        // this, keep their copy rather than ours -- either is a valid
-        // mapping of the same bytes, but `get` should always return the
-        // one every other reader is also seeing.
-        Ok(self.0.get_or_init(|| bytes.clone()).clone())
-    }
-}
 
 #[derive(Clone)]
 struct Location {
@@ -334,6 +137,12 @@ struct Location {
     offset:  u64,
     /// How many bytes the value is.
     length:  u32,
+}
+
+/// A request handed to the committer task over its `commands` channel.
+enum Command {
+    Put(PutMsg),
+    Rotate(RotateMsg),
 }
 
 /// One `put` waiting on the committer.
@@ -350,12 +159,6 @@ struct PutMsg {
 /// One `rotate` waiting on the committer.
 struct RotateMsg {
     reply: oneshot::Sender<io::Result<FileId>>,
-}
-
-/// A request handed to the committer task over its `commands` channel.
-enum Command {
-    Put(PutMsg),
-    Rotate(RotateMsg),
 }
 
 /// Owns the active segment's write side -- the only thing that ever
@@ -466,7 +269,7 @@ impl Committer {
                 length:  msg.value.len() as u32,
             });
         }
-        let result = self.segment.file.append(buf.freeze()).await;
+        let result = self.segment.append(buf.freeze()).await;
 
         match result {
             Ok(()) => {
@@ -520,8 +323,9 @@ impl Committer {
         self.start_fresh_segment().await?;
 
         let path = segment_path(&self.dir, old_id);
-        if let Some((file, records)) = revalidate_segment(&path, Some(self.codec)).await? {
-            let segment = Segment { id: old_id, file, mmap: Mmap::default() };
+        if let Some((segment, records)) =
+            revalidate_segment(old_id, &path, Some(self.codec)).await?
+        {
             let _ = segment.seal();
             {
                 let mut index = self.index.write().await;
@@ -539,11 +343,11 @@ impl Committer {
     /// if anything, becomes visible for it.
     async fn start_fresh_segment(&mut self) -> io::Result<()> {
         let next = self.segment.id.next();
-        let file = File::create(segment_path(&self.dir, next)).await?;
+        let segment = Segment::create(next, segment_path(&self.dir, next)).await?;
 
         self.offset = 0;
         self.active_len.store(0, Ordering::Relaxed);
-        self.segment = Segment { id: next, file, mmap: Mmap::default() };
+        self.segment = segment;
         Ok(())
     }
 }
@@ -611,10 +415,9 @@ impl Staging {
             // have been active when the previous run stopped needs
             // verifying.
             let verify = (i + 1 == ids.len()).then_some(codec);
-            let Some((file, records)) = revalidate_segment(&path, verify).await? else {
+            let Some((segment, records)) = revalidate_segment(id, &path, verify).await? else {
                 continue;
             };
-            let segment = Segment { id, file, mmap: Mmap::default() };
             let _ = segment.seal();
             for (key, offset, length) in records {
                 index.insert(key, Location { segment: segment.clone(), offset, length });
@@ -623,8 +426,7 @@ impl Staging {
         }
 
         let next = ids.last().map_or(FileId::FIRST, |id| id.next());
-        let file = File::create(segment_path(&dir, next)).await?;
-        let segment = Segment { id: next, file, mmap: Mmap::default() };
+        let segment = Segment::create(next, segment_path(&dir, next)).await?;
 
         let active_len = Arc::new(AtomicU64::new(0));
         let index = Arc::new(RwLock::new(index));
@@ -778,34 +580,6 @@ fn encode_record(key: Digest, value: &Bytes) -> Bytes {
     buf.freeze()
 }
 
-#[cfg(unix)]
-fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-    std::os::unix::fs::FileExt::read_at(file, buf, offset)
-}
-#[cfg(windows)]
-fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-    std::os::windows::fs::FileExt::seek_read(file, buf, offset)
-}
-
-/// Reads exactly `buf.len()` bytes from `file` starting at `offset`,
-/// retrying on a short read. Never touches a shared cursor, so this is
-/// safe to call concurrently from multiple tasks, including while the
-/// committer is appending to the same `file` through its own cursor.
-fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
-    while !buf.is_empty() {
-        let n = read_at(file, buf, offset)?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "failed to read whole record",
-            ));
-        }
-        buf = &mut buf[n..];
-        offset += n as u64;
-    }
-    Ok(())
-}
-
 /// Parses records from `buf` in order, returning each one's key and the
 /// byte range its value occupies within `buf`, plus how many bytes from
 /// the start of `buf` are valid.
@@ -856,9 +630,10 @@ fn parse(buf: &Bytes, codec: Option<Codec>) -> (u64, Vec<(Digest, u64, u32)>) {
 /// either an empty active segment that was created but never written to,
 /// or one torn so badly not even its first record survived.
 async fn revalidate_segment(
+    id: FileId,
     path: &Path,
     verify: Option<Codec>,
-) -> io::Result<Option<(File, Vec<(Digest, u64, u32)>)>> {
+) -> io::Result<Option<(Segment, Vec<(Digest, u64, u32)>)>> {
     let buf = read_bytes(path).await?;
     let len = buf.len() as u64;
 
@@ -874,18 +649,10 @@ async fn revalidate_segment(
         return Ok(None);
     }
 
-    let file = File::open(path.to_owned()).await?;
-    Ok(Some((file, records)))
+    let segment = Segment::open(id, path.to_owned()).await?;
+    Ok(Some((segment, records)))
 }
 
 async fn read_bytes(path: &Path) -> io::Result<Bytes> {
     fs::read(path).await.map(Bytes::from)
-}
-
-fn segment_path(dir: &Path, id: FileId) -> PathBuf {
-    dir.join(format!("{id}.log"))
-}
-
-fn parse_segment_name(name: &OsStr) -> Option<FileId> {
-    name.to_str()?.strip_suffix(".log")?.parse().ok().map(FileId)
 }

@@ -78,15 +78,15 @@ async fn rotate_seals_a_mapping_a_location_captured_before_it_can_see() {
 
     // `index`'s `Location` was captured while the segment was still
     // active: no mapping yet.
-    assert!(staging.index.read().await.get(&key).unwrap().segment.mmap.get().is_none());
+    assert!(!staging.index.read().await.get(&key).unwrap().segment.mmap_established());
 
     staging.rotate().await.unwrap();
 
     // The same `Location` -- `index` was never touched again since the
     // `put` above -- now sees the mapping `seal` established while
     // rotating, proving it's a shared cell doing this and not a fresh
-    // lookup back into `state`.
-    assert!(staging.index.read().await.get(&key).unwrap().segment.mmap.get().is_some());
+    // lookup back into `pending`.
+    assert!(staging.index.read().await.get(&key).unwrap().segment.mmap_established());
     assert_eq!(staging.get(key).await.unwrap(), Some(value));
 }
 

@@ -8,6 +8,7 @@ rust.library(
         "src/graph.rs",
         "src/lib.rs",
         "src/staging.rs",
+        "src/staging/segment.rs",
         "src/staging/tests.rs",
         "src/storage.rs",
         "src/storage/tests.rs",
