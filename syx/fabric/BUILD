@@ -16,7 +16,6 @@ rust.library(
     visibility = ["//visibility:public"],
     deps = [
         "//syx/content_addressing",
-        "@crates//:arc-swap",
         "@crates//:bytes",
         "@crates//:cbor2",
         "@crates//:crossbeam-skiplist",

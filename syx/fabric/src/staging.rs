@@ -44,23 +44,23 @@
 //! Each `index` entry carries its own clone of the `Segment` it lives in,
 //! rather than just an id to look up later, so once `put` hands one out,
 //! reading it back never depends on that segment still being tracked in
-//! `active`/`pending`. `finish` evicts a segment from `index` before
-//! `pending`, but the order doesn't matter for correctness either way: a
-//! `get` that already read the old `index` entry keeps working (its
-//! `Segment` clone's `File` stays valid even after the underlying path
-//! is unlinked), and one that reads after eviction just misses cleanly,
-//! no different from the key never having been staged.
+//! `pending`. `finish` evicts a segment from `index` before `pending`,
+//! but the order doesn't matter for correctness either way: a `get` that
+//! already read the old `index` entry keeps working (its `Segment`
+//! clone's `File` stays valid even after the underlying path is
+//! unlinked), and one that reads after eviction just misses cleanly, no
+//! different from the key never having been staged.
 //!
-//! The active segment and the pending ones are tracked separately, each
-//! behind its own lock-free structure rather than one lock shared
-//! between them: `active` (an `ArcSwap`) has exactly one writer, the
-//! committer, so there's no writer to serialize against, only readers to
-//! avoid blocking; `pending` (a `SkipMap` keyed by `FileId`) needs actual
-//! concurrent insert/remove/lookup by id, which is what it's built for.
-//! No caller ever needs a consistent joint snapshot of both at once --
-//! `find` only ever asks about a segment it already knows is pending,
-//! and `active_len` is published through its own separate atomic -- so
-//! there's no correctness lost in not sharing one lock between them.
+//! The active segment itself is never published anywhere: it lives only
+//! in the committer's own `Committer::segment`, since nothing outside
+//! needs a `Segment` for it specifically (`find`'s only caller never
+//! asks for it, and `get`/`contains` read through `index`'s own captured
+//! clones instead). The one fact about it callers do need, its current
+//! length, is published separately through `active_len`, a plain atomic.
+//! `pending` is the only thing actually shared with the committer, and
+//! it's a lock-free `SkipMap` keyed by `FileId` rather than a lock,
+//! since what it needs is real concurrent insert/remove/lookup by id,
+//! not just readers not blocking a single writer.
 //!
 //! `get` starts out reading via `read_at`, the same as while the segment
 //! is still active, but switches to slicing a mapped view once one
@@ -100,7 +100,6 @@ use std::{
     io,
 };
 
-use arc_swap::ArcSwap;
 use bytes::{
     BufMut,
     Bytes,
@@ -224,17 +223,16 @@ impl File {
 
 /// A segment's identity and open file, whether it's the one currently
 /// being appended to or one already rotated out. Cheap to clone: `id` is
-/// `Copy` and `file`/`mmap` each wrap an `Arc`, so `active`/`pending` and
-/// `index` can each hold their own clone with no lock of its own
-/// required.
+/// `Copy` and `file`/`mmap` each wrap an `Arc`, so `pending` and `index`
+/// can each hold their own clone with no lock of its own required.
 ///
-/// Every clone of a given `Segment` value -- the one `active`/`pending`
-/// tracks, and the one each `Location` written while it was active
-/// captured for itself -- shares the same `mmap` cell. `seal` fills it
-/// in exactly once, when the segment is sealed into `pending`, and that
-/// update is then visible through every clone already out there,
-/// including `Location`s inserted before sealing ever happened: nothing
-/// needs to go back and update `index` itself.
+/// Every clone of a given `Segment` value -- the one `pending` tracks
+/// once it's sealed, and the one each `Location` written while it was
+/// active captured for itself -- shares the same `mmap` cell. `seal`
+/// fills it in exactly once, when the segment is sealed into `pending`,
+/// and that update is then visible through every clone already out
+/// there, including `Location`s inserted before sealing ever happened:
+/// nothing needs to go back and update `index` itself.
 #[derive(Clone)]
 struct Segment {
     id:   FileId,
@@ -329,8 +327,8 @@ struct Location {
     /// The segment the value lives in, cloned at insert time from
     /// whatever `Segment` was current then (`commit`, `poison`, or
     /// `open`'s replay). Reading through this never needs to ask
-    /// `active`/`pending` about it, so a read never races a concurrent
-    /// `finish` tearing the segment out.
+    /// `pending` about it, so a read never races a concurrent `finish`
+    /// tearing the segment out.
     segment: Segment,
     /// Byte offset of the value within `segment.file`.
     offset:  u64,
@@ -367,9 +365,12 @@ enum Command {
 /// each paying for its own (see the module doc's "Concurrency" section).
 struct Committer {
     dir:        PathBuf,
-    /// The active segment. The committer's own working copy; `active`
-    /// below is only written to, never read back from, since this field
-    /// is always at least as current.
+    /// The active segment. Only the committer itself ever reads or
+    /// writes it -- nothing outside needs a `Segment` for the active
+    /// one specifically: `find`'s only caller never asks for it (see
+    /// its own doc), and `get`/`contains` read through `index`'s own
+    /// captured `Segment` clones instead. `Staging::active_len` covers
+    /// the one thing about the active segment external callers do need.
     segment:    Segment,
     /// The next unwritten offset in the active segment. Only the
     /// committer itself ever advances this; `Staging::active_len` reads
@@ -379,11 +380,6 @@ struct Committer {
     /// verifies a crash-torn one; see `poison`.
     codec:      Codec,
     active_len: Arc<AtomicU64>,
-    /// Published copy of `segment`, for readers. A lock-free single-slot
-    /// swap, not a lock: the committer is `active`'s only writer (this
-    /// task, never concurrent with itself), so there's no writer to
-    /// serialize against, only readers to avoid blocking.
-    active:     Arc<ArcSwap<Segment>>,
     /// Rotated out, not yet `finish`ed. Structurally can never contain
     /// the active segment, so nothing removing from it needs to guard
     /// against accidentally sealing the one still being written to.
@@ -544,13 +540,10 @@ impl Committer {
     async fn start_fresh_segment(&mut self) -> io::Result<()> {
         let next = self.segment.id.next();
         let file = File::create(segment_path(&self.dir, next)).await?;
-        let segment = Segment { id: next, file, mmap: Mmap::default() };
 
         self.offset = 0;
         self.active_len.store(0, Ordering::Relaxed);
-        self.segment = segment.clone();
-
-        self.active.store(Arc::new(segment));
+        self.segment = Segment { id: next, file, mmap: Mmap::default() };
         Ok(())
     }
 }
@@ -564,17 +557,14 @@ pub(crate) struct Staging {
     /// concurrent `put`s. `put` itself doesn't need this: it gets the
     /// same value back directly from the committer.
     active_len:  Arc<AtomicU64>,
-    /// The active segment, published by the committer; see `Committer`'s
-    /// own field of the same name.
-    active:      Arc<ArcSwap<Segment>>,
     /// Rotated out, not yet `finish`ed; see `Committer`'s own field of
     /// the same name.
     pending:     Arc<SkipMap<FileId, Segment>>,
     /// Every staged key's location, across every segment. A separate
-    /// lock from `active`/`pending`, so `get`/`contains` never wait
-    /// behind the committer's `write`/`sync_data` -- and self-sufficient
-    /// (each entry carries its own clone of the `Segment` it lives in),
-    /// so `get` never needs `active`/`pending` at all.
+    /// lock from `pending`, so `get`/`contains` never wait behind the
+    /// committer's `write`/`sync_data` -- and self-sufficient (each
+    /// entry carries its own clone of the `Segment` it lives in), so
+    /// `get` never needs `pending` at all.
     index:       Arc<RwLock<HashMap<Digest, Location>>>,
     /// `put` refuses new writes once pending segments reach this many,
     /// so a persistently failing `flush_pending` bounds local disk usage
@@ -637,7 +627,6 @@ impl Staging {
         let segment = Segment { id: next, file, mmap: Mmap::default() };
 
         let active_len = Arc::new(AtomicU64::new(0));
-        let active = Arc::new(ArcSwap::new(Arc::new(segment.clone())));
         let index = Arc::new(RwLock::new(index));
 
         let (commands, rx) = mpsc::unbounded_channel();
@@ -647,26 +636,22 @@ impl Staging {
             offset: 0,
             codec,
             active_len: Arc::clone(&active_len),
-            active: Arc::clone(&active),
             pending: Arc::clone(&pending),
             index: Arc::clone(&index),
         };
         tokio::spawn(committer.run(rx));
 
-        Ok(Self { dir, active_len, active, pending, index, max_pending, commands })
+        Ok(Self { dir, active_len, pending, index, max_pending, commands })
     }
 
     /// The `Segment` for `id`. Panics if it isn't tracked: its only
     /// caller (`entries`) only ever asks for one it already knows must
     /// still be open, from `pending_segments`/`rotate`'s own return
-    /// value. `get` doesn't call this -- its `Location`s carry their own
-    /// `Segment` clone, so a read never needs to ask `active`/`pending`
-    /// about a segment at all.
+    /// value -- so this is never asked about the active segment, only a
+    /// pending one. `get` doesn't call this either -- its `Location`s
+    /// carry their own `Segment` clone, so a read never needs to ask
+    /// `pending` about a segment at all.
     fn find(&self, id: FileId) -> Segment {
-        let active = self.active.load();
-        if active.id == id {
-            return (**active).clone();
-        }
         self.pending
             .get(&id)
             .map(|entry| entry.value().clone())
