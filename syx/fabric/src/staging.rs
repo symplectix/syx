@@ -44,12 +44,23 @@
 //! Each `index` entry carries its own clone of the `Segment` it lives in,
 //! rather than just an id to look up later, so once `put` hands one out,
 //! reading it back never depends on that segment still being tracked in
-//! `state`. `finish` evicts a segment from `index` before `state`, but
-//! the order doesn't matter for correctness either way: a `get` that
-//! already read the old `index` entry keeps working (its `Segment`
-//! clone's `File` stays valid even after the underlying path is
-//! unlinked), and one that reads after eviction just misses cleanly, no
-//! different from the key never having been staged.
+//! `active`/`pending`. `finish` evicts a segment from `index` before
+//! `pending`, but the order doesn't matter for correctness either way: a
+//! `get` that already read the old `index` entry keeps working (its
+//! `Segment` clone's `File` stays valid even after the underlying path
+//! is unlinked), and one that reads after eviction just misses cleanly,
+//! no different from the key never having been staged.
+//!
+//! The active segment and the pending ones are tracked separately, each
+//! behind its own lock-free structure rather than one lock shared
+//! between them: `active` (an `ArcSwap`) has exactly one writer, the
+//! committer, so there's no writer to serialize against, only readers to
+//! avoid blocking; `pending` (a `SkipMap` keyed by `FileId`) needs actual
+//! concurrent insert/remove/lookup by id, which is what it's built for.
+//! No caller ever needs a consistent joint snapshot of both at once --
+//! `find` only ever asks about a segment it already knows is pending,
+//! and `active_len` is published through its own separate atomic -- so
+//! there's no correctness lost in not sharing one lock between them.
 //!
 //! `get` starts out reading via `read_at`, the same as while the segment
 //! is still active, but switches to slicing a mapped view once one
@@ -89,6 +100,7 @@ use std::{
     io,
 };
 
+use arc_swap::ArcSwap;
 use bytes::{
     BufMut,
     Bytes,
@@ -99,6 +111,7 @@ use content_addressing::{
     Digest,
     Hasher,
 };
+use crossbeam_skiplist::SkipMap;
 use tokio::sync::{
     RwLock,
     mpsc,
@@ -211,16 +224,17 @@ impl File {
 
 /// A segment's identity and open file, whether it's the one currently
 /// being appended to or one already rotated out. Cheap to clone: `id` is
-/// `Copy` and `file`/`mmap` each wrap an `Arc`, so `state` and `index`
-/// can each hold their own clone with no lock of its own required.
+/// `Copy` and `file`/`mmap` each wrap an `Arc`, so `active`/`pending` and
+/// `index` can each hold their own clone with no lock of its own
+/// required.
 ///
-/// Every clone of a given `Segment` value -- the one `state` tracks, and
-/// the one each `Location` written while it was active captured for
-/// itself -- shares the same `mmap` cell. `seal` fills it in exactly
-/// once, when the segment is sealed into `pending`, and that update is
-/// then visible through every clone already out there, including
-/// `Location`s inserted before sealing ever happened: nothing needs to
-/// go back and update `index` itself.
+/// Every clone of a given `Segment` value -- the one `active`/`pending`
+/// tracks, and the one each `Location` written while it was active
+/// captured for itself -- shares the same `mmap` cell. `seal` fills it
+/// in exactly once, when the segment is sealed into `pending`, and that
+/// update is then visible through every clone already out there,
+/// including `Location`s inserted before sealing ever happened: nothing
+/// needs to go back and update `index` itself.
 #[derive(Clone)]
 struct Segment {
     id:   FileId,
@@ -310,22 +324,12 @@ impl Mmap {
     }
 }
 
-/// Which segment is active and which are pending. Plain data, other than
-/// the committer's own writes (see `Committer::rotate`), nothing mutates
-/// this; readers just take a shared lock.
-struct State {
-    active:  Segment,
-    /// Rotated out, not yet `finish`ed. Structurally can never contain
-    /// the active segment, so nothing removing from it needs to guard
-    /// against accidentally sealing the one still being written to.
-    pending: Vec<Segment>,
-}
-
 #[derive(Clone)]
 struct Location {
-    /// The segment the value lives in, cloned from `state`'s own
-    /// `Segment` value at insert time. Reading through this never needs
-    /// to ask `state` about it, so a read never races a concurrent
+    /// The segment the value lives in, cloned at insert time from
+    /// whatever `Segment` was current then (`commit`, `poison`, or
+    /// `open`'s replay). Reading through this never needs to ask
+    /// `active`/`pending` about it, so a read never races a concurrent
     /// `finish` tearing the segment out.
     segment: Segment,
     /// Byte offset of the value within `segment.file`.
@@ -363,7 +367,9 @@ enum Command {
 /// each paying for its own (see the module doc's "Concurrency" section).
 struct Committer {
     dir:        PathBuf,
-    /// The active segment.
+    /// The active segment. The committer's own working copy; `active`
+    /// below is only written to, never read back from, since this field
+    /// is always at least as current.
     segment:    Segment,
     /// The next unwritten offset in the active segment. Only the
     /// committer itself ever advances this; `Staging::active_len` reads
@@ -373,7 +379,19 @@ struct Committer {
     /// verifies a crash-torn one; see `poison`.
     codec:      Codec,
     active_len: Arc<AtomicU64>,
-    state:      Arc<RwLock<State>>,
+    /// Published copy of `segment`, for readers. A lock-free single-slot
+    /// swap, not a lock: the committer is `active`'s only writer (this
+    /// task, never concurrent with itself), so there's no writer to
+    /// serialize against, only readers to avoid blocking.
+    active:     Arc<ArcSwap<Segment>>,
+    /// Rotated out, not yet `finish`ed. Structurally can never contain
+    /// the active segment, so nothing removing from it needs to guard
+    /// against accidentally sealing the one still being written to.
+    /// Keyed and ordered by `FileId`, so oldest-first iteration (see
+    /// `Staging::pending_segments`) is a fact of the type, not a
+    /// convention `rotate`/`poison` have to uphold by always inserting
+    /// at the end.
+    pending:    Arc<SkipMap<FileId, Segment>>,
     index:      Arc<RwLock<HashMap<Digest, Location>>>,
 }
 
@@ -489,7 +507,7 @@ impl Committer {
 
         let old_id = old.id;
         let _ = old.seal();
-        self.state.write().await.pending.push(old);
+        self.pending.insert(old_id, old);
         Ok(old_id)
     }
 
@@ -515,12 +533,12 @@ impl Committer {
                     index.insert(key, Location { segment: segment.clone(), offset, length });
                 }
             }
-            self.state.write().await.pending.push(segment);
+            self.pending.insert(old_id, segment);
         }
         Ok(())
     }
 
-    /// Starts a brand new active segment. Doesn't touch `state`/`index`
+    /// Starts a brand new active segment. Doesn't touch `pending`/`index`
     /// for whatever segment was active before -- callers decide what,
     /// if anything, becomes visible for it.
     async fn start_fresh_segment(&mut self) -> io::Result<()> {
@@ -532,7 +550,7 @@ impl Committer {
         self.active_len.store(0, Ordering::Relaxed);
         self.segment = segment.clone();
 
-        self.state.write().await.active = segment;
+        self.active.store(Arc::new(segment));
         Ok(())
     }
 }
@@ -546,12 +564,17 @@ pub(crate) struct Staging {
     /// concurrent `put`s. `put` itself doesn't need this: it gets the
     /// same value back directly from the committer.
     active_len:  Arc<AtomicU64>,
-    state:       Arc<RwLock<State>>,
+    /// The active segment, published by the committer; see `Committer`'s
+    /// own field of the same name.
+    active:      Arc<ArcSwap<Segment>>,
+    /// Rotated out, not yet `finish`ed; see `Committer`'s own field of
+    /// the same name.
+    pending:     Arc<SkipMap<FileId, Segment>>,
     /// Every staged key's location, across every segment. A separate
-    /// lock from `state`, so `get`/`contains` never wait behind the
-    /// committer's `write`/`sync_data` -- and self-sufficient (each
-    /// entry carries its own clone of the `Segment` it lives in), so
-    /// `get` never needs `state` at all.
+    /// lock from `active`/`pending`, so `get`/`contains` never wait
+    /// behind the committer's `write`/`sync_data` -- and self-sufficient
+    /// (each entry carries its own clone of the `Segment` it lives in),
+    /// so `get` never needs `active`/`pending` at all.
     index:       Arc<RwLock<HashMap<Digest, Location>>>,
     /// `put` refuses new writes once pending segments reach this many,
     /// so a persistently failing `flush_pending` bounds local disk usage
@@ -590,7 +613,7 @@ impl Staging {
         ids.sort_unstable();
 
         let mut index = HashMap::new();
-        let mut pending = Vec::new();
+        let pending = Arc::new(SkipMap::new());
         for (i, &id) in ids.iter().enumerate() {
             let path = segment_path(&dir, id);
             // Every earlier file was already durable before this
@@ -606,7 +629,7 @@ impl Staging {
             for (key, offset, length) in records {
                 index.insert(key, Location { segment: segment.clone(), offset, length });
             }
-            pending.push(segment);
+            pending.insert(id, segment);
         }
 
         let next = ids.last().map_or(FileId::FIRST, |id| id.next());
@@ -614,7 +637,7 @@ impl Staging {
         let segment = Segment { id: next, file, mmap: Mmap::default() };
 
         let active_len = Arc::new(AtomicU64::new(0));
-        let state = Arc::new(RwLock::new(State { active: segment.clone(), pending }));
+        let active = Arc::new(ArcSwap::new(Arc::new(segment.clone())));
         let index = Arc::new(RwLock::new(index));
 
         let (commands, rx) = mpsc::unbounded_channel();
@@ -624,30 +647,29 @@ impl Staging {
             offset: 0,
             codec,
             active_len: Arc::clone(&active_len),
-            state: Arc::clone(&state),
+            active: Arc::clone(&active),
+            pending: Arc::clone(&pending),
             index: Arc::clone(&index),
         };
         tokio::spawn(committer.run(rx));
 
-        Ok(Self { dir, active_len, state, index, max_pending, commands })
+        Ok(Self { dir, active_len, active, pending, index, max_pending, commands })
     }
 
     /// The `Segment` for `id`. Panics if it isn't tracked: its only
     /// caller (`entries`) only ever asks for one it already knows must
     /// still be open, from `pending_segments`/`rotate`'s own return
     /// value. `get` doesn't call this -- its `Location`s carry their own
-    /// `Segment` clone, so a read never needs to ask `state` about a
-    /// segment at all.
-    async fn find(&self, id: FileId) -> Segment {
-        let state = self.state.read().await;
-        if state.active.id == id {
-            return state.active.clone();
+    /// `Segment` clone, so a read never needs to ask `active`/`pending`
+    /// about a segment at all.
+    fn find(&self, id: FileId) -> Segment {
+        let active = self.active.load();
+        if active.id == id {
+            return (**active).clone();
         }
-        state
-            .pending
-            .iter()
-            .find(|segment| segment.id == id)
-            .cloned()
+        self.pending
+            .get(&id)
+            .map(|entry| entry.value().clone())
             .unwrap_or_else(|| panic!("segment {id} is no longer tracked"))
     }
 
@@ -661,7 +683,7 @@ impl Staging {
     /// at that point `flush_pending` isn't keeping up, and accepting more
     /// would grow local disk usage without bound.
     pub(crate) async fn put(&self, key: Digest, value: Bytes) -> io::Result<u64> {
-        let pending_len = self.state.read().await.pending.len();
+        let pending_len = self.pending.len();
         if pending_len >= self.max_pending as usize {
             return Err(io::Error::other(format!(
                 "staging: {pending_len} segments already pending (max {})",
@@ -712,8 +734,8 @@ impl Staging {
     /// Segments rotated out but not yet `finish`ed, oldest first. Covers
     /// both a previous flush that failed partway and, after a restart,
     /// whatever `open` found already on disk.
-    pub(crate) async fn pending_segments(&self) -> Vec<FileId> {
-        self.state.read().await.pending.iter().map(|segment| segment.id).collect()
+    pub(crate) fn pending_segments(&self) -> Vec<FileId> {
+        self.pending.iter().map(|entry| *entry.key()).collect()
     }
 
     /// Every `(key, value)` pair in `id`'s segment, in the order they
@@ -731,7 +753,7 @@ impl Staging {
     /// segment was sealed into `pending`; only maps it itself if that
     /// didn't happen or failed.
     pub(crate) async fn entries(&self, id: FileId) -> io::Result<Vec<(Digest, Bytes)>> {
-        let segment = self.find(id).await;
+        let segment = self.find(id);
         let buf = segment.seal()?;
 
         let records = {
@@ -752,7 +774,7 @@ impl Staging {
     /// can't hold that one, so there's nothing to guard against here.
     pub(crate) async fn finish(&self, id: FileId) -> io::Result<()> {
         self.index.write().await.retain(|_, location| location.segment.id != id);
-        self.state.write().await.pending.retain(|segment| segment.id != id);
+        self.pending.remove(&id);
         fs::remove_file(self.segment_path(id)).await
     }
 

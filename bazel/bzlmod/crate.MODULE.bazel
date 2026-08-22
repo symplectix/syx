@@ -49,6 +49,18 @@ crate.spec(
     version = "0.9",
 )
 
+# Lock-free swap of a single `Arc`, and a lock-free ordered map: used by
+# syx/fabric's staging.rs to track the active and pending segments without
+# a lock shared between the committer and readers.
+crate.spec(
+    package = "arc-swap",
+    version = "1",
+)
+crate.spec(
+    package = "crossbeam-skiplist",
+    version = "0.1",
+)
+
 # (De)serialization framework.
 crate.spec(
     features = ["derive"],

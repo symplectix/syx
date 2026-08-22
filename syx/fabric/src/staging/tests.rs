@@ -65,7 +65,7 @@ async fn rotate_moves_the_active_segment_into_pending_and_resets_active_len() {
     let segment = staging.rotate().await.unwrap();
 
     assert_eq!(staging.active_len(), 0);
-    assert_eq!(staging.pending_segments().await, vec![segment]);
+    assert_eq!(staging.pending_segments(), vec![segment]);
     assert!(staging.contains(key).await);
 }
 
@@ -115,7 +115,7 @@ async fn finish_deletes_the_segment_and_evicts_its_entries() {
 
     staging.finish(segment).await.unwrap();
 
-    assert!(staging.pending_segments().await.is_empty());
+    assert!(staging.pending_segments().is_empty());
     assert!(!staging.contains(key).await);
 }
 
@@ -131,7 +131,7 @@ async fn reopening_finds_pending_segments_left_by_a_previous_instance() {
 
     let reopened = open(dir.path()).await;
 
-    assert_eq!(reopened.pending_segments().await, vec![segment]);
+    assert_eq!(reopened.pending_segments(), vec![segment]);
     assert_eq!(reopened.get(key).await.unwrap(), Some(value));
 }
 
@@ -187,14 +187,14 @@ async fn put_refuses_once_max_pending_segments_are_stuck() {
         staging.put(key, value).await.unwrap();
         staging.rotate().await.unwrap();
     }
-    assert_eq!(staging.pending_segments().await.len(), 2);
+    assert_eq!(staging.pending_segments().len(), 2);
 
     let (key, value) = encode(b"c");
     let err = staging.put(key, value.clone()).await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::Other);
 
     // Finishing one segment frees a slot for the next write.
-    let oldest = staging.pending_segments().await[0];
+    let oldest = staging.pending_segments()[0];
     staging.finish(oldest).await.unwrap();
     staging.put(key, value.clone()).await.unwrap();
     assert_eq!(staging.get(key).await.unwrap(), Some(value));

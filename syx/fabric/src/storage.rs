@@ -621,7 +621,7 @@ async fn flush_pending(
     flushing: &Flushing,
     _guard: OwnedMutexGuard<()>,
 ) -> io::Result<()> {
-    let mut segments = staging.pending_segments().await;
+    let mut segments = staging.pending_segments();
     if staging.active_len() > 0 {
         segments.push(staging.rotate().await?);
         flushing.reset_staging_since();
