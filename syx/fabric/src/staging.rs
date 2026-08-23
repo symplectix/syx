@@ -193,6 +193,10 @@ struct RotateMsg {
 /// each paying for its own (see the module doc's "Concurrency" section).
 struct Committer {
     dir:        PathBuf,
+    /// The active segment's id. `Segment` itself doesn't carry one (see
+    /// its own doc); tracked here alongside `segment`, the same way
+    /// `offset` and `records` are.
+    id:         FileId,
     /// The active segment. Only the committer itself ever reads or
     /// writes it -- nothing outside needs a `Segment` for the active
     /// one specifically: `find`'s only caller never asks for it (see
@@ -355,10 +359,10 @@ impl Committer {
     /// `Rotate` can never jump ahead of `Put`s that were sent first.
     async fn rotate(&mut self) -> io::Result<FileId> {
         let old = self.segment.clone();
+        let old_id = self.id;
         let records = std::mem::take(&mut self.records);
         self.start_fresh_segment().await?;
 
-        let old_id = old.id;
         let _ = old.seal();
         self.pending.insert(old_id, Pending { segment: old, records });
         Ok(old_id)
@@ -373,13 +377,11 @@ impl Committer {
     /// and the next `open` will find and replay it like any other
     /// segment left over from a previous run.
     async fn poison(&mut self) -> io::Result<()> {
-        let old_id = self.segment.id;
+        let old_id = self.id;
         self.start_fresh_segment().await?;
 
         let path = segment_path(&self.dir, old_id);
-        if let Some((segment, records)) =
-            revalidate_segment(old_id, &path, Some(self.codec)).await?
-        {
+        if let Some((segment, records)) = revalidate_segment(&path, Some(self.codec)).await? {
             let _ = segment.seal();
             {
                 let mut index = self.index.write().await;
@@ -396,12 +398,13 @@ impl Committer {
     /// for whatever segment was active before -- callers decide what,
     /// if anything, becomes visible for it.
     async fn start_fresh_segment(&mut self) -> io::Result<()> {
-        let next = self.segment.id.next();
-        let segment = Segment::create(next, segment_path(&self.dir, next)).await?;
+        let next = self.id.next();
+        let segment = Segment::create(segment_path(&self.dir, next)).await?;
 
         self.offset = 0;
         self.active_len.store(0, Ordering::Relaxed);
         self.records.clear();
+        self.id = next;
         self.segment = segment;
         Ok(())
     }
@@ -470,7 +473,7 @@ impl Staging {
             // have been active when the previous run stopped needs
             // verifying.
             let verify = (i + 1 == ids.len()).then_some(codec);
-            let Some((segment, records)) = revalidate_segment(id, &path, verify).await? else {
+            let Some((segment, records)) = revalidate_segment(&path, verify).await? else {
                 continue;
             };
             let _ = segment.seal();
@@ -481,7 +484,7 @@ impl Staging {
         }
 
         let next = ids.last().map_or(FileId::FIRST, |id| id.next());
-        let segment = Segment::create(next, segment_path(&dir, next)).await?;
+        let segment = Segment::create(segment_path(&dir, next)).await?;
 
         let active_len = Arc::new(AtomicU64::new(0));
         let index = Arc::new(RwLock::new(index));
@@ -489,6 +492,7 @@ impl Staging {
         let (commands, rx) = mpsc::unbounded_channel();
         let committer = Committer {
             dir: dir.clone(),
+            id: next,
             segment,
             offset: 0,
             codec,
@@ -702,7 +706,6 @@ fn parse(buf: &Bytes, codec: Option<Codec>) -> (u64, Vec<Record>) {
 /// either an empty active segment that was created but never written to,
 /// or one torn so badly not even its first record survived.
 async fn revalidate_segment(
-    id: FileId,
     path: &Path,
     verify: Option<Codec>,
 ) -> io::Result<Option<(Segment, Vec<Record>)>> {
@@ -721,7 +724,7 @@ async fn revalidate_segment(
         return Ok(None);
     }
 
-    let segment = Segment::open(id, path.to_owned()).await?;
+    let segment = Segment::open(path.to_owned()).await?;
     Ok(Some((segment, records)))
 }
 

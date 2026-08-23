@@ -18,12 +18,13 @@ use std::{
 use bytes::Bytes;
 use tokio::task;
 
-/// A segment's identity and open file, whether it's the one currently
-/// being appended to or one already rotated out.
+/// A segment's open file, whether it's the one currently being appended
+/// to or one already rotated out. Doesn't carry its own `FileId`: that's
+/// tracked separately by whoever cares which segment this is (see
+/// `staging`'s `Committer::id`, and `pending`'s own `FileId` keys) --
+/// nothing in this module ever needs to read it back.
 #[derive(Clone)]
 pub(super) struct Segment {
-    pub(super) id: FileId,
-
     /// This segment's open file. `mmap` itself, once sealing calls for
     /// it, maps this same file. While this is the active segment, it's
     /// also the one handle `Committer` appends through.
@@ -53,19 +54,19 @@ struct File(Arc<std::fs::File>);
 struct Mmap(Arc<OnceLock<Bytes>>);
 
 impl Segment {
-    fn new(id: FileId, file: File) -> Segment {
-        Segment { id, file, mmap: Mmap::default() }
+    fn new(file: File) -> Segment {
+        Segment { file, mmap: Mmap::default() }
     }
 
-    /// Creates a brand new, empty segment file for `id` at `path`.
-    pub(super) async fn create(id: FileId, path: PathBuf) -> io::Result<Segment> {
-        File::create(path).await.map(|file| Segment::new(id, file))
+    /// Creates a brand new, empty segment file at `path`.
+    pub(super) async fn create(path: PathBuf) -> io::Result<Segment> {
+        File::create(path).await.map(Segment::new)
     }
 
-    /// Opens `id`'s existing segment file read-only, for one found
-    /// already on disk left over from a previous run.
-    pub(super) async fn open(id: FileId, path: PathBuf) -> io::Result<Segment> {
-        File::open(path).await.map(|file| Segment::new(id, file))
+    /// Opens the existing segment file at `path` read-only, for one
+    /// found already on disk left over from a previous run.
+    pub(super) async fn open(path: PathBuf) -> io::Result<Segment> {
+        File::open(path).await.map(Segment::new)
     }
 
     /// Appends `buf` to this segment's file. Not yet durable on its own
@@ -275,7 +276,7 @@ mod tests {
     #[tokio::test]
     async fn seal_is_visible_through_every_earlier_clone() {
         let dir = testing::tempdir();
-        let segment = Segment::create(FileId::FIRST, dir.path().join("0.log")).await.unwrap();
+        let segment = Segment::create(dir.path().join("0.log")).await.unwrap();
 
         // Cloned before `seal` runs: no mapping yet, since `Mmap` starts
         // empty and `create` never establishes one.
