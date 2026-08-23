@@ -68,10 +68,19 @@ impl Segment {
         File::open(path).await.map(|file| Segment::new(id, file))
     }
 
-    /// Appends `buf` to this segment's file and durably syncs it. Only
-    /// ever called by `Committer`, on the active segment.
+    /// Appends `buf` to this segment's file. Not yet durable on its own
+    /// -- see `flush`. Only ever called by `Committer`, on the active
+    /// segment.
     pub(super) async fn append(&self, buf: Bytes) -> io::Result<()> {
         self.file.append(buf).await
+    }
+
+    /// Syncs everything appended so far to durable storage. Split from
+    /// `append` so a caller batching several appends into one buffer
+    /// (see `Committer::commit`) pays for one `write` and one sync, not
+    /// a sync per append.
+    pub(super) async fn flush(&self) -> io::Result<()> {
+        self.file.flush().await
     }
 
     /// Reads `length` bytes at `offset`: sliced zero-copy from the
@@ -150,16 +159,18 @@ impl File {
         .expect("open should not panic")
     }
 
-    /// Appends `buf` and durably syncs it.
+    /// Appends `buf`. Not yet durable on its own.
     async fn append(&self, buf: Bytes) -> io::Result<()> {
         let file = Arc::clone(&self.0);
-        task::spawn_blocking(move || -> io::Result<()> {
-            let mut w = &*file;
-            w.write_all(&buf)?;
-            file.sync_data()
-        })
-        .await
-        .expect("write should not panic")
+        task::spawn_blocking(move || (&*file).write_all(&buf))
+            .await
+            .expect("write should not panic")
+    }
+
+    /// Syncs everything appended so far to durable storage.
+    async fn flush(&self) -> io::Result<()> {
+        let file = Arc::clone(&self.0);
+        task::spawn_blocking(move || file.sync_data()).await.expect("flush should not panic")
     }
 
     /// Reads exactly `length` bytes at `offset`. Safe to call
@@ -175,17 +186,6 @@ impl File {
         .await
         .expect("read_at should not panic")
         .map(Bytes::from)
-    }
-
-    /// Maps the whole file read-only. Unlike this type's other
-    /// operations, not blocking I/O worth moving off the calling task:
-    /// `mmap(2)` only sets up the mapping, faulting pages in lazily as
-    /// they're actually read, rather than reading the file itself.
-    fn mmap(&self) -> io::Result<Bytes> {
-        // Safety: only ever called on a segment that's already fully
-        // and durably written and sealed into `pending` -- nothing
-        // writes to it again from this point on (see the module doc).
-        unsafe { memmap2::Mmap::map(&*self.0) }.map(Bytes::from_owner)
     }
 }
 
@@ -215,12 +215,18 @@ impl Mmap {
         if let Some(bytes) = self.get() {
             return Ok(bytes);
         }
-        let bytes = file.mmap()?;
-        // If another caller (or `seal`) won the race and already set
-        // this, keep their copy rather than ours -- either is a valid
-        // mapping of the same bytes, but `get` should always return the
-        // one every other reader is also seeing.
-        Ok(self.0.get_or_init(|| bytes.clone()).clone())
+        // Safety: only ever called on a segment that's already fully
+        // and durably written and sealed into `pending`.
+        //
+        // Not `MmapOptions::populate`: it would fault in the whole file
+        // synchronously, inside a call this module doesn't spawn_blocking
+        // on the assumption that `mmap(2)` itself is cheap. `open`'s
+        // replay is the one call site where that might not hold.
+        //
+        // TODO: A losing caller still maps the file itself.
+        // Switch to `get_or_try_init` once it stabilizes, to skip that.
+        let mmap = unsafe { memmap2::Mmap::map(&*file.0)? };
+        Ok(self.0.get_or_init(move || Bytes::from_owner(mmap)).clone())
     }
 }
 

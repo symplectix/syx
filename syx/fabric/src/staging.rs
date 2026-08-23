@@ -198,10 +198,11 @@ impl Committer {
     /// Runs until every `Staging` handle (and thus every `commands`
     /// sender) is dropped.
     async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
-        // A `Rotate` peeked while draining a batch, but not yet allowed
-        // to run, since everything sent before it still needs to land
-        // in the segment it's about to seal.
+        // A `Rotate` peeked while draining a batch.
         let mut carried: Option<Command> = None;
+        // Reused across every `Put` batch, `commit` drains it empty
+        // (keeping its capacity) rather than consuming it.
+        let mut batch: Vec<PutMsg> = Vec::new();
         loop {
             // Each iteration handles exactly one `Command`: a `Rotate`
             // runs by itself, a `Put` drains whatever else is already
@@ -232,7 +233,7 @@ impl Committer {
                     // next commit's own write keeps the queue filling
                     // while this one runs, so batches converge on their
                     // own without ever adding latency to wait for one.
-                    let mut batch = vec![first];
+                    batch.push(first);
                     loop {
                         match commands.try_recv() {
                             Ok(Command::Put(msg)) => batch.push(msg),
@@ -243,50 +244,67 @@ impl Committer {
                             Err(_) => break,
                         }
                     }
-                    self.commit(batch).await;
+                    self.commit(&mut batch).await;
                 }
             }
         }
     }
 
-    /// Writes every record in `batch` with one `write`+`sync_data` call,
-    /// then publishes their locations and replies to every waiter. The
-    /// group commit itself: the cost of one `fsync`-equivalent call is
-    /// shared across however many `put`s happened to be ready when this
-    /// batch was drained.
-    async fn commit(&mut self, batch: Vec<PutMsg>) {
-        let mut buf = BytesMut::new();
+    /// Appends every record in `batch`, then syncs once with a single
+    /// `flush` call, and publishes their locations and replies to every
+    /// waiter. The group commit itself: `write` is cheap (it only lands
+    /// in the page cache), so nothing is gained batching it into one
+    /// call, but the cost of one `fsync`-equivalent `flush` is shared
+    /// across however many `put`s happened to be ready when this batch
+    /// was drained.
+    async fn commit(&mut self, batch: &mut Vec<PutMsg>) {
         let mut locations = Vec::with_capacity(batch.len());
         let mut offset = self.offset;
-        for msg in &batch {
-            let record = encode_record(msg.key, &msg.value);
+        let mut written = Ok(());
+        for msg in batch.iter() {
             let value_offset = offset + RECORD_HEADER_LEN;
-            offset += record.len() as u64;
-            buf.extend_from_slice(&record);
+            offset += RECORD_HEADER_LEN + msg.value.len() as u64;
+
+            let mut header = BytesMut::with_capacity(RECORD_HEADER_LEN as usize);
+            header.extend_from_slice(msg.key.as_ref());
+            header.put_u32(msg.value.len() as u32);
+            // Appended separately from `msg.value`, not concatenated into
+            // one buffer first: `Bytes` is contiguous, so concatenating
+            // would mean copying `value` (already an owned `Bytes`) into a
+            // fresh one just to hand it to `append`. `value.clone()` is
+            // just a refcount bump, no copy.
+            if let Err(e) = self.segment.append(header.freeze()).await {
+                written = Err(e);
+                break;
+            }
+            if let Err(e) = self.segment.append(msg.value.clone()).await {
+                written = Err(e);
+                break;
+            }
+
             locations.push(Location {
                 segment: self.segment.clone(),
                 offset:  value_offset,
                 length:  msg.value.len() as u32,
             });
         }
-        let result = self.segment.append(buf.freeze()).await;
+        let result = match written {
+            Ok(()) => self.segment.flush().await,
+            Err(e) => Err(e),
+        };
 
         match result {
             Ok(()) => {
                 self.offset = offset;
                 self.active_len.store(offset, Ordering::Relaxed);
-                {
-                    let mut index = self.index.write().await;
-                    for (msg, location) in batch.iter().zip(&locations) {
-                        index.insert(msg.key, location.clone());
-                    }
-                }
-                for msg in batch {
+                let mut index = self.index.write().await;
+                for (msg, location) in batch.drain(..).zip(locations) {
+                    index.insert(msg.key, location);
                     let _ = msg.reply.send(Ok(offset));
                 }
             }
             Err(e) => {
-                for msg in batch {
+                for msg in batch.drain(..) {
                     let _ = msg.reply.send(Err(io::Error::new(e.kind(), e.to_string())));
                 }
                 // See the module doc's last paragraph: this segment's
@@ -571,14 +589,6 @@ impl Staging {
 }
 
 const RECORD_HEADER_LEN: u64 = 32 + 4;
-
-fn encode_record(key: Digest, value: &Bytes) -> Bytes {
-    let mut buf = BytesMut::with_capacity(RECORD_HEADER_LEN as usize + value.len());
-    buf.extend_from_slice(key.as_ref());
-    buf.put_u32(value.len() as u32);
-    buf.extend_from_slice(value);
-    buf.freeze()
-}
 
 /// Parses records from `buf` in order, returning each one's key and the
 /// byte range its value occupies within `buf`, plus how many bytes from
