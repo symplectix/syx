@@ -26,8 +26,10 @@
 //! ## Object Store
 //!
 //! - `cas/sha256/{pack_id:x}`: one object per consolidated segment, hex-encoded. A pack object's
-//!   bytes are just its packed entries' concatenated bytes. A `Entry`'s `offset`/`length` say where
-//!   its bytes start and how long they run within that concatenation.
+//!   bytes are exactly the staging segment's own sealed bytes (see `staging`'s module doc for its
+//!   `[key][len][value]` framing) -- uploaded as-is, not decoded and reassembled first. An
+//!   `Entry`'s `offset`/`length` point past a record's header, at its value, the same offsets
+//!   `staging` already parsed out of the segment.
 use std::io;
 use std::ops::Range;
 use std::pin::pin;
@@ -647,32 +649,38 @@ async fn flush_segments(
     segments: Vec<staging::FileId>,
 ) -> io::Result<()> {
     for segment in segments {
-        let staged = staging.entries(segment).await?;
-        if staged.is_empty() {
+        let (buf, records) = staging.segment_bytes(segment).await?;
+        if records.is_empty() {
             staging.finish(segment).await?;
             continue;
         }
 
-        // Each staged value is kept as its own `Bytes`, not copied into
-        // one contiguous buffer, since `PutPayload` is itself a cheaply
-        // cloneable sequence of `Bytes`.
-        let pack_id = Hasher::new().parts(staged.iter().map(|(_, b)| b.as_ref())).digest();
-        let mut entries = Vec::with_capacity(staged.len());
-        let mut chunks = Vec::with_capacity(staged.len());
-        let mut offset: u64 = 0;
-        for (digest, bytes) in staged {
-            let length = bytes.len() as u64;
-            entries.push((digest, Entry { pack_id, offset, length }));
-            offset += length;
-            chunks.push(bytes);
+        // A pack object's bytes are exactly a staging segment's own
+        // sealed bytes (see `Staging::segment_bytes`), so `buf` is
+        // uploaded as-is instead of being decoded and reassembled into
+        // a fresh payload. Only `pack_id` -- a hash of just the values,
+        // not the `[key][len]` framing around them -- still needs
+        // computing.
+        let mut hasher = Hasher::new();
+        for record in &records {
+            let value = buf
+                .slice(record.offset as usize..(record.offset + u64::from(record.length)) as usize);
+            hasher.part(value.as_ref());
         }
+        let pack_id = hasher.digest();
 
         let path = pack_path(cas_prefix, pack_id);
-        blobs.put(&path, PutPayload::from_iter(chunks)).await.map_err(io::Error::from)?;
+        // Still a `put` through the `ObjectStore` trait, not a raw file
+        // copy: for a `LocalFileSystem`-backed store, the segment file
+        // could in principle just be renamed into place instead, but
+        // that needs backend-specific code `ObjectStore`'s trait doesn't
+        // expose, so it isn't attempted here.
+        blobs.put(&path, PutPayload::from_bytes(buf)).await.map_err(io::Error::from)?;
 
         let mut batch = slatedb::WriteBatch::new();
-        for (digest, entry) in entries {
-            batch.put_bytes(Bytes::from(entry_key(cas_prefix, digest)), entry.encode());
+        for record in records {
+            let entry = Entry { pack_id, offset: record.offset, length: u64::from(record.length) };
+            batch.put_bytes(Bytes::from(entry_key(cas_prefix, record.key)), entry.encode());
         }
         db.write(batch).await.map_err(other)?;
 
