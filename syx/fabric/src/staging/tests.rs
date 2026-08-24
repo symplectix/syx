@@ -70,23 +70,22 @@ async fn rotate_moves_the_active_segment_into_pending_and_resets_active_len() {
 }
 
 #[tokio::test]
-async fn rotate_seals_a_mapping_a_location_captured_before_it_can_see() {
+async fn rotate_seals_a_mapping_a_segment_captured_before_it_can_see() {
     let dir = testing::tempdir();
     let staging = open(dir.path()).await;
     let (key, value) = encode(b"hello");
     staging.put(key, value.clone()).await.unwrap();
 
-    // `index`'s `Location` was captured while the segment was still
-    // active: no mapping yet.
-    assert!(!staging.index.read().await.get(&key).unwrap().segment.mmap_established());
+    // Captured while the segment was still active: no mapping yet.
+    let segment = staging.active.read().await.segment.clone();
+    assert!(!segment.mmap_established());
 
     staging.rotate().await.unwrap();
 
-    // The same `Location` -- `index` was never touched again since the
-    // `put` above -- now sees the mapping `seal` established while
-    // rotating, proving it's a shared cell doing this and not a fresh
-    // lookup back into `pending`.
-    assert!(staging.index.read().await.get(&key).unwrap().segment.mmap_established());
+    // The same clone, never re-fetched since, now sees the mapping
+    // `seal` established while rotating, proving it's a shared cell
+    // doing this and not a fresh lookup back into `pending`.
+    assert!(segment.mmap_established());
     assert_eq!(staging.get(key).await.unwrap(), Some(value));
 }
 
@@ -101,8 +100,12 @@ async fn entries_returns_everything_written_to_a_pending_segment() {
 
     let segment = staging.rotate().await.unwrap();
 
+    // Unordered: `entries` no longer promises write order now that
+    // `Pending::records` is keyed by digest, not a sequence.
     let entries = staging.entries(segment).await.unwrap();
-    assert_eq!(entries, vec![(key_a, value_a), (key_b, value_b)]);
+    assert_eq!(entries.len(), 2);
+    assert!(entries.contains(&(key_a, value_a)));
+    assert!(entries.contains(&(key_b, value_b)));
 }
 
 #[tokio::test]

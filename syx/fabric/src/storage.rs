@@ -662,9 +662,9 @@ async fn flush_segments(
         // not the `[key][len]` framing around them -- still needs
         // computing.
         let mut hasher = Hasher::new();
-        for record in &records {
-            let value = buf
-                .slice(record.offset as usize..(record.offset + u64::from(record.length)) as usize);
+        for slot in records.values() {
+            let value =
+                buf.slice(slot.offset as usize..(slot.offset + u64::from(slot.length)) as usize);
             hasher.part(value.as_ref());
         }
         let pack_id = hasher.digest();
@@ -678,9 +678,9 @@ async fn flush_segments(
         blobs.put(&path, PutPayload::from_bytes(buf)).await.map_err(io::Error::from)?;
 
         let mut batch = slatedb::WriteBatch::new();
-        for record in records {
-            let entry = Entry { pack_id, offset: record.offset, length: u64::from(record.length) };
-            batch.put_bytes(Bytes::from(entry_key(cas_prefix, record.key)), entry.encode());
+        for (digest, slot) in records {
+            let entry = Entry { pack_id, offset: slot.offset, length: u64::from(slot.length) };
+            batch.put_bytes(Bytes::from(entry_key(cas_prefix, digest)), entry.encode());
         }
         db.write(batch).await.map_err(other)?;
 

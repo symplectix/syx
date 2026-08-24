@@ -36,44 +36,38 @@
 //! channel, in the order they were sent, `rotate` can never seal a
 //! segment out from under a `put` that was sent before it -- the
 //! ordering the committer already needs for its own batching gives this
-//! guarantee for free, no separate lock required. `get`/`contains` only
-//! ever touch a separate index lock and read via position-addressed I/O
-//! (`read_at`/Windows' `seek_read`), so they never wait behind the
-//! committer's `write`/`sync_data` either.
+//! guarantee for free, no separate lock required.
 //!
-//! Each `index` entry carries its own clone of the `Segment` it lives in,
-//! rather than just an id to look up later, so once `put` hands one out,
-//! reading it back never depends on that segment still being tracked in
-//! `pending`. `finish` evicts a segment from `pending` before `index`,
-//! but the order doesn't matter for correctness either way: a `get` that
-//! already read the old `index` entry keeps working (its `Segment`
-//! clone's `File` stays valid even after the underlying path is
-//! unlinked), and one that reads after eviction just misses cleanly, no
-//! different from the key never having been staged.
+//! `get`/`contains` don't consult a flat, all-segments key index: there
+//! isn't one. They check the active segment first (`active`, a lock
+//! shared with the committer), then every pending one, oldest first
+//! (`pending`, lock-free). Each of `active` and every `pending` entry
+//! bundles its `Segment` together with its own `Digest -> Slot` map as
+//! one unit, so a key found in one always resolves against the matching
+//! segment -- `rotate` swaps both out together, so `records` and
+//! `segment` can never describe different points in time. `active` is
+//! the one lock this ever waits on, and only briefly, right after a
+//! `commit` succeeds; every pending segment is immutable once rotated,
+//! so walking `pending` needs no lock at all. Bounding how many segments
+//! `get` ever has to check (see `max_pending`) is what keeps this cheap.
 //!
-//! The active segment itself is never published anywhere: it lives only
-//! in the committer's own `Committer::segment`, since nothing outside
-//! needs a `Segment` for it specifically (`find`'s only caller never
-//! asks for it, and `get`/`contains` read through `index`'s own captured
-//! clones instead). The one fact about it callers do need, its current
-//! length, is published separately through `active_len`, a plain atomic.
-//! `pending` is the only thing actually shared with the committer, and
-//! it's a lock-free `SkipMap` keyed by `FileId` rather than a lock,
-//! since what it needs is real concurrent insert/remove/lookup by id,
-//! not just readers not blocking a single writer.
+//! Rotating a segment out just moves its `{segment, records}` pair into
+//! `pending`, keyed by `FileId`; `finish` just removes that key. Neither
+//! step touches a second structure to keep in sync -- there isn't one to
+//! forget.
 //!
 //! `get` starts out reading via `read_at`, the same as while the segment
 //! is still active, but switches to slicing a mapped view once one
 //! exists (see `Segment`'s `mmap` field) -- established once, by `seal`,
 //! at the moment a segment is sealed into `pending`, and from then on
-//! shared by every clone of that `Segment` value, including ones `index`
-//! already held from before sealing happened.
+//! shared by every clone of that `Segment` value, including one `get`
+//! obtained from `active` before rotating sealed it into `pending`.
 //!
 //! A `commit` that fails partway poisons the segment it was writing to:
 //! `O_APPEND` guarantees every successful `write` lands at the file's
 //! true end regardless of what this module believes that end is, so a
 //! partial write (or one that landed but whose `sync_data` then failed)
-//! can leave the file longer than `self.offset` accounts for. Rather
+//! can leave the file longer than `active_len` accounts for. Rather
 //! than let later commits compute offsets against that stale belief, the
 //! committer starts a fresh segment immediately and, best-effort,
 //! re-derives the old one's true contents the same way `open` recovers
@@ -81,7 +75,7 @@
 //! nothing durably written is silently lost.
 
 use std::collections::HashMap;
-use std::io;
+use std::ffi::OsStr;
 use std::path::{
     Path,
     PathBuf,
@@ -90,6 +84,10 @@ use std::sync::Arc;
 use std::sync::atomic::{
     AtomicU64,
     Ordering,
+};
+use std::{
+    fmt,
+    io,
 };
 
 use bytes::{
@@ -115,53 +113,75 @@ use tokio::{
 
 mod segment;
 
-pub(crate) use segment::FileId;
-use segment::{
-    Segment,
-    parse_segment_name,
-    segment_path,
-};
+use segment::Segment;
 
 #[cfg(test)]
 mod tests;
 
-#[derive(Clone)]
-struct Location {
-    /// The segment the value lives in, cloned at insert time from
-    /// whatever `Segment` was current then (`commit`, `poison`, or
-    /// `open`'s replay). Reading through this never needs to ask
-    /// `pending` about it, so a read never races a concurrent `finish`
-    /// tearing the segment out.
-    segment: Segment,
-    /// Byte offset of the value within `segment.file`.
-    offset:  u64,
-    /// How many bytes the value is.
-    length:  u32,
+/// One append-only file's identity: `{id:020}.log` in `Staging`'s
+/// directory. A segment is created empty, then appended to sequentially
+/// while it's the active one; once rotated out it never changes again
+/// until `finish` deletes it. `segment` itself doesn't need this (see
+/// its own module doc); it only matters to this module's own
+/// bookkeeping -- `Committer::file_id` and `pending`'s keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FileId(u64);
+
+impl FileId {
+    const FIRST: FileId = FileId(0);
+
+    fn next(self) -> FileId {
+        FileId(self.0 + 1)
+    }
 }
 
-/// One record's key and where its value lives within a segment's bytes:
-/// `offset`/`length` point past the `[key][len]` header, at the value.
+impl fmt::Display for FileId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:020}", self.0)
+    }
+}
+
+fn segment_path(dir: &Path, id: FileId) -> PathBuf {
+    dir.join(format!("{id}.log"))
+}
+
+fn parse_segment_name(name: &OsStr) -> Option<FileId> {
+    name.to_str()?.strip_suffix(".log")?.parse().ok().map(FileId)
+}
+
+/// Where a record's value lives within a segment's bytes: `offset`/
+/// `length` point past the `[key][len]` header, at the value.
 #[derive(Clone, Copy)]
-pub(crate) struct Record {
-    pub(crate) key:    Digest,
+pub(crate) struct Slot {
     pub(crate) offset: u64,
     pub(crate) length: u32,
 }
 
+/// A segment's records, keyed by digest for the O(1) lookup `get`/
+/// `contains` need. Order doesn't matter: each `Slot` is a self-
+/// contained byte range, independent of every other one.
+pub(crate) type Records = HashMap<Digest, Slot>;
+
+/// The active segment together with every record committed to it so
+/// far. Bundled as one unit, under one lock, rather than two separate
+/// fields: a key found in `records` must always resolve against the
+/// exact `segment` it was written to, and `rotate` is the only thing
+/// that ever replaces either -- doing so atomically (see
+/// `Committer::start_fresh_segment`) is what lets a reader trust that
+/// pairing without a lock of its own to race.
+struct Active {
+    segment: Segment,
+    records: Records,
+}
+
 /// One entry of `pending`: a rotated-out segment together with every
-/// record it holds. Kept separate from `Segment` itself, which stays
-/// agnostic to record framing (that's `parse`'s job) and which also
-/// stands alone as the active segment and inside every `Location` --
-/// neither has any use for a whole segment's key list, so it isn't a
-/// field of `Segment`.
-///
-/// `records` is exactly what `finish` needs to evict this segment's
-/// keys from `index` in one pass, and what `flush_segments` needs to
-/// build a pack's `Entry`s, without either re-parsing `segment`.
+/// record it holds. Same shape as `Active`, but immutable once
+/// inserted -- a pending segment is never written to again -- so no
+/// lock is needed to read one back.
 #[derive(Clone)]
 struct Pending {
     segment: Segment,
-    records: Vec<Record>,
+    records: Records,
 }
 
 /// A request handed to the committer task over its `commands` channel.
@@ -192,31 +212,30 @@ struct RotateMsg {
 /// concurrent `put`s can share one `write`+`sync_data` call instead of
 /// each paying for its own (see the module doc's "Concurrency" section).
 struct Committer {
-    dir:        PathBuf,
-    /// The active segment's id. `Segment` itself doesn't carry one (see
-    /// its own doc); tracked here alongside `segment`, the same way
-    /// `offset` and `records` are.
-    id:         FileId,
-    /// The active segment. Only the committer itself ever reads or
-    /// writes it -- nothing outside needs a `Segment` for the active
-    /// one specifically: `find`'s only caller never asks for it (see
-    /// its own doc), and `get`/`contains` read through `index`'s own
-    /// captured `Segment` clones instead. `Staging::active_len` covers
-    /// the one thing about the active segment external callers do need.
-    segment:    Segment,
-    /// The next unwritten offset in the active segment. Only the
-    /// committer itself ever advances this; `Staging::active_len` reads
-    /// the published copy in `active_len` instead.
-    offset:     u64,
+    dir:   PathBuf,
     /// Verifies a poisoned segment's recovered tail the same way `open`
     /// verifies a crash-torn one; see `poison`.
-    codec:      Codec,
+    codec: Codec,
+
+    /// The active segment's id. `Segment` itself doesn't carry one (see
+    /// its own doc); tracked here alongside `segment`.
+    file_id:    FileId,
+    /// The published view of the active segment, shared with `Staging`
+    /// for `get`/`contains`; see `Active`'s own doc.
+    active:     Arc<RwLock<Active>>,
+    /// The active segment's current length, and the next unwritten
+    /// offset within it (the same number: nothing is ever removed from
+    /// its middle). The committer's only record of it -- there's no
+    /// separate private copy, since a relaxed load always sees this
+    /// same task's own last store.
     active_len: Arc<AtomicU64>,
-    /// Every record `commit` has written to the active segment so far,
-    /// in order. Handed off to `pending` as `Pending::records` by
-    /// `rotate` (or replaced outright by `poison`'s own re-derived
-    /// records); reset by `start_fresh_segment` either way.
-    records:    Vec<Record>,
+    /// The active segment. A private working copy: writes go through
+    /// this directly, without ever taking `active`'s lock, so a `put`'s
+    /// `append`+`flush` never waits behind a `get`/`contains` reader (or
+    /// vice versa). Kept in sync with `active`'s own copy by
+    /// `start_fresh_segment`, the only place either one changes.
+    segment:    Segment,
+
     /// Rotated out, not yet `finish`ed. Structurally can never contain
     /// the active segment, so nothing removing from it needs to guard
     /// against accidentally sealing the one still being written to.
@@ -224,8 +243,7 @@ struct Committer {
     /// `Staging::pending_segments`) is a fact of the type, not a
     /// convention `rotate`/`poison` have to uphold by always inserting
     /// at the end.
-    pending:    Arc<SkipMap<FileId, Pending>>,
-    index:      Arc<RwLock<HashMap<Digest, Location>>>,
+    pending: Arc<SkipMap<FileId, Pending>>,
 }
 
 impl Committer {
@@ -292,8 +310,8 @@ impl Committer {
     /// across however many `put`s happened to be ready when this batch
     /// was drained.
     async fn commit(&mut self, batch: &mut Vec<PutMsg>) {
-        let mut locations = Vec::with_capacity(batch.len());
-        let mut offset = self.offset;
+        let mut slots = Vec::with_capacity(batch.len());
+        let mut offset = self.active_len.load(Ordering::Relaxed);
         let mut written = Ok(());
         for msg in batch.iter() {
             let value_offset = offset + RECORD_HEADER_LEN;
@@ -316,11 +334,7 @@ impl Committer {
                 break;
             }
 
-            locations.push(Location {
-                segment: self.segment.clone(),
-                offset:  value_offset,
-                length:  msg.value.len() as u32,
-            });
+            slots.push(Slot { offset: value_offset, length: msg.value.len() as u32 });
         }
         let result = match written {
             Ok(()) => self.segment.flush().await,
@@ -329,16 +343,10 @@ impl Committer {
 
         match result {
             Ok(()) => {
-                self.offset = offset;
                 self.active_len.store(offset, Ordering::Relaxed);
-                let mut index = self.index.write().await;
-                for (msg, location) in batch.drain(..).zip(locations) {
-                    self.records.push(Record {
-                        key:    msg.key,
-                        offset: location.offset,
-                        length: location.length,
-                    });
-                    index.insert(msg.key, location);
+                let mut active = self.active.write().await;
+                for (msg, slot) in batch.drain(..).zip(slots) {
+                    active.records.insert(msg.key, slot);
                     let _ = msg.reply.send(Ok(offset));
                 }
             }
@@ -347,7 +355,7 @@ impl Committer {
                     let _ = msg.reply.send(Err(io::Error::new(e.kind(), e.to_string())));
                 }
                 // See the module doc's last paragraph: this segment's
-                // true tail is no longer known from `self.offset` alone.
+                // true tail is no longer known from `active_len` alone.
                 let _ = self.poison().await;
             }
         }
@@ -358,18 +366,16 @@ impl Committer {
     /// free: both run inside the same single-consumer loop, so a
     /// `Rotate` can never jump ahead of `Put`s that were sent first.
     async fn rotate(&mut self) -> io::Result<FileId> {
-        let old = self.segment.clone();
-        let old_id = self.id;
-        let records = std::mem::take(&mut self.records);
-        self.start_fresh_segment().await?;
+        let old_id = self.file_id;
+        let old = self.start_fresh_segment().await?;
 
-        let _ = old.seal();
-        self.pending.insert(old_id, Pending { segment: old, records });
+        let _ = old.segment.seal();
+        self.pending.insert(old_id, Pending { segment: old.segment, records: old.records });
         Ok(old_id)
     }
 
     /// Handles a `commit` that failed partway. Starts a fresh segment
-    /// immediately so later commits don't inherit a stale `self.offset`,
+    /// immediately so later commits don't inherit a stale `active_len`,
     /// then, best-effort, re-derives what actually landed durably in the
     /// old one (the same recovery `Staging::open` runs at startup) and
     /// publishes whatever of it is valid. If that recovery itself fails,
@@ -377,36 +383,34 @@ impl Committer {
     /// and the next `open` will find and replay it like any other
     /// segment left over from a previous run.
     async fn poison(&mut self) -> io::Result<()> {
-        let old_id = self.id;
-        self.start_fresh_segment().await?;
+        let old_id = self.file_id;
+        // The replaced `Active` is discarded: whatever it believes it
+        // holds may not match what's actually durable, which is exactly
+        // what `revalidate_segment` below re-derives from disk instead.
+        let _ = self.start_fresh_segment().await?;
 
         let path = segment_path(&self.dir, old_id);
         if let Some((segment, records)) = revalidate_segment(&path, Some(self.codec)).await? {
             let _ = segment.seal();
-            {
-                let mut index = self.index.write().await;
-                for &Record { key, offset, length } in &records {
-                    index.insert(key, Location { segment: segment.clone(), offset, length });
-                }
-            }
             self.pending.insert(old_id, Pending { segment, records });
         }
         Ok(())
     }
 
-    /// Starts a brand new active segment. Doesn't touch `pending`/`index`
-    /// for whatever segment was active before -- callers decide what,
-    /// if anything, becomes visible for it.
-    async fn start_fresh_segment(&mut self) -> io::Result<()> {
-        let next = self.id.next();
+    /// Starts a brand new active segment, swapping it (and a fresh,
+    /// empty `Active`) in for both `self.segment` and the published
+    /// `active`. Returns the `Active` this replaced, so `rotate` can
+    /// hand it off to `pending`.
+    async fn start_fresh_segment(&mut self) -> io::Result<Active> {
+        let next = self.file_id.next();
         let segment = Segment::create(segment_path(&self.dir, next)).await?;
 
-        self.offset = 0;
         self.active_len.store(0, Ordering::Relaxed);
-        self.records.clear();
-        self.id = next;
-        self.segment = segment;
-        Ok(())
+        self.file_id = next;
+        self.segment = segment.clone();
+
+        let fresh = Active { segment, records: Records::new() };
+        Ok(std::mem::replace(&mut *self.active.write().await, fresh))
     }
 }
 
@@ -419,18 +423,16 @@ pub(crate) struct Staging {
     /// concurrent `put`s. `put` itself doesn't need this: it gets the
     /// same value back directly from the committer.
     active_len:  Arc<AtomicU64>,
+    /// The active segment and its records so far; see `Committer`'s own
+    /// field of the same name.
+    active:      Arc<RwLock<Active>>,
     /// Rotated out, not yet `finish`ed; see `Committer`'s own field of
     /// the same name.
     pending:     Arc<SkipMap<FileId, Pending>>,
-    /// Every staged key's location, across every segment. A separate
-    /// lock from `pending`, so `get`/`contains` never wait behind the
-    /// committer's `write`/`sync_data` -- and self-sufficient (each
-    /// entry carries its own clone of the `Segment` it lives in), so
-    /// `get` never needs `pending` at all.
-    index:       Arc<RwLock<HashMap<Digest, Location>>>,
     /// `put` refuses new writes once pending segments reach this many,
     /// so a persistently failing `flush_pending` bounds local disk usage
-    /// instead of growing it without limit.
+    /// instead of growing it without limit. Also what bounds `get`'s own
+    /// cost: see the module doc's "Concurrency" section.
     max_pending: u16,
     /// Where `put`/`rotate` send their requests; the committer task
     /// holds the matching receiver for as long as any `Staging` handle
@@ -464,7 +466,6 @@ impl Staging {
         }
         ids.sort_unstable();
 
-        let mut index = HashMap::new();
         let pending = Arc::new(SkipMap::new());
         for (i, &id) in ids.iter().enumerate() {
             let path = segment_path(&dir, id);
@@ -477,9 +478,6 @@ impl Staging {
                 continue;
             };
             let _ = segment.seal();
-            for &Record { key, offset, length } in &records {
-                index.insert(key, Location { segment: segment.clone(), offset, length });
-            }
             pending.insert(id, Pending { segment, records });
         }
 
@@ -487,32 +485,28 @@ impl Staging {
         let segment = Segment::create(segment_path(&dir, next)).await?;
 
         let active_len = Arc::new(AtomicU64::new(0));
-        let index = Arc::new(RwLock::new(index));
+        let active =
+            Arc::new(RwLock::new(Active { segment: segment.clone(), records: Records::new() }));
 
         let (commands, rx) = mpsc::unbounded_channel();
         let committer = Committer {
             dir: dir.clone(),
-            id: next,
+            file_id: next,
             segment,
-            offset: 0,
             codec,
             active_len: Arc::clone(&active_len),
-            records: Vec::new(),
+            active: Arc::clone(&active),
             pending: Arc::clone(&pending),
-            index: Arc::clone(&index),
         };
         tokio::spawn(committer.run(rx));
 
-        Ok(Self { dir, active_len, pending, index, max_pending, commands })
+        Ok(Self { dir, active_len, active, pending, max_pending, commands })
     }
 
     /// The `Pending` entry for `id`. Panics if it isn't tracked: its
     /// only caller (`segment_bytes`) only ever asks for one it already
     /// knows must still be open, from `pending_segments`/`rotate`'s own
-    /// return value -- so this is never asked about the active segment,
-    /// only a pending one. `get` doesn't call this either -- its
-    /// `Location`s carry their own `Segment` clone, so a read never
-    /// needs to ask `pending` about a segment at all.
+    /// return value -- so this is never asked about the active segment.
     fn find(&self, id: FileId) -> Pending {
         self.pending
             .get(&id)
@@ -545,18 +539,34 @@ impl Staging {
         response.await.map_err(|_| io::Error::other("staging: committer task is gone"))?
     }
 
-    /// Fetches the value staged under `key`, if any.
+    /// Fetches the value staged under `key`, if any. Checks the active
+    /// segment first, then every pending one, oldest first; see the
+    /// module doc's "Concurrency" section for why this is cheap.
     pub(crate) async fn get(&self, key: Digest) -> io::Result<Option<Bytes>> {
-        let Some(location) = self.index.read().await.get(&key).cloned() else {
-            return Ok(None);
+        // `active`'s lock is held only long enough to clone out a match
+        // (cheap: `Segment` is `Arc`-backed) -- not across the actual
+        // read below, which needs no lock of its own.
+        let found = {
+            let active = self.active.read().await;
+            active.records.get(&key).map(|slot| (active.segment.clone(), *slot))
         };
-        let bytes = location.segment.read(location.offset, location.length).await?;
-        Ok(Some(bytes))
+        if let Some((segment, slot)) = found {
+            return segment.read_at(slot.offset, slot.length).await.map(Some);
+        }
+        for entry in self.pending.iter() {
+            if let Some(slot) = entry.value().records.get(&key) {
+                return entry.value().segment.read_at(slot.offset, slot.length).await.map(Some);
+            }
+        }
+        Ok(None)
     }
 
     /// Whether `key` is currently staged, without reading its value.
     pub(crate) async fn contains(&self, key: Digest) -> bool {
-        self.index.read().await.contains_key(&key)
+        if self.active.read().await.records.contains_key(&key) {
+            return true;
+        }
+        self.pending.iter().any(|entry| entry.value().records.contains_key(&key))
     }
 
     /// How many bytes the active segment currently holds. `put` already
@@ -586,9 +596,8 @@ impl Staging {
     }
 
     /// The sealed segment's whole-file bytes, and every record's key,
-    /// offset, and length within them, in the order they were written.
-    /// `id` must have come from `rotate` or `pending_segments`; it is
-    /// never the active segment.
+    /// offset, and length within them. `id` must have come from `rotate`
+    /// or `pending_segments`; it is never the active segment.
     ///
     /// Just reads `find`'s `Pending`: `records` was already parsed once
     /// (by `commit`, `poison`, or `open`'s replay) when this segment
@@ -606,17 +615,16 @@ impl Staging {
     /// Usually reuses the mapping `seal` already established when this
     /// segment was sealed into `pending`; only maps it itself if that
     /// didn't happen or failed.
-    pub(crate) async fn segment_bytes(&self, id: FileId) -> io::Result<(Bytes, Vec<Record>)> {
+    pub(crate) async fn segment_bytes(&self, id: FileId) -> io::Result<(Bytes, Records)> {
         let pending = self.find(id);
         let buf = pending.segment.seal()?;
         Ok((buf, pending.records))
     }
 
-    /// Every `(key, value)` pair in `id`'s segment, in the order they
-    /// were written. Each value is a zero-copy `Bytes` view into
-    /// `segment_bytes`'s buffer, so bytes flow from the page cache
-    /// straight into whatever the caller does with them without an
-    /// intermediate copy into a fresh buffer.
+    /// Every `(key, value)` pair in `id`'s segment. Each value is a
+    /// zero-copy `Bytes` view into `segment_bytes`'s buffer, so bytes
+    /// flow from the page cache straight into whatever the caller does
+    /// with them without an intermediate copy into a fresh buffer.
     ///
     /// Test-only: `flush_segments` uses `segment_bytes` directly instead,
     /// since it needs the record offsets/lengths, not decoded values.
@@ -625,27 +633,27 @@ impl Staging {
         let (buf, records) = self.segment_bytes(id).await?;
         Ok(records
             .into_iter()
-            .map(|Record { key, offset, length }| {
-                (key, buf.slice(offset as usize..(offset + u64::from(length)) as usize))
+            .map(|(key, slot)| {
+                (
+                    key,
+                    buf.slice(
+                        slot.offset as usize..(slot.offset + u64::from(slot.length)) as usize,
+                    ),
+                )
             })
             .collect())
     }
 
-    /// Deletes `id`'s segment and evicts its entries from the index.
-    /// Only call this once its content is durably packed elsewhere. `id`
-    /// must be pending, never the active segment: `pending` structurally
-    /// can't hold that one, so there's nothing to guard against here.
+    /// Deletes `id`'s segment. Only call this once its content is
+    /// durably packed elsewhere. `id` must be pending, never the active
+    /// segment: `pending` structurally can't hold that one, so there's
+    /// nothing to guard against here.
     ///
-    /// Evicts by `id`'s own `Pending::records`, not a scan of all of
-    /// `index`: cost is proportional to this segment's own key count,
-    /// not to how much else happens to be staged across every segment.
+    /// Just removes `id` from `pending`: there's no second, flat index
+    /// to keep in sync with it (see the module doc), so nothing else
+    /// needs touching before the file itself comes off disk.
     pub(crate) async fn finish(&self, id: FileId) -> io::Result<()> {
-        if let Some(pending) = self.pending.remove(&id) {
-            let mut index = self.index.write().await;
-            for record in &pending.value().records {
-                index.remove(&record.key);
-            }
-        }
+        self.pending.remove(&id);
         fs::remove_file(self.segment_path(id)).await
     }
 
@@ -656,9 +664,8 @@ impl Staging {
 
 const RECORD_HEADER_LEN: u64 = 32 + 4;
 
-/// Parses records from `buf` in order, returning each one's key and the
-/// byte range its value occupies within `buf`, plus how many bytes from
-/// the start of `buf` are valid.
+/// Parses records from `buf` in order, returning each one's key and where
+/// its value lives, plus how many bytes from the start of `buf` are valid.
 ///
 /// `codec` is `None` for a segment already known to be fully durable, in
 /// which case only the length framing is trusted. It's `Some` whenever
@@ -667,8 +674,8 @@ const RECORD_HEADER_LEN: u64 = 32 + 4;
 /// and the first record that fails this, or that the file simply doesn't
 /// have enough bytes left for, is treated as a torn tail. Everything from
 /// that point on is dropped rather than trusted.
-fn parse(buf: &Bytes, codec: Option<Codec>) -> (u64, Vec<Record>) {
-    let mut records = Vec::new();
+fn parse(buf: &Bytes, codec: Option<Codec>) -> (u64, Records) {
+    let mut records = Records::new();
     let mut offset = 0usize;
     while offset as u64 + RECORD_HEADER_LEN <= buf.len() as u64 {
         let key = Digest::new(buf[offset..offset + 32].try_into().unwrap());
@@ -685,7 +692,7 @@ fn parse(buf: &Bytes, codec: Option<Codec>) -> (u64, Vec<Record>) {
                 _ => break,
             }
         }
-        records.push(Record { key, offset: value_start as u64, length });
+        records.insert(key, Slot { offset: value_start as u64, length });
         offset = value_end;
     }
     (offset as u64, records)
@@ -708,7 +715,7 @@ fn parse(buf: &Bytes, codec: Option<Codec>) -> (u64, Vec<Record>) {
 async fn revalidate_segment(
     path: &Path,
     verify: Option<Codec>,
-) -> io::Result<Option<(Segment, Vec<Record>)>> {
+) -> io::Result<Option<(Segment, Records)>> {
     let buf = read_bytes(path).await?;
     let len = buf.len() as u64;
 

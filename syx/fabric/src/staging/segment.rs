@@ -1,18 +1,11 @@
 //! A segment's on-disk file and in-memory view.
 
-use std::ffi::OsStr;
+use std::io;
 use std::io::Write as _;
-use std::path::{
-    Path,
-    PathBuf,
-};
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     OnceLock,
-};
-use std::{
-    fmt,
-    io,
 };
 
 use bytes::Bytes;
@@ -34,13 +27,6 @@ pub(super) struct Segment {
     /// written; filled in once the segment is sealed into `pending`.
     mmap: Mmap,
 }
-
-/// One append-only file's identity: `{id:020}.log` in `Staging`'s
-/// directory. A segment is created empty, then appended to sequentially
-/// while it's the active one; once rotated out it never changes again
-/// until `finish` deletes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct FileId(u64);
 
 /// A segment's open file. Wraps `std::fs::File` behind position-
 /// independent operations only: `read_at` for concurrent reads, `append`
@@ -69,17 +55,13 @@ impl Segment {
         File::open(path).await.map(Segment::new)
     }
 
-    /// Appends `buf` to this segment's file. Not yet durable on its own
-    /// -- see `flush`. Only ever called by `Committer`, on the active
-    /// segment.
+    /// Appends `buf` to this segment's file. Not yet durable on its own.
+    /// Only ever called by `Committer`, on the active segment.
     pub(super) async fn append(&self, buf: Bytes) -> io::Result<()> {
         self.file.append(buf).await
     }
 
-    /// Syncs everything appended so far to durable storage. Split from
-    /// `append` so a caller batching several appends into one buffer
-    /// (see `Committer::commit`) pays for one `write` and one sync, not
-    /// a sync per append.
+    /// Syncs everything appended so far to durable storage.
     pub(super) async fn flush(&self) -> io::Result<()> {
         self.file.flush().await
     }
@@ -87,11 +69,7 @@ impl Segment {
     /// Reads `length` bytes at `offset`: sliced zero-copy from the
     /// mapping if one's been established, or via a positioned read
     /// against `file` if it isn't (not yet sealed, or sealing failed).
-    /// `Segment` is the only thing that ever reads `file` directly for
-    /// an actual read -- it owns both `file` and `mmap`, so it's the
-    /// one place that can decide between them without either being
-    /// passed around on its own.
-    pub(super) async fn read(&self, offset: u64, length: u32) -> io::Result<Bytes> {
+    pub(super) async fn read_at(&self, offset: u64, length: u32) -> io::Result<Bytes> {
         // `mmap.read_at`, not `seal`: this might still be the active
         // segment (still being written to), and mapping that one is
         // exactly what `seal` must never do -- only a sealed segment's
@@ -121,20 +99,6 @@ impl Segment {
     #[cfg(test)]
     pub(super) fn mmap_established(&self) -> bool {
         self.mmap.get().is_some()
-    }
-}
-
-impl FileId {
-    pub(super) const FIRST: FileId = FileId(0);
-
-    pub(super) fn next(self) -> FileId {
-        FileId(self.0 + 1)
-    }
-}
-
-impl fmt::Display for FileId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:020}", self.0)
     }
 }
 
@@ -259,14 +223,6 @@ fn read_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> io::Res
         offset += n as u64;
     }
     Ok(())
-}
-
-pub(super) fn segment_path(dir: &Path, id: FileId) -> PathBuf {
-    dir.join(format!("{id}.log"))
-}
-
-pub(super) fn parse_segment_name(name: &OsStr) -> Option<FileId> {
-    name.to_str()?.strip_suffix(".log")?.parse().ok().map(FileId)
 }
 
 #[cfg(test)]
