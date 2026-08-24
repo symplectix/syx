@@ -1,85 +1,12 @@
-//! `Cas`'s local staging area: an append-only log written to a private
-//! directory, not to `db` or `blobs`. Every `put` fsyncs before returning,
-//! so what's staged here survives this node's own crash, unlike
-//! `slatedb`'s in-memory WAL buffer. Content is keyed by its own digest,
-//! so replaying the same (key, value) pair after a crash, or retrying the
-//! same segment after a failed flush, is always a safe no-op.
+//! An append-only log written to a private directory.
 //!
-//! Every segment file starts with a fixed magic prefix, before any
-//! records; see `segment`'s own doc. `Segment::open` checks it first,
-//! so a file that turns out not to be one of ours, despite
-//! matching `FileId`'s `{id:020}.log` naming, is left alone rather than
-//! misread as records or deleted as an empty segment. Past that prefix,
-//! records are framed as `[key: 32 bytes][value_len: u32 BE][value]`,
-//! with no separate checksum. Verifying a segment means decoding each
-//! record and recomputing its digest, which is a stronger check than a
-//! CRC would be; `revalidate_segment` runs this whenever a segment's
-//! tail might be torn, truncating away anything from the first bad
-//! record on.
+//! Content is keyed by its own digest, so replaying the same (key, value) pair
+//! after a crash, or retrying the same segment after a failed flush, is always
+//! a safe no-op.
 //!
-//! Puts append to one active segment. Once a caller rotates it out, it
-//! becomes a pending segment: readable through `entries`, and removed via
-//! `finish` once its content is durably packed elsewhere. `open` always
-//! starts a fresh active segment; every file found on disk becomes a
-//! pending segment, so recovering from a crash needs no special case
-//! beyond what a failed flush already handles.
-//!
-//! # Concurrency
-//!
-//! `put` doesn't write directly. It sends its `(key, value)` to a single
-//! committer task over an unbounded channel and waits for that task to
-//! reply. The committer drains whatever else is already queued before
-//! writing, so however many `put`s happen to be ready at once share one
-//! `write`+`sync_data` call, instead of each paying for its own. This is
-//! the same group-commit technique WAL implementations use to amortize
-//! `fsync`'s per-call cost under concurrent writers, and it matters far
-//! more than avoiding write contention: on an SSD there's no seek
-//! penalty to dodge in the first place, so the previous position-
-//! addressed `write_at` design bought little there, while still paying
-//! for a separate `fsync`-equivalent call per `put`.
-//!
-//! Because `put`s and `rotate` funnel through the same single-consumer
-//! channel, in the order they were sent, `rotate` can never seal a
-//! segment out from under a `put` that was sent before it. The ordering
-//! the committer already needs for its own batching gives this guarantee
-//! for free, with no separate lock required.
-//!
-//! `get`/`contains` don't consult a flat, all-segments key index: there
-//! isn't one. They check the active segment first, through `active`, a
-//! lock shared with the committer, then walk every pending one through
-//! `pending`, which is lock-free. Each of `active` and every `pending`
-//! entry bundles its `Segment` together with its own `Digest -> Slot`
-//! map as one unit, so a key found in one always resolves against the
-//! matching segment. `rotate` swaps both out together, so `records` and
-//! `segment` can never describe different points in time. `active` is
-//! the one lock this ever waits on, and only briefly, right after a
-//! `commit` succeeds; every pending segment is immutable once rotated,
-//! so walking `pending` needs no lock at all. What keeps this cheap is
-//! bounding how many segments `get` ever has to check; `max_pending` is
-//! what enforces that bound.
-//!
-//! Rotating a segment out just moves its `{segment, records}` pair into
-//! `pending`, keyed by `FileId`; `finish` just removes that key. Neither
-//! step touches a second structure to keep in sync, because there isn't
-//! one to forget.
-//!
-//! `get` starts out reading via `read_at`, the same as while the segment
-//! is still active, but switches to slicing a mapped view once one
-//! exists; see `Segment`'s `mmap` field. `seal` establishes that mapping
-//! once, at the moment a segment is sealed into `pending`, and from then
-//! on it is shared by every clone of that `Segment` value, including one
-//! `get` obtained from `active` before rotating sealed it into `pending`.
-//!
-//! A `commit` that fails partway poisons the segment it was writing to:
-//! `O_APPEND` guarantees every successful `write` lands at the file's
-//! true end regardless of what this module believes that end is, so a
-//! partial write, or one that landed but whose `sync_data` then failed,
-//! can leave the file longer than `active_len` accounts for. Rather
-//! than let later commits compute offsets against that stale belief, the
-//! committer starts a fresh segment immediately and, best-effort,
-//! re-derives the old one's true contents the same way `open` recovers
-//! from a crash (`revalidate_segment`, truncating any torn tail) so
-//! nothing durably written is silently lost.
+//! Every log file starts with a fixed magic prefix, before any
+//! records. Past that prefix, records are framed as:
+//! `[key: 32 bytes][value_len: u32 BE][value]`.
 
 use std::collections::HashMap;
 use std::io;
@@ -118,7 +45,10 @@ mod file_id;
 mod segment;
 
 pub(crate) use file_id::FileId;
-use segment::Segment;
+use segment::{
+    BytesIndex,
+    Segment,
+};
 
 #[cfg(test)]
 mod tests;
@@ -131,27 +61,25 @@ pub(crate) struct Slot {
     pub(crate) length: u32,
 }
 
+impl BytesIndex for Slot {
+    async fn read_from(&self, segment: &Segment) -> io::Result<Bytes> {
+        (self.offset..self.offset + self.length as u64).read_from(segment).await
+    }
+}
+
 /// A segment's records, keyed by digest for the O(1) lookup `get`/
 /// `contains` need. Order doesn't matter: each `Slot` is a self-
 /// contained byte range, independent of every other one.
 pub(crate) type Records = HashMap<Digest, Slot>;
 
-/// The active segment together with every record committed to it so
-/// far. Bundled as one unit, under one lock, rather than two separate
-/// fields: a key found in `records` must always resolve against the
-/// exact `segment` it was written to, and `rotate` is the only thing
-/// that ever replaces either. Replacing them atomically, see
-/// `Committer::start_fresh_segment`, is what lets a reader trust that
-/// pairing without a lock of its own to race.
+/// The active segment with every record committed to it so far.
 struct Active {
     segment: Segment,
     records: Records,
 }
 
 /// One entry of `pending`: a rotated-out segment together with every
-/// record it holds. Same shape as `Active`, but immutable once
-/// inserted, since a pending segment is never written to again, so no
-/// lock is needed to read one back.
+/// record it holds. Same shape as `Active`, but immutable.
 #[derive(Clone)]
 struct Pending {
     segment: Segment,
@@ -169,9 +97,7 @@ struct PutMsg {
     key:   Digest,
     value: Bytes,
     /// Replied with the active segment's length once this `put`'s bytes
-    /// have landed in it, so a caller that needs to react to that (e.g.
-    /// `Cas::put_blob` checking it against `Flushing`) doesn't need a
-    /// separate `active_len` call right after.
+    /// have landed in it.
     reply: oneshot::Sender<io::Result<u64>>,
 }
 
@@ -181,10 +107,8 @@ struct RotateMsg {
 }
 
 /// Owns the active segment's write side: the only thing that ever
-/// writes to a segment file. Every `Staging::put`/`rotate` funnels
-/// through its `commands` channel instead of writing directly, so many
-/// concurrent `put`s can share one `write`+`sync_data` call instead of
-/// each paying for its own; see the module doc's "Concurrency" section.
+/// writes to a segment file. Many concurrent `put`s can share one
+/// `write`+`sync_data` call instead of each paying for its own.
 struct Committer {
     dir:   PathBuf,
     /// Verifies a poisoned segment's recovered tail the same way `open`
@@ -200,16 +124,11 @@ struct Committer {
     /// for `get`/`contains`; see `Active`'s own doc.
     active:     Arc<RwLock<Active>>,
     /// The active segment's current length, and the next unwritten
-    /// offset within it. These are the same number, since nothing is
-    /// ever removed from its middle. The committer's only record of it:
-    /// there is no separate private copy, since a relaxed load always
-    /// sees this same task's own last store.
+    /// offset within it.
     active_len: Arc<AtomicU64>,
     /// The active segment. A private working copy: writes go through
-    /// this directly, without ever taking `active`'s lock, so a `put`'s
-    /// `append`+`flush` never waits behind a `get`/`contains` reader, or
-    /// the other way around. Kept in sync with `active`'s own copy by
-    /// `start_fresh_segment`, the only place either one changes.
+    /// this directly without taking `active`'s lock, so a `put`'s
+    /// `append`+`flush` never waits behind a `get`/`contains` reader.
     segment:    Segment,
 
     /// Rotated out, not yet `finish`ed. Structurally can never contain
@@ -276,11 +195,9 @@ impl Committer {
 
     /// Appends every record in `batch`, then syncs once with a single
     /// `flush` call, and publishes their locations and replies to every
-    /// waiter. This is the group commit itself: `write` is cheap, since
-    /// it only lands in the page cache, so nothing is gained by batching
-    /// it into one call, but the cost of one `fsync`-equivalent `flush`
-    /// is shared across however many `put`s happened to be ready when
-    /// this batch was drained.
+    /// waiter.
+    /// The cost of one `flush` is shared across many `put`s happened to
+    /// be ready when this batch was drained.
     async fn commit(&mut self, batch: &mut Vec<PutMsg>) {
         let mut slots = Vec::with_capacity(batch.len());
         let mut offset = self.active_len.load(Ordering::Relaxed);
@@ -347,13 +264,14 @@ impl Committer {
     }
 
     /// Handles a `commit` that failed partway. Starts a fresh segment
-    /// immediately so later commits don't inherit a stale `active_len`,
-    /// then, best-effort, re-derives what actually landed durably in the
-    /// old one. This is the same recovery `Staging::open` runs at
+    /// immediately so later commits don't inherit a stale segment.
+    ///
+    /// Re-derives, best-effort, what actually landed durably in the
+    /// old segment. This is the same recovery `Staging::open` runs at
     /// startup, and it publishes whatever of the old segment is valid.
-    /// If that recovery itself fails, the old segment's valid prefix
-    /// isn't lost: it's still on disk, and the next `open` will find and
-    /// replay it like any other segment left over from a previous run.
+    ///
+    /// If that recovery itself fails, it's still on disk.
+    /// The next `open` will find and replay it like any other segment.
     async fn poison(&mut self) -> io::Result<()> {
         let old_id = self.file_id;
         // The replaced `Active` is discarded: whatever it believes it
@@ -370,13 +288,12 @@ impl Committer {
 
     /// Starts a brand new active segment, swapping it (and a fresh,
     /// empty `Active`) in for both `self.segment` and the published
-    /// `active`. Returns the `Active` this replaced, so `rotate` can
-    /// hand it off to `pending`.
+    /// `active`.
     async fn start_fresh_segment(&mut self) -> io::Result<Active> {
         let next = file_id::next();
         let segment = Segment::create(file_id::path(&self.dir, next)).await?;
 
-        self.active_len.store(segment::MAGIC_LEN, Ordering::Relaxed);
+        self.active_len.store(0, Ordering::Relaxed);
         self.file_id = next;
         self.segment = segment.clone();
 
@@ -389,10 +306,7 @@ pub(crate) struct Staging {
     /// The directory segments live in.
     dir:         PathBuf,
     /// The active segment's current length, published by the committer
-    /// after every batch it commits. Lock-free, so `flush_pending` can
-    /// check whether anything is staged without contending with
-    /// concurrent `put`s. `put` itself doesn't need this: it gets the
-    /// same value back directly from the committer.
+    /// after every batch it commits.
     active_len:  Arc<AtomicU64>,
     /// The active segment and its records so far; see `Committer`'s own
     /// field of the same name.
@@ -402,8 +316,7 @@ pub(crate) struct Staging {
     pending:     Arc<SkipMap<FileId, Pending>>,
     /// `put` refuses new writes once pending segments reach this many,
     /// so a persistently failing `flush_pending` bounds local disk usage
-    /// instead of growing it without limit. Also what bounds `get`'s own
-    /// cost: see the module doc's "Concurrency" section.
+    /// instead of growing it without limit.
     max_pending: u16,
     /// Where `put`/`rotate` send their requests; the committer task
     /// holds the matching receiver for as long as any `Staging` handle,
@@ -413,13 +326,15 @@ pub(crate) struct Staging {
 
 impl Staging {
     /// Opens the staging directory at `dir`, creating it if needed, and
-    /// replays whatever segments are already there. `codec` decodes each
-    /// replayed record to verify it against its own key; it must match
+    /// replays whatever segments are already there.
+    ///
+    /// `codec` decodes each replayed record to verify it against its own key; it must match
     /// whatever `Cas` itself uses, since a value's digest is only
-    /// meaningful once decoded back to its original content. `max_pending`
-    /// is enforced from this point on, even if replay already found more
-    /// pending segments than that: `put` refuses further writes until
-    /// enough of the backlog clears.
+    /// meaningful once decoded back to its original content.
+    ///
+    /// `max_pending` is enforced from this point on, even if replay
+    /// already found more pending segments than that: `put` refuses
+    /// further writes until enough of the backlog clears.
     pub(crate) async fn open(
         dir: impl Into<PathBuf>,
         codec: Codec,
@@ -460,7 +375,7 @@ impl Staging {
         let next = file_id::next();
         let segment = Segment::create(file_id::path(&dir, next)).await?;
 
-        let active_len = Arc::new(AtomicU64::new(segment::MAGIC_LEN));
+        let active_len = Arc::new(AtomicU64::new(0));
         let active =
             Arc::new(RwLock::new(Active { segment: segment.clone(), records: Records::new() }));
 
@@ -492,9 +407,7 @@ impl Staging {
 
     /// Durably appends `value` under `key` to the active segment. Once
     /// this returns, `value` survives a crash of this node. Returns the
-    /// active segment's length immediately after, so a caller that needs
-    /// that (e.g. to compare against a flush threshold) gets it for free
-    /// instead of making a separate `active_len` call.
+    /// active segment's length immediately after.
     ///
     /// Refuses the write if pending segments already number `max_pending`:
     /// at that point `flush_pending` isn't keeping up, and accepting more
@@ -516,23 +429,19 @@ impl Staging {
     }
 
     /// Fetches the value staged under `key`, if any. Checks the active
-    /// segment first, then every pending one; see the module doc's
-    /// "Concurrency" section for why this is cheap.
+    /// segment first, then every pending one.
     pub(crate) async fn get(&self, key: Digest) -> io::Result<Option<Bytes>> {
-        // `active`'s lock is held only long enough to clone out a match.
-        // That clone is cheap, since `Segment` is `Arc`-backed, and the
-        // lock is not held across the actual read below, which needs no
-        // lock of its own.
         let found = {
             let active = self.active.read().await;
             active.records.get(&key).map(|slot| (active.segment.clone(), *slot))
         };
+        // The lock is not held here, segment.bytes needs no lock.
         if let Some((segment, slot)) = found {
-            return segment.read_at(slot.offset, slot.length).await.map(Some);
+            return segment.bytes(slot).await.map(Some);
         }
         for entry in self.pending.iter() {
-            if let Some(slot) = entry.value().records.get(&key) {
-                return entry.value().segment.read_at(slot.offset, slot.length).await.map(Some);
+            if let Some(&slot) = entry.value().records.get(&key) {
+                return entry.value().segment.bytes(slot).await.map(Some);
             }
         }
         Ok(None)
@@ -572,53 +481,13 @@ impl Staging {
         self.pending.iter().map(|entry| *entry.key()).collect()
     }
 
-    /// The sealed segment's whole-file bytes, and every record's key,
-    /// offset, and length within them. `id` must have come from `rotate`
-    /// or `pending_segments`; it is never the active segment.
-    ///
-    /// Just reads `find`'s `Pending`: `records` was already parsed once,
-    /// by `commit`, `poison`, or `open`'s replay, when this segment
-    /// became pending, so there's nothing left to reparse here.
-    ///
-    /// For `flush_segments`: a pack object's bytes are exactly a staging
-    /// segment's own `[key][len][value]` framing, so the sealed buffer
-    /// is what gets uploaded as-is. Each record's offset and length,
-    /// pointing past the header at the value, are exactly what a pack
-    /// `Entry` needs, so nothing has to be decoded and reassembled first.
-    ///
-    /// Reads via mmap, not `read_at`: unlike the active segment, a
-    /// pending one is never written to again, so there's no writer to
-    /// race and no risk of the file growing out from under the mapping.
-    /// Usually reuses the mapping `seal` already established when this
-    /// segment was sealed into `pending`; only maps it itself if that
-    /// didn't happen or failed.
+    /// The sealed segment's records, and every one's key, offset, and
+    /// length within them. `id` must have come from `rotate` or
+    /// `pending_segments`; it is never the active segment.
     pub(crate) async fn segment_bytes(&self, id: FileId) -> io::Result<(Bytes, Records)> {
         let pending = self.find(id);
-        let buf = pending.segment.seal()?;
+        let buf = pending.segment.bytes(..).await?;
         Ok((buf, pending.records))
-    }
-
-    /// Every `(key, value)` pair in `id`'s segment. Each value is a
-    /// zero-copy `Bytes` view into `segment_bytes`'s buffer, so bytes
-    /// flow from the page cache straight into whatever the caller does
-    /// with them without an intermediate copy into a fresh buffer.
-    ///
-    /// Test-only: `flush_segments` uses `segment_bytes` directly instead,
-    /// since it needs the record offsets/lengths, not decoded values.
-    #[cfg(test)]
-    pub(crate) async fn entries(&self, id: FileId) -> io::Result<Vec<(Digest, Bytes)>> {
-        let (buf, records) = self.segment_bytes(id).await?;
-        Ok(records
-            .into_iter()
-            .map(|(key, slot)| {
-                (
-                    key,
-                    buf.slice(
-                        slot.offset as usize..(slot.offset + u64::from(slot.length)) as usize,
-                    ),
-                )
-            })
-            .collect())
     }
 
     /// Deletes `id`'s segment. Only call this once its content is
@@ -637,25 +506,45 @@ impl Staging {
     fn file_path(&self, id: FileId) -> PathBuf {
         file_id::path(&self.dir, id)
     }
+
+    /// Every `(key, value)` pair in `id`'s segment. Each value is a
+    /// zero-copy `Bytes` view into `segment_bytes`'s buffer.
+    ///
+    /// Test-only: `flush_segments` uses `segment_bytes` directly instead,
+    /// since it needs the record offsets/lengths, not decoded values.
+    #[cfg(test)]
+    pub(crate) async fn entries(&self, id: FileId) -> io::Result<Vec<(Digest, Bytes)>> {
+        let (buf, records) = self.segment_bytes(id).await?;
+        Ok(records
+            .into_iter()
+            .map(|(key, slot)| {
+                (
+                    key,
+                    buf.slice(
+                        slot.offset as usize..(slot.offset + u64::from(slot.length)) as usize,
+                    ),
+                )
+            })
+            .collect())
+    }
 }
 
 const RECORD_HEADER_LEN: u64 = 32 + 4;
 
-/// Parses records from `buf` in order, starting at `start` (past
-/// `MAGIC` and whatever records already preceded it), and returning
+/// Parses records from `buf` in order, from the start, and returning
 /// each one's key and where its value lives, plus how many bytes from
-/// the start of `buf` are valid.
+/// the start of `buf` are valid. `buf` is expected to already be a
+/// segment's records on their own.
 ///
 /// `codec` is `None` for a segment already known to be fully durable, in
 /// which case only the length framing is trusted. It's `Some` whenever
-/// the segment's tail might be torn (see `revalidate_segment`): each
-/// record is then decoded and its digest recomputed against its own key,
-/// and the first record that fails this, or that the file simply doesn't
-/// have enough bytes left for, is treated as a torn tail. Everything from
-/// that point on is dropped rather than trusted.
-fn parse(buf: &Bytes, start: u64, codec: Option<Codec>) -> (u64, Records) {
+/// the segment's tail might be torn: each record is then decoded and
+/// its digest recomputed against its own key, and the first record that
+/// fails this, or that the file simply doesn't have enough bytes left for,
+/// is treated as a torn tail. Everything from that point on is dropped.
+fn parse(buf: &Bytes, codec: Option<Codec>) -> (u64, Records) {
     let mut records = Records::new();
-    let mut offset = start as usize;
+    let mut offset = 0usize;
     while offset as u64 + RECORD_HEADER_LEN <= buf.len() as u64 {
         let key = Digest::new(buf[offset..offset + 32].try_into().unwrap());
         let length = u32::from_be_bytes(buf[offset + 32..offset + 36].try_into().unwrap());
@@ -678,23 +567,10 @@ fn parse(buf: &Bytes, start: u64, codec: Option<Codec>) -> (u64, Records) {
 }
 
 /// Re-reads the segment file at `path`, verifying and truncating away any
-/// torn tail. Used both by `open`, recovering from a crash, and by
-/// `Committer::poison`, recovering from a commit that failed partway.
-/// Both are situations where a segment's recorded length can no longer
-/// be trusted and has to be re-derived from the file itself.
+/// torn tail.
 ///
-/// `verify` is `Some` to also recompute and check each record's digest;
-/// `None` trusts the length framing alone, for a segment already known
-/// to be fully durable. That is every segment but the one that could
-/// have been active, when called from `open`.
-///
-/// `None` covers both a file `Segment::open` already found isn't one of
-/// `staging`'s own, and one that is but whose records all turned out
-/// invalid; either way there's nothing to add to `pending`.
-///
-/// The returned `Segment`, when there is one, is already sealed: both
-/// `Segment::open` and `Segment::truncate` seal before handing one
-/// back, so callers don't need to do it again.
+/// The returned `Segment` is sealed: both `Segment::open` and `truncate`
+/// seal before handing one back, so callers don't need to do it again.
 async fn revalidate_segment(
     path: &Path,
     verify: Option<Codec>,
@@ -708,13 +584,11 @@ async fn revalidate_segment(
         segment::Opened::Foreign => return Ok(None),
     };
 
-    let buf = segment.bytes().await?;
+    let buf = segment.bytes(..).await?;
     let len = buf.len() as u64;
     let (valid_len, records) = {
         let buf = buf.clone();
-        task::spawn_blocking(move || parse(&buf, segment::MAGIC_LEN, verify))
-            .await
-            .expect("parse should not panic")
+        task::spawn_blocking(move || parse(&buf, verify)).await.expect("parse should not panic")
     };
     let segment = if valid_len < len {
         Segment::truncate(path.to_owned(), valid_len).await?

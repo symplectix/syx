@@ -4,6 +4,10 @@
 
 use std::io;
 use std::io::Write as _;
+use std::ops::{
+    Bound,
+    RangeBounds,
+};
 use std::path::{
     Path,
     PathBuf,
@@ -19,23 +23,16 @@ use tokio::{
     task,
 };
 
-/// Every segment file starts with exactly these bytes, before anything
-/// `staging` writes into it. Purely a file-identity check: `Segment::open`
-/// uses it to tell a real segment apart from some other file that
-/// happens to match `FileId`'s naming, so this module never needs to
-/// know anything about what comes after it.
+/// Every segment file starts with exactly these bytes.
+/// `Segment::open` uses this to tell a real segment apart from some
+/// other file that happens to match `FileId`'s naming.
 const MAGIC: &[u8] = b"FABSTAG1";
 
-/// Where a segment's own records start, past `MAGIC`. Exposed so
-/// `staging` can parse records starting at the right offset without
-/// needing to know `MAGIC`'s actual bytes.
-pub(super) const MAGIC_LEN: u64 = MAGIC.len() as u64;
+/// Where a segment's own records start, past `MAGIC`.
+const MAGIC_LEN: u64 = MAGIC.len() as u64;
 
 /// A segment's open file, whether it's the one currently being appended
-/// to or one already rotated out. Doesn't carry its own `FileId`. That's
-/// tracked separately by whoever cares which segment this is: see
-/// `staging`'s `Committer::file_id`, and `pending`'s own `FileId` keys.
-/// Nothing in this module ever needs to read it back.
+/// to or one already rotated out.
 #[derive(Clone)]
 pub(super) struct Segment {
     /// This segment's open file. `mmap` itself, once sealing calls for
@@ -49,8 +46,9 @@ pub(super) struct Segment {
 }
 
 /// A segment's open file. Wraps `std::fs::File` behind position-
-/// independent operations only: `read_at` for concurrent reads, `append`
-/// for the one writer, and `mmap` for a one-time whole-file mapping.
+/// independent operations only: `read_at`/`read_from` for concurrent
+/// reads, `append` for the one writer, and `mmap` for a one-time
+/// whole-file mapping.
 #[derive(Clone)]
 struct File(Arc<std::fs::File>);
 
@@ -73,14 +71,7 @@ impl Segment {
     }
 
     /// Opens the segment file at `path`, checking that it's really one
-    /// of `staging`'s own before treating it as one. Only ever reads
-    /// `MAGIC_LEN` bytes to decide that, through `read_at`, rather than
-    /// the whole file: a `Foreign` file, in particular, might be
-    /// arbitrarily large and is none of this function's business to
-    /// read past its first few bytes. A read-only operation: it never
-    /// touches `path` on disk itself, `Empty` included, since deciding
-    /// what to do about a file that isn't a real segment is the
-    /// caller's call, not this one's.
+    /// of `staging`'s own before treating it as one.
     ///
     /// Seals a `Valid` result before returning it: once `MAGIC` is
     /// confirmed, this is a real segment, and this call's own view of
@@ -90,7 +81,7 @@ impl Segment {
     /// rather than mutating this one.
     pub(super) async fn open(path: &Path) -> io::Result<Opened> {
         let segment = File::open(path.to_owned()).await.map(Segment::new)?;
-        match segment.read_at(0, MAGIC_LEN as u32).await {
+        match segment.file.read_at(0, MAGIC_LEN as u32).await {
             Ok(prefix) if &prefix[..] == MAGIC => {
                 let _ = segment.seal();
                 Ok(Opened::Valid(segment))
@@ -101,20 +92,20 @@ impl Segment {
         }
     }
 
-    /// Truncates the segment file at `path` to `len` bytes, discarding a
-    /// torn tail found while revalidating it after a crash, then
-    /// reopens it through `open`, the same validated entry point used
-    /// everywhere else, rather than duplicating its file-opening logic
-    /// here. Takes `path`, not `&self`: a `Segment`'s own handle is
-    /// opened read-only, so it can't itself be used to truncate.
+    /// Truncates the segment file at `path` to `len` bytes of records,
+    /// discarding a torn tail found while revalidating it after a
+    /// crash, then reopens it through `open`.
     ///
-    /// `len` always leaves at least `MAGIC_LEN` bytes standing, since
-    /// it only ever comes from `staging::parse`, which never returns a
-    /// valid length shorter than where it started scanning; see its own
-    /// doc. So this always finds `Valid`. If it doesn't, `truncate` was
-    /// called with a `len` that cut into `MAGIC` itself, a bug in the
-    /// caller rather than a legitimate outcome to swallow quietly.
+    /// `len` is record-relative: this adds `MAGIC_LEN` back before
+    /// touching the file, so the caller never needs to know it exists.
+    ///
+    /// `MAGIC` itself always survives, whatever `len` is, since the
+    /// file is never truncated to fewer than `MAGIC_LEN` bytes. So this
+    /// always finds `Valid`; if it doesn't, opening the truncated file
+    /// failed in some other way, which is surfaced as an error rather
+    /// than swallowed quietly.
     pub(super) async fn truncate(path: PathBuf, len: u64) -> io::Result<Segment> {
+        let len = MAGIC_LEN + len;
         fs::OpenOptions::new().write(true).open(&path).await?.set_len(len).await?;
         match Segment::open(&path).await? {
             Opened::Valid(segment) => Ok(segment),
@@ -135,40 +126,18 @@ impl Segment {
         self.file.flush().await
     }
 
-    /// Reads `length` bytes at `offset`: sliced zero-copy from the
-    /// mapping if one's been established. Falls back to a positioned
-    /// read against `file` if it isn't, either because the segment isn't
-    /// sealed yet or because sealing failed.
-    pub(super) async fn read_at(&self, offset: u64, length: u32) -> io::Result<Bytes> {
-        // `mmap.read_at`, not `seal`: this might still be the active
-        // segment, still being written to, and mapping that one is
-        // exactly what `seal` must never do. Only a sealed segment's
-        // `mmap` is safe to establish on demand.
-        if let Some(bytes) = self.mmap.read_at(offset, length) {
-            return Ok(bytes);
-        }
-        self.file.read_at(offset, length).await
-    }
-
-    /// This segment's entire current on-disk contents in one shot: the
-    /// mapping `seal` established, if there is one, same as `read_at`.
-    /// Falls back to a plain positioned read otherwise, for the rare
-    /// case sealing itself failed even though `open` confirmed this is
-    /// a real segment.
-    pub(super) async fn bytes(&self) -> io::Result<Bytes> {
-        if let Some(bytes) = self.mmap.get() {
-            return Ok(bytes);
-        }
-        self.file.bytes().await
+    /// This segment's records at `index`, sliced zero-copy from the
+    /// mapping `seal` established, if there is one. `index` is
+    /// record-relative: 0 means the first byte past `MAGIC`, not the
+    /// first byte of the file.
+    pub(super) async fn bytes(&self, index: impl BytesIndex) -> io::Result<Bytes> {
+        index.read_from(self).await
     }
 
     /// Establishes this segment's whole-file mapping, for a segment
-    /// that's about to become pending or already is. From this point on
-    /// the segment is never written to again; the module doc explains
-    /// why that makes mapping it safe. This is idempotent. Because
-    /// `mmap` is shared, the mapping becomes visible through every clone
-    /// of this `Segment` value already out there, including any a caller
-    /// already captured before sealing happened.
+    /// that's about to become pending or already is.
+    ///
+    /// From this point on the segment is never written to again.
     pub(super) fn seal(&self) -> io::Result<Bytes> {
         self.mmap.get_or_map(&self.file)
     }
@@ -180,6 +149,40 @@ impl Segment {
     #[cfg(test)]
     pub(super) fn mmap_established(&self) -> bool {
         self.mmap.get().is_some()
+    }
+}
+
+/// Something that can select a byte range within a `Segment`'s records.
+///
+/// Every index is record-relative; `read_from`'s own implementations are
+/// where `MAGIC_LEN` gets added back before actually touching the
+/// file, once and only here.
+pub(super) trait BytesIndex {
+    async fn read_from(&self, segment: &Segment) -> io::Result<Bytes>;
+}
+
+impl<T: RangeBounds<u64>> BytesIndex for T {
+    async fn read_from(&self, segment: &Segment) -> io::Result<Bytes> {
+        let start = MAGIC_LEN
+            + match self.start_bound() {
+                Bound::Included(&start) => start,
+                Bound::Excluded(&start) => start + 1,
+                Bound::Unbounded => 0,
+            };
+        let end = match self.end_bound() {
+            Bound::Included(&end) => Some(MAGIC_LEN + end + 1),
+            Bound::Excluded(&end) => Some(MAGIC_LEN + end),
+            Bound::Unbounded => None,
+        };
+
+        if let Some(bytes) = segment.mmap.get() {
+            let end = end.unwrap_or(bytes.len() as u64);
+            return Ok(bytes.slice(start as usize..end as usize));
+        }
+        match end {
+            Some(end) => segment.file.read_at(start, (end - start) as u32).await,
+            None => segment.file.read_from(start).await,
+        }
     }
 }
 
@@ -247,38 +250,27 @@ impl File {
         .map(Bytes::from)
     }
 
-    /// This file's entire current contents in one shot, through this
-    /// same open handle rather than opening it again by path.
-    async fn bytes(&self) -> io::Result<Bytes> {
+    /// Reads from `start` to this file's current end, in one shot,
+    /// discovering how far that is along the way.
+    async fn read_from(&self, start: u64) -> io::Result<Bytes> {
         let file = Arc::clone(&self.0);
         task::spawn_blocking(move || -> io::Result<Vec<u8>> {
-            let mut buf = vec![0u8; file.metadata()?.len() as usize];
-            read_at(&file, &mut buf, 0)?;
+            let len = file.metadata()?.len();
+            let mut buf = vec![0u8; (len - start) as usize];
+            read_at(&file, &mut buf, start)?;
             Ok(buf)
         })
         .await
-        .expect("bytes should not panic")
+        .expect("read_from should not panic")
         .map(Bytes::from)
     }
 }
 
 impl Mmap {
     /// The mapping, if it's been established already. Never maps the
-    /// file itself: callers that only want to peek, `read_at`, are happy
-    /// to fall back to `File::read_at` on a miss, so they shouldn't pay
-    /// for mapping a whole segment just to read one small value from it.
+    /// file itself.
     fn get(&self) -> Option<Bytes> {
         self.0.get().cloned()
-    }
-
-    /// Reads `length` bytes at `offset`, sliced zero-copy from the
-    /// mapping, if one's been established. `None`, not an error, if it
-    /// hasn't: unlike `File::read_at`, there's nothing to actually read
-    /// here, just an in-memory slice of what's already there.
-    fn read_at(&self, offset: u64, length: u32) -> Option<Bytes> {
-        let bytes = self.get()?;
-        let start = offset as usize;
-        Some(bytes.slice(start..start + length as usize))
     }
 
     /// The mapping, establishing it first if it isn't there yet.
