@@ -40,8 +40,8 @@
 //!
 //! `get`/`contains` don't consult a flat, all-segments key index: there
 //! isn't one. They check the active segment first (`active`, a lock
-//! shared with the committer), then every pending one, oldest first
-//! (`pending`, lock-free). Each of `active` and every `pending` entry
+//! shared with the committer), then every pending one (`pending`,
+//! lock-free). Each of `active` and every `pending` entry
 //! bundles its `Segment` together with its own `Digest -> Slot` map as
 //! one unit, so a key found in one always resolves against the matching
 //! segment -- `rotate` swaps both out together, so `records` and
@@ -206,10 +206,6 @@ struct Committer {
     /// Rotated out, not yet `finish`ed. Structurally can never contain
     /// the active segment, so nothing removing from it needs to guard
     /// against accidentally sealing the one still being written to.
-    /// Keyed and ordered by `FileId`, so oldest-first iteration (see
-    /// `Staging::pending_segments`) is a fact of the type, not a
-    /// convention `rotate`/`poison` have to uphold by always inserting
-    /// at the end.
     pending: Arc<SkipMap<FileId, Pending>>,
 }
 
@@ -507,8 +503,8 @@ impl Staging {
     }
 
     /// Fetches the value staged under `key`, if any. Checks the active
-    /// segment first, then every pending one, oldest first; see the
-    /// module doc's "Concurrency" section for why this is cheap.
+    /// segment first, then every pending one; see the module doc's
+    /// "Concurrency" section for why this is cheap.
     pub(crate) async fn get(&self, key: Digest) -> io::Result<Option<Bytes>> {
         // `active`'s lock is held only long enough to clone out a match
         // (cheap: `Segment` is `Arc`-backed) -- not across the actual
@@ -555,9 +551,9 @@ impl Staging {
         response.await.map_err(|_| io::Error::other("staging: committer task is gone"))?
     }
 
-    /// Segments rotated out but not yet `finish`ed, oldest first. Covers
-    /// both a previous flush that failed partway and, after a restart,
-    /// whatever `open` found already on disk.
+    /// Segments rotated out but not yet `finish`ed. Covers both a
+    /// previous flush that failed partway and, after a restart, whatever
+    /// `open` found already on disk.
     pub(crate) fn pending_segments(&self) -> Vec<FileId> {
         self.pending.iter().map(|entry| *entry.key()).collect()
     }
