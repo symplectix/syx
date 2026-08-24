@@ -39,7 +39,7 @@ pub use storage::Cas;
 #[derive(Clone)]
 pub struct Graph {
     // Local durable staging for not-yet-packed content. The only thing
-    // `Graph` can't default -- everything below can fall back to living
+    // `Graph` can't default: everything below can fall back to living
     // under the same directory.
     staging: Arc<staging::Staging>,
 

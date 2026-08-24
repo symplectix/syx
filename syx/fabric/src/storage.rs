@@ -391,7 +391,7 @@ impl<'a> Cas<'a> {
             .await
     }
 
-    /// Fetch and decode chunk(s).
+    /// Fetch and decode the blob stored under `digest`.
     async fn load(&self, digest: &Digest) -> io::Result<Option<(ContentFlags, Bytes)>> {
         let Some(stored) = self.get_blob(*digest).await? else {
             return Ok(None);
@@ -402,8 +402,8 @@ impl<'a> Cas<'a> {
             .expect("decode should not panic")
     }
 
-    /// Write one chunk(s) under `key`, skipping the encode step entirely
-    /// if `key` is already stored.
+    /// Writes `bytes` as a blob under `key`, skipping the encode step
+    /// entirely if `key` is already stored.
     async fn save(&self, key: Digest, flags: ContentFlags, bytes: Vec<u8>) -> io::Result<()> {
         if self.contains_blob(key).await? {
             return Ok(());
@@ -442,9 +442,10 @@ impl<'a> Cas<'a> {
         self.copy_from(len, &mut io::Cursor::new(bytes)).await
     }
 
-    /// Reads the content at `digest` if present and write it to `w`.
+    /// Reads the content at `digest` if present and writes it to `w`.
     ///
-    /// `get` is the better choice for values small enough that this doesn't matter.
+    /// `get` is the better choice for values small enough that this
+    /// doesn't matter.
     pub async fn read_into<W>(&self, digest: &Digest, w: &mut W) -> io::Result<bool>
     where
         W: AsyncWrite + Unpin,
@@ -520,10 +521,10 @@ impl<'a> Cas<'a> {
         // chunk's boundary depends on a rolling hash over what came
         // before it), but staging a chunk doesn't need to block finding
         // the next one. This is also what lets group commit batch this
-        // call's own chunks together, which it otherwise never would --
-        // batching only happens across whatever's in flight at once, and
-        // a caller that awaits each of its own writes serially never has
-        // more than one in flight.
+        // call's own chunks together, which it otherwise never would,
+        // since batching only happens across whatever's in flight at
+        // once, and a caller that awaits each of its own writes
+        // serially never has more than one in flight.
         let mut saves = FuturesUnordered::new();
         while let Some(chunk) = chunks.next().await {
             let chunk = chunk?;
@@ -695,9 +696,9 @@ struct Chunk {
     len:    u32,
 }
 
-/// Decode chunks into its ordered chunk references.
-///
-/// The format is a flat sequence of 36-byte records (`digest[32] || len: u32 be`).
+/// Decodes the chunks-manifest format into an ordered list of chunk
+/// references: a flat sequence of 36-byte records (`digest[32] || len:
+/// u32 be`).
 fn decode_chunks(bytes: &[u8]) -> io::Result<Vec<Chunk>> {
     if !bytes.len().is_multiple_of(36) {
         return Err(invalid_data("chunks body length is not a multiple of 36"));

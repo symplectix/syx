@@ -195,9 +195,8 @@ impl Committer {
 
     /// Appends every record in `batch`, then syncs once with a single
     /// `flush` call, and publishes their locations and replies to every
-    /// waiter.
-    /// The cost of one `flush` is shared across many `put`s happened to
-    /// be ready when this batch was drained.
+    /// waiter. The cost of that one `flush` is shared across however
+    /// many `put`s happened to be ready when this batch was drained.
     async fn commit(&mut self, batch: &mut Vec<PutMsg>) {
         let mut slots = Vec::with_capacity(batch.len());
         let mut offset = self.active_len.load(Ordering::Relaxed);
@@ -243,8 +242,9 @@ impl Committer {
                 for msg in batch.drain(..) {
                     let _ = msg.reply.send(Err(io::Error::new(e.kind(), e.to_string())));
                 }
-                // See the module doc's last paragraph: this segment's
-                // true tail is no longer known from `active_len` alone.
+                // `O_APPEND` still lands whatever it managed to write
+                // even though this batch failed, so `active_len` can no
+                // longer be trusted as this segment's true length.
                 let _ = self.poison().await;
             }
         }
@@ -332,9 +332,10 @@ impl Staging {
     /// Opens the staging directory at `dir`, creating it if needed, and
     /// replays whatever segments are already there.
     ///
-    /// `codec` decodes each replayed record to verify it against its own key; it must match
-    /// whatever `Cas` itself uses, since a value's digest is only
-    /// meaningful once decoded back to its original content.
+    /// `codec` decodes each replayed record to verify it against its
+    /// own key; it must match whatever `Cas` itself uses, since a
+    /// value's digest is only meaningful once decoded back to its
+    /// original content.
     ///
     /// `max_pending` is enforced from this point on, even if replay
     /// already found more pending segments than that: `put` refuses
@@ -435,11 +436,12 @@ impl Staging {
     /// Fetches the value staged under `key`, if any. Checks the active
     /// segment first, then every pending one.
     pub(crate) async fn get(&self, key: Digest) -> io::Result<Option<Bytes>> {
+        // Scoped to just the lookup: `segment.bytes` below runs without
+        // holding `active`'s lock, so a slow read never blocks a `put`.
         let found = {
             let active = self.active.read().await;
             active.records.get(&key).map(|slot| (active.segment.clone(), *slot))
         };
-        // The lock is not held here, segment.bytes needs no lock.
         if let Some((segment, slot)) = found {
             return segment.bytes(slot).await.map(Some);
         }
@@ -500,8 +502,8 @@ impl Staging {
     /// nothing to guard against here.
     ///
     /// Just removes `id` from `pending`: there's no second, flat index
-    /// to keep in sync with it (see the module doc), so nothing else
-    /// needs touching before the file itself comes off disk.
+    /// to keep in sync with it, so nothing else needs touching before
+    /// the file itself comes off disk.
     pub(crate) async fn finish(&self, id: FileId) -> io::Result<()> {
         self.pending.remove(&id);
         fs::remove_file(self.file_path(id)).await

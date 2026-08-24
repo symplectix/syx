@@ -222,7 +222,7 @@ async fn put_refuses_once_max_pending_segments_are_stuck() {
     let staging = Staging::open(dir.path(), Codec::new(), 2).await.unwrap();
 
     // Stage and rotate twice, reaching the cap without ever `finish`ing
-    // a segment -- as if `flush_pending` were failing persistently.
+    // a segment, as if `flush_pending` were failing persistently.
     for payload in [&b"a"[..], &b"b"[..]] {
         let (key, value) = encode(payload);
         staging.put(key, value).await.unwrap();

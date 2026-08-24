@@ -11,13 +11,12 @@ use std::sync::atomic::{
     Ordering,
 };
 
-/// A single always-advancing counter.
+/// The source of fresh ids for every `next` call in this process.
 static ID: AtomicU64 = AtomicU64::new(0);
 
-/// Source of fresh ids for every `next` calls in this process.
-/// Safe to call for any id, in any order, concurrently.
+/// Advances `ID` so it never hands out an id already used by `id`.
+/// Safe to call with any id, in any order, concurrently.
 pub(super) fn seed(id: FileId) {
-    // Advances `ID` so it never hands out an id already used by `id`.
     ID.fetch_max(id.0 + 1, Ordering::Relaxed);
 }
 

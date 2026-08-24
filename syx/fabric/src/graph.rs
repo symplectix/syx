@@ -19,11 +19,11 @@ use crate::{
 /// parts share.
 ///
 /// `staging_dir` is the only thing that must be specified: a local
-/// directory `Graph` stages not-yet-packed blobs in. Everything else --
-/// where `db`/`blobs` physically live -- defaults to also living under
-/// `staging_dir` via a local `object_store`, so a `Graph` works
-/// standalone with zero external setup; override `db_backend`/`blobs`
-/// to point at S3 (or any other `object_store` backend) instead.
+/// directory `Graph` stages not-yet-packed blobs in. Everything else,
+/// including where `db`/`blobs` physically live, defaults to also
+/// living under `staging_dir` via a local `object_store`, so a `Graph`
+/// works standalone with zero external setup; override `db_backend`/
+/// `blobs` to point at S3 (or any other `object_store` backend) instead.
 pub struct Builder {
     // staging
     staging_dir:          PathBuf,

@@ -73,7 +73,7 @@ impl Segment {
     /// Opens the segment file at `path`, checking that it's really one
     /// of `staging`'s own before treating it as one.
     ///
-    /// Return s`None` for anything that isn't confidently one of
+    /// Returns `None` for anything that isn't confidently one of
     /// `staging`'s own segments.
     ///
     /// Seals a `Some` result before returning it: once `MAGIC` is
