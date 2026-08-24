@@ -149,7 +149,7 @@ async fn reopening_drops_a_torn_tail_record_and_keeps_the_valid_ones() {
 
     // Simulate a crash mid-write: append a record whose declared length
     // promises more bytes than actually follow it in the file.
-    let path = segment_path(dir.path(), FileId::FIRST);
+    let path = file_id::path(dir.path(), FileId::FIRST);
     let valid_len = fs::metadata(&path).await.unwrap().len();
     let mut torn = Vec::new();
     torn.extend_from_slice(Digest::new([0xaa; 32]).as_ref());

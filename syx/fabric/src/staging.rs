@@ -75,7 +75,7 @@
 //! nothing durably written is silently lost.
 
 use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::io;
 use std::path::{
     Path,
     PathBuf,
@@ -84,10 +84,6 @@ use std::sync::Arc;
 use std::sync::atomic::{
     AtomicU64,
     Ordering,
-};
-use std::{
-    fmt,
-    io,
 };
 
 use bytes::{
@@ -111,43 +107,14 @@ use tokio::{
     task,
 };
 
+mod file_id;
 mod segment;
 
+pub(crate) use file_id::FileId;
 use segment::Segment;
 
 #[cfg(test)]
 mod tests;
-
-/// One append-only file's identity: `{id:020}.log` in `Staging`'s
-/// directory. A segment is created empty, then appended to sequentially
-/// while it's the active one; once rotated out it never changes again
-/// until `finish` deletes it. `segment` itself doesn't need this (see
-/// its own module doc); it only matters to this module's own
-/// bookkeeping -- `Committer::file_id` and `pending`'s keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct FileId(u64);
-
-impl FileId {
-    const FIRST: FileId = FileId(0);
-
-    fn next(self) -> FileId {
-        FileId(self.0 + 1)
-    }
-}
-
-impl fmt::Display for FileId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:020}", self.0)
-    }
-}
-
-fn segment_path(dir: &Path, id: FileId) -> PathBuf {
-    dir.join(format!("{id}.log"))
-}
-
-fn parse_segment_name(name: &OsStr) -> Option<FileId> {
-    name.to_str()?.strip_suffix(".log")?.parse().ok().map(FileId)
-}
 
 /// Where a record's value lives within a segment's bytes: `offset`/
 /// `length` point past the `[key][len]` header, at the value.
@@ -389,7 +356,7 @@ impl Committer {
         // what `revalidate_segment` below re-derives from disk instead.
         let _ = self.start_fresh_segment().await?;
 
-        let path = segment_path(&self.dir, old_id);
+        let path = file_id::path(&self.dir, old_id);
         if let Some((segment, records)) = revalidate_segment(&path, Some(self.codec)).await? {
             let _ = segment.seal();
             self.pending.insert(old_id, Pending { segment, records });
@@ -403,7 +370,7 @@ impl Committer {
     /// hand it off to `pending`.
     async fn start_fresh_segment(&mut self) -> io::Result<Active> {
         let next = self.file_id.next();
-        let segment = Segment::create(segment_path(&self.dir, next)).await?;
+        let segment = Segment::create(file_id::path(&self.dir, next)).await?;
 
         self.active_len.store(0, Ordering::Relaxed);
         self.file_id = next;
@@ -460,7 +427,7 @@ impl Staging {
         let mut ids = Vec::new();
         let mut read_dir = fs::read_dir(&dir).await?;
         while let Some(entry) = read_dir.next_entry().await? {
-            if let Some(id) = parse_segment_name(&entry.file_name()) {
+            if let Some(id) = file_id::parse(&entry.file_name()) {
                 ids.push(id);
             }
         }
@@ -468,7 +435,7 @@ impl Staging {
 
         let pending = Arc::new(SkipMap::new());
         for (i, &id) in ids.iter().enumerate() {
-            let path = segment_path(&dir, id);
+            let path = file_id::path(&dir, id);
             // Every earlier file was already durable before this
             // process ever rotated past it; only the one that could
             // have been active when the previous run stopped needs
@@ -482,7 +449,7 @@ impl Staging {
         }
 
         let next = ids.last().map_or(FileId::FIRST, |id| id.next());
-        let segment = Segment::create(segment_path(&dir, next)).await?;
+        let segment = Segment::create(file_id::path(&dir, next)).await?;
 
         let active_len = Arc::new(AtomicU64::new(0));
         let active =
@@ -654,11 +621,11 @@ impl Staging {
     /// needs touching before the file itself comes off disk.
     pub(crate) async fn finish(&self, id: FileId) -> io::Result<()> {
         self.pending.remove(&id);
-        fs::remove_file(self.segment_path(id)).await
+        fs::remove_file(self.file_path(id)).await
     }
 
-    fn segment_path(&self, id: FileId) -> PathBuf {
-        segment_path(&self.dir, id)
+    fn file_path(&self, id: FileId) -> PathBuf {
+        file_id::path(&self.dir, id)
     }
 }
 
