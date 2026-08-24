@@ -302,6 +302,10 @@ impl Committer {
     }
 }
 
+/// The staging area's public handle. `Committer` runs the actual write
+/// path in its own task; `Staging` holds the same active/pending state
+/// through shared `Arc`s, so its own reads never see something the
+/// committer doesn't.
 pub(crate) struct Staging {
     /// The directory segments live in.
     dir:         PathBuf,
