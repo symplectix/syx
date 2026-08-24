@@ -186,6 +186,37 @@ async fn reopening_drops_a_torn_tail_record_and_keeps_the_valid_ones() {
 }
 
 #[tokio::test]
+async fn reopening_leaves_a_short_foreign_file_untouched() {
+    let dir = testing::tempdir();
+
+    // Matches `FileId`'s `{20-digit}.log` naming, but its few bytes
+    // can't possibly hold `MAGIC`. Guessing this is one of `staging`'s
+    // own crashed segments would mean deleting a file that was never
+    // staging's to touch.
+    let path = dir.path().join(format!("{:020}.log", 42u64));
+    fs::write(&path, b"hi").await.unwrap();
+
+    let staging = open(dir.path()).await;
+
+    assert_eq!(fs::read(&path).await.unwrap(), b"hi");
+    assert!(staging.pending_segments().is_empty());
+}
+
+#[tokio::test]
+async fn reopening_leaves_an_empty_foreign_file_untouched() {
+    let dir = testing::tempdir();
+
+    // 0 bytes is not proof this is one of `staging`'s own.
+    let path = dir.path().join(format!("{:020}.log", 43u64));
+    fs::write(&path, b"").await.unwrap();
+
+    let staging = open(dir.path()).await;
+
+    assert!(fs::try_exists(&path).await.unwrap());
+    assert!(staging.pending_segments().is_empty());
+}
+
+#[tokio::test]
 async fn put_refuses_once_max_pending_segments_are_stuck() {
     let dir = testing::tempdir();
     let staging = Staging::open(dir.path(), Codec::new(), 2).await.unwrap();

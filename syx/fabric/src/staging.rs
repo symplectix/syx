@@ -575,13 +575,10 @@ async fn revalidate_segment(
     path: &Path,
     verify: Option<Codec>,
 ) -> io::Result<Option<(Segment, Records)>> {
-    let segment = match Segment::open(path).await? {
-        segment::Opened::Valid(segment) => segment,
-        segment::Opened::Empty => {
-            fs::remove_file(path).await?;
-            return Ok(None);
-        }
-        segment::Opened::Foreign => return Ok(None),
+    let Some(segment) = Segment::open(path).await? else {
+        // Not confidently one of `staging`'s own; see `Segment::open`.
+        // Left untouched, whatever it is.
+        return Ok(None);
     };
 
     let buf = segment.bytes(..).await?;

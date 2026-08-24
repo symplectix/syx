@@ -73,21 +73,21 @@ impl Segment {
     /// Opens the segment file at `path`, checking that it's really one
     /// of `staging`'s own before treating it as one.
     ///
-    /// Seals a `Valid` result before returning it: once `MAGIC` is
+    /// Return s`None` for anything that isn't confidently one of
+    /// `staging`'s own segments.
+    ///
+    /// Seals a `Some` result before returning it: once `MAGIC` is
     /// confirmed, this is a real segment, and this call's own view of
-    /// it never changes again. If `staging` goes on to find and
-    /// truncate a torn tail, that happens through `truncate`, which
-    /// hands back an entirely different, freshly sealed `Segment`
-    /// rather than mutating this one.
-    pub(super) async fn open(path: &Path) -> io::Result<Opened> {
+    /// it never changes again.
+    pub(super) async fn open(path: &Path) -> io::Result<Option<Segment>> {
         let segment = File::open(path.to_owned()).await.map(Segment::new)?;
         match segment.file.read_at(0, MAGIC_LEN as u32).await {
             Ok(prefix) if &prefix[..] == MAGIC => {
                 let _ = segment.seal();
-                Ok(Opened::Valid(segment))
+                Ok(Some(segment))
             }
-            Ok(_) => Ok(Opened::Foreign),
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(Opened::Empty),
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -101,18 +101,17 @@ impl Segment {
     ///
     /// `MAGIC` itself always survives, whatever `len` is, since the
     /// file is never truncated to fewer than `MAGIC_LEN` bytes. So this
-    /// always finds `Valid`; if it doesn't, opening the truncated file
-    /// failed in some other way, which is surfaced as an error rather
-    /// than swallowed quietly.
+    /// always finds it, unless opening the truncated file failed in
+    /// some other way, which is surfaced as an error rather than
+    /// swallowed quietly.
     pub(super) async fn truncate(path: PathBuf, len: u64) -> io::Result<Segment> {
         let len = MAGIC_LEN + len;
         fs::OpenOptions::new().write(true).open(&path).await?.set_len(len).await?;
-        match Segment::open(&path).await? {
-            Opened::Valid(segment) => Ok(segment),
-            Opened::Empty | Opened::Foreign => Err(io::Error::other(format!(
+        Segment::open(&path).await?.ok_or_else(|| {
+            io::Error::other(format!(
                 "staging: {path:?} lost its magic after truncating to {len} bytes"
-            ))),
-        }
+            ))
+        })
     }
 
     /// Appends `buf` to this segment's file. Not yet durable on its own.
@@ -184,19 +183,6 @@ impl<T: RangeBounds<u64>> BytesIndex for T {
             None => segment.file.read_from(start).await,
         }
     }
-}
-
-/// What `Segment::open`ing a file already on disk turned out to find.
-pub(super) enum Opened {
-    /// Starts with `MAGIC`: really one of `staging`'s own segments.
-    Valid(Segment),
-    /// Too short to have ever held `MAGIC`, the same as a segment whose
-    /// creation crashed before anything was written at all. Left on
-    /// disk; it's the caller's call whether to delete it.
-    Empty,
-    /// Doesn't start with `MAGIC`, so not actually one of `staging`'s
-    /// own segments, whatever it is. Left on disk, untouched.
-    Foreign,
 }
 
 impl File {
