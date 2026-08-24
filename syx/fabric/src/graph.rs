@@ -169,8 +169,15 @@ impl Builder {
         let codec = codec.unwrap_or_default();
         let max_pending_segments =
             max_pending_segments.unwrap_or(storage::DEFAULT_MAX_PENDING_SEGMENTS);
+        // Its own subdirectory, the same way `db_backend`'s default gets
+        // `staging_dir.join("db")` above: `Staging::open` lists every
+        // entry in whatever directory it's given and treats matches as
+        // its own segments, so it needs one nothing else ever writes
+        // into, not `staging_dir` itself (which `db`/`blobs` also live
+        // under by default).
         let staging = Arc::new(
-            crate::staging::Staging::open(staging_dir, codec, max_pending_segments).await?,
+            crate::staging::Staging::open(staging_dir.join("staging"), codec, max_pending_segments)
+                .await?,
         );
 
         let blobs = blobs_backend.unwrap_or_else(|| db_backend.clone());

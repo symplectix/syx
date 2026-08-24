@@ -4,14 +4,32 @@
 
 use std::io;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{
+    Path,
+    PathBuf,
+};
 use std::sync::{
     Arc,
     OnceLock,
 };
 
 use bytes::Bytes;
-use tokio::task;
+use tokio::{
+    fs,
+    task,
+};
+
+/// Every segment file starts with exactly these bytes, before anything
+/// `staging` writes into it. Purely a file-identity check: `Segment::open`
+/// uses it to tell a real segment apart from some other file that
+/// happens to match `FileId`'s naming, so this module never needs to
+/// know anything about what comes after it.
+const MAGIC: &[u8] = b"FABSTAG1";
+
+/// Where a segment's own records start, past `MAGIC`. Exposed so
+/// `staging` can parse records starting at the right offset without
+/// needing to know `MAGIC`'s actual bytes.
+pub(super) const MAGIC_LEN: u64 = MAGIC.len() as u64;
 
 /// A segment's open file, whether it's the one currently being appended
 /// to or one already rotated out. Doesn't carry its own `FileId`. That's
@@ -46,15 +64,64 @@ impl Segment {
         Segment { file, mmap: Mmap::default() }
     }
 
-    /// Creates a brand new, empty segment file at `path`.
+    /// Creates a brand new segment file at `path`, and writes `MAGIC` as
+    /// its first bytes.
     pub(super) async fn create(path: PathBuf) -> io::Result<Segment> {
-        File::create(path).await.map(Segment::new)
+        let segment = File::create(path).await.map(Segment::new)?;
+        segment.append(Bytes::from_static(MAGIC)).await?;
+        Ok(segment)
     }
 
-    /// Opens the existing segment file at `path` read-only, for one
-    /// found already on disk left over from a previous run.
-    pub(super) async fn open(path: PathBuf) -> io::Result<Segment> {
-        File::open(path).await.map(Segment::new)
+    /// Opens the segment file at `path`, checking that it's really one
+    /// of `staging`'s own before treating it as one. Only ever reads
+    /// `MAGIC_LEN` bytes to decide that, through `read_at`, rather than
+    /// the whole file: a `Foreign` file, in particular, might be
+    /// arbitrarily large and is none of this function's business to
+    /// read past its first few bytes. A read-only operation: it never
+    /// touches `path` on disk itself, `Empty` included, since deciding
+    /// what to do about a file that isn't a real segment is the
+    /// caller's call, not this one's.
+    ///
+    /// Seals a `Valid` result before returning it: once `MAGIC` is
+    /// confirmed, this is a real segment, and this call's own view of
+    /// it never changes again. If `staging` goes on to find and
+    /// truncate a torn tail, that happens through `truncate`, which
+    /// hands back an entirely different, freshly sealed `Segment`
+    /// rather than mutating this one.
+    pub(super) async fn open(path: &Path) -> io::Result<Opened> {
+        let segment = File::open(path.to_owned()).await.map(Segment::new)?;
+        match segment.read_at(0, MAGIC_LEN as u32).await {
+            Ok(prefix) if &prefix[..] == MAGIC => {
+                let _ = segment.seal();
+                Ok(Opened::Valid(segment))
+            }
+            Ok(_) => Ok(Opened::Foreign),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(Opened::Empty),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Truncates the segment file at `path` to `len` bytes, discarding a
+    /// torn tail found while revalidating it after a crash, then
+    /// reopens it through `open`, the same validated entry point used
+    /// everywhere else, rather than duplicating its file-opening logic
+    /// here. Takes `path`, not `&self`: a `Segment`'s own handle is
+    /// opened read-only, so it can't itself be used to truncate.
+    ///
+    /// `len` always leaves at least `MAGIC_LEN` bytes standing, since
+    /// it only ever comes from `staging::parse`, which never returns a
+    /// valid length shorter than where it started scanning; see its own
+    /// doc. So this always finds `Valid`. If it doesn't, `truncate` was
+    /// called with a `len` that cut into `MAGIC` itself, a bug in the
+    /// caller rather than a legitimate outcome to swallow quietly.
+    pub(super) async fn truncate(path: PathBuf, len: u64) -> io::Result<Segment> {
+        fs::OpenOptions::new().write(true).open(&path).await?.set_len(len).await?;
+        match Segment::open(&path).await? {
+            Opened::Valid(segment) => Ok(segment),
+            Opened::Empty | Opened::Foreign => Err(io::Error::other(format!(
+                "staging: {path:?} lost its magic after truncating to {len} bytes"
+            ))),
+        }
     }
 
     /// Appends `buf` to this segment's file. Not yet durable on its own.
@@ -83,6 +150,18 @@ impl Segment {
         self.file.read_at(offset, length).await
     }
 
+    /// This segment's entire current on-disk contents in one shot: the
+    /// mapping `seal` established, if there is one, same as `read_at`.
+    /// Falls back to a plain positioned read otherwise, for the rare
+    /// case sealing itself failed even though `open` confirmed this is
+    /// a real segment.
+    pub(super) async fn bytes(&self) -> io::Result<Bytes> {
+        if let Some(bytes) = self.mmap.get() {
+            return Ok(bytes);
+        }
+        self.file.bytes().await
+    }
+
     /// Establishes this segment's whole-file mapping, for a segment
     /// that's about to become pending or already is. From this point on
     /// the segment is never written to again; the module doc explains
@@ -102,6 +181,19 @@ impl Segment {
     pub(super) fn mmap_established(&self) -> bool {
         self.mmap.get().is_some()
     }
+}
+
+/// What `Segment::open`ing a file already on disk turned out to find.
+pub(super) enum Opened {
+    /// Starts with `MAGIC`: really one of `staging`'s own segments.
+    Valid(Segment),
+    /// Too short to have ever held `MAGIC`, the same as a segment whose
+    /// creation crashed before anything was written at all. Left on
+    /// disk; it's the caller's call whether to delete it.
+    Empty,
+    /// Doesn't start with `MAGIC`, so not actually one of `staging`'s
+    /// own segments, whatever it is. Left on disk, untouched.
+    Foreign,
 }
 
 impl File {
@@ -152,6 +244,20 @@ impl File {
         })
         .await
         .expect("read_at should not panic")
+        .map(Bytes::from)
+    }
+
+    /// This file's entire current contents in one shot, through this
+    /// same open handle rather than opening it again by path.
+    async fn bytes(&self) -> io::Result<Bytes> {
+        let file = Arc::clone(&self.0);
+        task::spawn_blocking(move || -> io::Result<Vec<u8>> {
+            let mut buf = vec![0u8; file.metadata()?.len() as usize];
+            read_at(&file, &mut buf, 0)?;
+            Ok(buf)
+        })
+        .await
+        .expect("bytes should not panic")
         .map(Bytes::from)
     }
 }

@@ -5,11 +5,17 @@
 //! so replaying the same (key, value) pair after a crash, or retrying the
 //! same segment after a failed flush, is always a safe no-op.
 //!
-//! Records are framed as `[key: 32 bytes][value_len: u32 BE][value]`, with
-//! no separate checksum. Verifying a segment means decoding each record
-//! and recomputing its digest, which is a stronger check than a CRC would
-//! be; `revalidate_segment` runs this whenever a segment's tail might be
-//! torn, truncating away anything from the first bad record on.
+//! Every segment file starts with a fixed magic prefix, before any
+//! records; see `segment`'s own doc. `Segment::open` checks it first,
+//! so a file that turns out not to be one of ours, despite
+//! matching `FileId`'s `{id:020}.log` naming, is left alone rather than
+//! misread as records or deleted as an empty segment. Past that prefix,
+//! records are framed as `[key: 32 bytes][value_len: u32 BE][value]`,
+//! with no separate checksum. Verifying a segment means decoding each
+//! record and recomputing its digest, which is a stronger check than a
+//! CRC would be; `revalidate_segment` runs this whenever a segment's
+//! tail might be torn, truncating away anything from the first bad
+//! record on.
 //!
 //! Puts append to one active segment. Once a caller rotates it out, it
 //! becomes a pending segment: readable through `entries`, and removed via
@@ -357,7 +363,6 @@ impl Committer {
 
         let path = file_id::path(&self.dir, old_id);
         if let Some((segment, records)) = revalidate_segment(&path, Some(self.codec)).await? {
-            let _ = segment.seal();
             self.pending.insert(old_id, Pending { segment, records });
         }
         Ok(())
@@ -371,7 +376,7 @@ impl Committer {
         let next = file_id::next();
         let segment = Segment::create(file_id::path(&self.dir, next)).await?;
 
-        self.active_len.store(0, Ordering::Relaxed);
+        self.active_len.store(segment::MAGIC_LEN, Ordering::Relaxed);
         self.file_id = next;
         self.segment = segment.clone();
 
@@ -447,17 +452,15 @@ impl Staging {
             // have been active when the previous run stopped needs
             // verifying.
             let verify = (i + 1 == ids.len()).then_some(codec);
-            let Some((segment, records)) = revalidate_segment(&path, verify).await? else {
-                continue;
-            };
-            let _ = segment.seal();
-            pending.insert(id, Pending { segment, records });
+            if let Some((segment, records)) = revalidate_segment(&path, verify).await? {
+                pending.insert(id, Pending { segment, records });
+            }
         }
 
         let next = file_id::next();
         let segment = Segment::create(file_id::path(&dir, next)).await?;
 
-        let active_len = Arc::new(AtomicU64::new(0));
+        let active_len = Arc::new(AtomicU64::new(segment::MAGIC_LEN));
         let active =
             Arc::new(RwLock::new(Active { segment: segment.clone(), records: Records::new() }));
 
@@ -638,8 +641,10 @@ impl Staging {
 
 const RECORD_HEADER_LEN: u64 = 32 + 4;
 
-/// Parses records from `buf` in order, returning each one's key and where
-/// its value lives, plus how many bytes from the start of `buf` are valid.
+/// Parses records from `buf` in order, starting at `start` (past
+/// `MAGIC` and whatever records already preceded it), and returning
+/// each one's key and where its value lives, plus how many bytes from
+/// the start of `buf` are valid.
 ///
 /// `codec` is `None` for a segment already known to be fully durable, in
 /// which case only the length framing is trusted. It's `Some` whenever
@@ -648,9 +653,9 @@ const RECORD_HEADER_LEN: u64 = 32 + 4;
 /// and the first record that fails this, or that the file simply doesn't
 /// have enough bytes left for, is treated as a torn tail. Everything from
 /// that point on is dropped rather than trusted.
-fn parse(buf: &Bytes, codec: Option<Codec>) -> (u64, Records) {
+fn parse(buf: &Bytes, start: u64, codec: Option<Codec>) -> (u64, Records) {
     let mut records = Records::new();
-    let mut offset = 0usize;
+    let mut offset = start as usize;
     while offset as u64 + RECORD_HEADER_LEN <= buf.len() as u64 {
         let key = Digest::new(buf[offset..offset + 32].try_into().unwrap());
         let length = u32::from_be_bytes(buf[offset + 32..offset + 36].try_into().unwrap());
@@ -683,32 +688,43 @@ fn parse(buf: &Bytes, codec: Option<Codec>) -> (u64, Records) {
 /// to be fully durable. That is every segment but the one that could
 /// have been active, when called from `open`.
 ///
-/// Deletes the file and returns `None` if nothing valid remains: either
-/// an empty active segment that was created but never written to, or
-/// one torn so badly not even its first record survived.
+/// `None` covers both a file `Segment::open` already found isn't one of
+/// `staging`'s own, and one that is but whose records all turned out
+/// invalid; either way there's nothing to add to `pending`.
+///
+/// The returned `Segment`, when there is one, is already sealed: both
+/// `Segment::open` and `Segment::truncate` seal before handing one
+/// back, so callers don't need to do it again.
 async fn revalidate_segment(
     path: &Path,
     verify: Option<Codec>,
 ) -> io::Result<Option<(Segment, Records)>> {
-    let buf = read_bytes(path).await?;
-    let len = buf.len() as u64;
+    let segment = match Segment::open(path).await? {
+        segment::Opened::Valid(segment) => segment,
+        segment::Opened::Empty => {
+            fs::remove_file(path).await?;
+            return Ok(None);
+        }
+        segment::Opened::Foreign => return Ok(None),
+    };
 
+    let buf = segment.bytes().await?;
+    let len = buf.len() as u64;
     let (valid_len, records) = {
         let buf = buf.clone();
-        task::spawn_blocking(move || parse(&buf, verify)).await.expect("parse should not panic")
+        task::spawn_blocking(move || parse(&buf, segment::MAGIC_LEN, verify))
+            .await
+            .expect("parse should not panic")
     };
-    if valid_len < len {
-        fs::OpenOptions::new().write(true).open(path).await?.set_len(valid_len).await?;
-    }
+    let segment = if valid_len < len {
+        Segment::truncate(path.to_owned(), valid_len).await?
+    } else {
+        segment
+    };
     if records.is_empty() {
         fs::remove_file(path).await?;
         return Ok(None);
     }
 
-    let segment = Segment::open(path.to_owned()).await?;
     Ok(Some((segment, records)))
-}
-
-async fn read_bytes(path: &Path) -> io::Result<Bytes> {
-    fs::read(path).await.map(Bytes::from)
 }

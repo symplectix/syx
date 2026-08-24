@@ -48,9 +48,9 @@ async fn active_len_tracks_bytes_written_to_the_active_segment() {
     let dir = testing::tempdir();
     let staging = open(dir.path()).await;
     let (key, value) = encode(b"hello");
-    let expected = RECORD_HEADER_LEN + value.len() as u64;
+    let expected = segment::MAGIC_LEN + RECORD_HEADER_LEN + value.len() as u64;
 
-    assert_eq!(staging.active_len(), 0);
+    assert_eq!(staging.active_len(), segment::MAGIC_LEN);
     staging.put(key, value).await.unwrap();
     assert_eq!(staging.active_len(), expected);
 }
@@ -64,7 +64,7 @@ async fn rotate_moves_the_active_segment_into_pending_and_resets_active_len() {
 
     let segment = staging.rotate().await.unwrap();
 
-    assert_eq!(staging.active_len(), 0);
+    assert_eq!(staging.active_len(), segment::MAGIC_LEN);
     assert_eq!(staging.pending_segments(), vec![segment]);
     assert!(staging.contains(key).await);
 }
