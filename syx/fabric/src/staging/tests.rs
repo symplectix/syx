@@ -148,8 +148,15 @@ async fn reopening_drops_a_torn_tail_record_and_keeps_the_valid_ones() {
     }
 
     // Simulate a crash mid-write: append a record whose declared length
-    // promises more bytes than actually follow it in the file.
-    let path = file_id::path(dir.path(), FileId::FIRST);
+    // promises more bytes than actually follow it in the file. Found by
+    // listing `dir` (exactly one segment file exists at this point)
+    // rather than assuming any particular id: `file_id`'s counter is
+    // shared process-wide, so this directory's first segment isn't
+    // necessarily id 0 if another test already claimed lower ids.
+    let path = {
+        let mut read_dir = fs::read_dir(dir.path()).await.unwrap();
+        read_dir.next_entry().await.unwrap().unwrap().path()
+    };
     let valid_len = fs::metadata(&path).await.unwrap().len();
     let mut torn = Vec::new();
     torn.extend_from_slice(Digest::new([0xaa; 32]).as_ref());

@@ -26,8 +26,8 @@
 //! ## Object Store
 //!
 //! - `cas/sha256/{pack_id:x}`: one object per consolidated segment, hex-encoded. A pack object's
-//!   bytes are exactly the staging segment's own sealed bytes (see `staging`'s module doc for its
-//!   `[key][len][value]` framing) -- uploaded as-is, not decoded and reassembled first. An
+//!   bytes are exactly the staging segment's own sealed bytes; see `staging`'s module doc for its
+//!   `[key][len][value]` framing. They are uploaded as-is, not decoded and reassembled first. An
 //!   `Entry`'s `offset`/`length` point past a record's header, at its value, the same offsets
 //!   `staging` already parsed out of the segment.
 use std::io;
@@ -656,10 +656,10 @@ async fn flush_segments(
         }
 
         // A pack object's bytes are exactly a staging segment's own
-        // sealed bytes (see `Staging::segment_bytes`), so `buf` is
+        // sealed bytes; see `Staging::segment_bytes`. So `buf` is
         // uploaded as-is instead of being decoded and reassembled into
-        // a fresh payload. Only `pack_id` -- a hash of just the values,
-        // not the `[key][len]` framing around them -- still needs
+        // a fresh payload. Only `pack_id`, a hash of just the values and
+        // not the `[key][len]` framing around them, still needs
         // computing.
         let mut hasher = Hasher::new();
         for slot in records.values() {

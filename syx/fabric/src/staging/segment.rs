@@ -1,4 +1,6 @@
 //! A segment's on-disk file and in-memory view.
+//! A segment is created empty, then appended to sequentially while
+//! it's the active one; once rotated out it never changes again.
 
 use std::io;
 use std::io::Write as _;
@@ -12,10 +14,10 @@ use bytes::Bytes;
 use tokio::task;
 
 /// A segment's open file, whether it's the one currently being appended
-/// to or one already rotated out. Doesn't carry its own `FileId`: that's
-/// tracked separately by whoever cares which segment this is (see
-/// `staging`'s `Committer::id`, and `pending`'s own `FileId` keys) --
-/// nothing in this module ever needs to read it back.
+/// to or one already rotated out. Doesn't carry its own `FileId`. That's
+/// tracked separately by whoever cares which segment this is: see
+/// `staging`'s `Committer::file_id`, and `pending`'s own `FileId` keys.
+/// Nothing in this module ever needs to read it back.
 #[derive(Clone)]
 pub(super) struct Segment {
     /// This segment's open file. `mmap` itself, once sealing calls for
@@ -67,12 +69,13 @@ impl Segment {
     }
 
     /// Reads `length` bytes at `offset`: sliced zero-copy from the
-    /// mapping if one's been established, or via a positioned read
-    /// against `file` if it isn't (not yet sealed, or sealing failed).
+    /// mapping if one's been established. Falls back to a positioned
+    /// read against `file` if it isn't, either because the segment isn't
+    /// sealed yet or because sealing failed.
     pub(super) async fn read_at(&self, offset: u64, length: u32) -> io::Result<Bytes> {
         // `mmap.read_at`, not `seal`: this might still be the active
-        // segment (still being written to), and mapping that one is
-        // exactly what `seal` must never do -- only a sealed segment's
+        // segment, still being written to, and mapping that one is
+        // exactly what `seal` must never do. Only a sealed segment's
         // `mmap` is safe to establish on demand.
         if let Some(bytes) = self.mmap.read_at(offset, length) {
             return Ok(bytes);
@@ -81,13 +84,12 @@ impl Segment {
     }
 
     /// Establishes this segment's whole-file mapping, for a segment
-    /// that's about to become (or already is) pending: from this point
-    /// it's never written to again (see the module doc), so mapping it
-    /// is safe. Idempotent, and, because `mmap` is shared, this update
-    /// is visible through every clone of this `Segment` value already
-    /// out there, including `Location`s `index` held from before
-    /// sealing happened -- nothing needs to go back and update `index`
-    /// itself.
+    /// that's about to become pending or already is. From this point on
+    /// the segment is never written to again; the module doc explains
+    /// why that makes mapping it safe. This is idempotent. Because
+    /// `mmap` is shared, the mapping becomes visible through every clone
+    /// of this `Segment` value already out there, including any a caller
+    /// already captured before sealing happened.
     pub(super) fn seal(&self) -> io::Result<Bytes> {
         self.mmap.get_or_map(&self.file)
     }
@@ -112,8 +114,8 @@ impl File {
     }
 
     /// Creates a brand new segment file: readable and appendable, and
-    /// failing if `path` already exists (a segment id is only ever used
-    /// once).
+    /// failing if `path` already exists, since a segment id is only ever
+    /// used once.
     async fn create(path: PathBuf) -> io::Result<Self> {
         task::spawn_blocking(move || {
             let mut opts = std::fs::OpenOptions::new();
@@ -156,17 +158,17 @@ impl File {
 
 impl Mmap {
     /// The mapping, if it's been established already. Never maps the
-    /// file itself: callers that only want to peek (`read_at`, happy to
-    /// fall back to `File::read_at` on a miss) shouldn't pay for
-    /// mapping a whole segment just to read one small value from it.
+    /// file itself: callers that only want to peek, `read_at`, are happy
+    /// to fall back to `File::read_at` on a miss, so they shouldn't pay
+    /// for mapping a whole segment just to read one small value from it.
     fn get(&self) -> Option<Bytes> {
         self.0.get().cloned()
     }
 
     /// Reads `length` bytes at `offset`, sliced zero-copy from the
-    /// mapping -- if one's been established. `None`, not an error, if
-    /// it hasn't: unlike `File::read_at`, there's nothing to actually
-    /// read here, just an in-memory slice of what's already there.
+    /// mapping, if one's been established. `None`, not an error, if it
+    /// hasn't: unlike `File::read_at`, there's nothing to actually read
+    /// here, just an in-memory slice of what's already there.
     fn read_at(&self, offset: u64, length: u32) -> Option<Bytes> {
         let bytes = self.get()?;
         let start = offset as usize;
@@ -174,8 +176,8 @@ impl Mmap {
     }
 
     /// The mapping, establishing it first if it isn't there yet.
-    /// Idempotent: a mapping already established by another caller (or
-    /// concurrently by this one losing a race) is reused as-is.
+    /// Idempotent: a mapping already established by another caller, or
+    /// concurrently by this one losing a race, is reused as-is.
     fn get_or_map(&self, file: &File) -> io::Result<Bytes> {
         if let Some(bytes) = self.get() {
             return Ok(bytes);
@@ -242,9 +244,9 @@ mod tests {
         segment.seal().unwrap();
 
         // The clone shares `segment`'s `mmap` cell, so it sees the
-        // mapping `seal` just established on the other clone -- proving
-        // this is a shared cell, not a fresh mapping each clone would
-        // have to establish for itself.
+        // mapping `seal` just established on the other clone. This
+        // proves it's a shared cell, not a fresh mapping each clone
+        // would have to establish for itself.
         assert!(clone.mmap_established());
     }
 }

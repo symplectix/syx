@@ -1,9 +1,4 @@
-//! A segment's identity: `{id:020}.log` in `Staging`'s directory. A
-//! segment is created empty, then appended to sequentially while it's
-//! the active one; once rotated out it never changes again until
-//! `finish` deletes it. `segment` itself doesn't need this (see its own
-//! module doc); it only matters to `staging`'s own bookkeeping --
-//! `Committer::file_id` and `pending`'s keys.
+//! A segment's identity: `{id:020}.log` in `Staging`'s directory.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -11,20 +6,32 @@ use std::path::{
     Path,
     PathBuf,
 };
+use std::sync::atomic::{
+    AtomicU64,
+    Ordering,
+};
+
+/// A single always-advancing counter.
+static ID: AtomicU64 = AtomicU64::new(0);
+
+/// Source of fresh ids for every `next` calls in this process.
+/// Safe to call for any id, in any order, concurrently.
+pub(super) fn seed(id: FileId) {
+    // Advances `ID` so it never hands out an id already used by `id`.
+    ID.fetch_max(id.0 + 1, Ordering::Relaxed);
+}
+
+/// Claims a fresh, unique id.
+pub(super) fn next() -> FileId {
+    FileId(ID.fetch_add(1, Ordering::Relaxed))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct FileId(u64);
 
-impl FileId {
-    pub(super) const FIRST: FileId = FileId(0);
-
-    pub(super) fn next(self) -> FileId {
-        FileId(self.0 + 1)
-    }
-}
-
 impl fmt::Display for FileId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Exactly wide enough for u64::MAX (20 digits).
         write!(f, "{:020}", self.0)
     }
 }
