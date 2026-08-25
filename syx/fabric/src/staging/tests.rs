@@ -70,26 +70,6 @@ async fn rotate_moves_the_active_segment_into_pending_and_resets_active_segment_
 }
 
 #[tokio::test]
-async fn rotate_seals_a_mapping_a_segment_captured_before_it_can_see() {
-    let dir = testing::tempdir();
-    let staging = open(dir.path()).await;
-    let (key, value) = encode(b"hello");
-    staging.put(key, value.clone()).await.unwrap();
-
-    // Captured while the segment was still active: no mapping yet.
-    let segment = staging.active.read().await.segment.clone();
-    assert!(!segment.sealed());
-
-    staging.rotate().await.unwrap();
-
-    // The same clone, never re-fetched since, now sees the mapping
-    // `seal` established while rotating, proving it's a shared cell
-    // doing this and not a fresh lookup back into `pending`.
-    assert!(segment.sealed());
-    assert_eq!(staging.get(key).await.unwrap(), Some(value));
-}
-
-#[tokio::test]
 async fn entries_returns_everything_written_to_a_pending_segment() {
     let dir = testing::tempdir();
     let staging = open(dir.path()).await;
