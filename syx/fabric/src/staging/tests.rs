@@ -78,14 +78,14 @@ async fn rotate_seals_a_mapping_a_segment_captured_before_it_can_see() {
 
     // Captured while the segment was still active: no mapping yet.
     let segment = staging.active.read().await.segment.clone();
-    assert!(!segment.mmap_established());
+    assert!(!segment.sealed());
 
     staging.rotate().await.unwrap();
 
     // The same clone, never re-fetched since, now sees the mapping
     // `seal` established while rotating, proving it's a shared cell
     // doing this and not a fresh lookup back into `pending`.
-    assert!(segment.mmap_established());
+    assert!(segment.sealed());
     assert_eq!(staging.get(key).await.unwrap(), Some(value));
 }
 

@@ -26,7 +26,7 @@ use tokio::{
 /// Every segment file starts with exactly these bytes.
 /// `Segment::open` uses this to tell a real segment apart from some
 /// other file that happens to match `FileId`'s naming.
-const MAGIC: &[u8] = b"FABSTAG1";
+const MAGIC: &[u8] = b"SEGv1";
 
 /// Where a segment's own records start, past `MAGIC`.
 const MAGIC_LEN: u64 = MAGIC.len() as u64;
@@ -117,11 +117,13 @@ impl Segment {
     /// Appends `buf` to this segment's file. Not yet durable on its own.
     /// Only ever called by `Committer`, on the active segment.
     pub(super) async fn append(&self, buf: Bytes) -> io::Result<()> {
+        assert!(!self.sealed());
         self.file.append(buf).await
     }
 
     /// Syncs everything appended so far to durable storage.
     pub(super) async fn flush(&self) -> io::Result<()> {
+        assert!(!self.sealed());
         self.file.flush().await
     }
 
@@ -142,11 +144,11 @@ impl Segment {
     }
 
     /// Whether `seal` has already established this segment's mapping.
-    /// Exists for tests: proves the mapping is really shared through
-    /// every clone of a `Segment` value, not just visible to whichever
-    /// clone happened to call `seal`.
-    #[cfg(test)]
-    pub(super) fn mmap_established(&self) -> bool {
+    /// `append`/`flush` assert this is false: once sealed, a segment is
+    /// never written to again. Also used by tests, to prove the mapping
+    /// is really shared through every clone of a `Segment` value, not
+    /// just visible to whichever clone happened to call `seal`.
+    pub(super) fn sealed(&self) -> bool {
         self.mmap.get().is_some()
     }
 }
@@ -323,7 +325,7 @@ mod tests {
         // Cloned before `seal` runs: no mapping yet, since `Mmap` starts
         // empty and `create` never establishes one.
         let clone = segment.clone();
-        assert!(!clone.mmap_established());
+        assert!(!clone.sealed());
 
         segment.seal().unwrap();
 
@@ -331,6 +333,6 @@ mod tests {
         // mapping `seal` just established on the other clone. This
         // proves it's a shared cell, not a fresh mapping each clone
         // would have to establish for itself.
-        assert!(clone.mmap_established());
+        assert!(clone.sealed());
     }
 }
