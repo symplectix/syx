@@ -150,10 +150,11 @@ impl Flushing {
     }
 
     /// Whether enough has accumulated since the last flush to make one
-    /// due now: `active_len` crossing `bytes_threshold`, or enough time
-    /// having passed since `staging_since` regardless of `active_len`.
-    fn is_due(&self, active_len: u64) -> bool {
-        active_len >= self.bytes_threshold
+    /// due now: `active_segment_len` crossing `bytes_threshold`, or
+    /// enough time having passed since `staging_since` regardless of
+    /// `active_segment_len`.
+    fn is_due(&self, active_segment_len: u64) -> bool {
+        active_segment_len >= self.bytes_threshold
             || self.staging_since.lock().unwrap().elapsed() >= self.duration_threshold
     }
 
@@ -338,9 +339,9 @@ impl<'a> Cas<'a> {
     /// persistently broken flush path is surfaced to callers rather than
     /// growing `staging` without bound.
     async fn put_blob(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
-        let active_len = self.staging.put(key, bytes).await?;
+        let active_segment_len = self.staging.put(key, bytes).await?;
 
-        if !self.flushing.is_due(active_len) {
+        if !self.flushing.is_due(active_segment_len) {
             return Ok(());
         }
 
@@ -625,7 +626,7 @@ async fn flush_pending(
     _guard: OwnedMutexGuard<()>,
 ) -> io::Result<()> {
     let mut segments = staging.pending_segments();
-    if staging.active_len() > 0 {
+    if staging.active_segment_len() > 0 {
         segments.push(staging.rotate().await?);
         flushing.reset_staging_since();
     }

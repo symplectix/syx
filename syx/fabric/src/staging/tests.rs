@@ -44,19 +44,19 @@ async fn contains_reflects_whether_a_key_is_staged() {
 }
 
 #[tokio::test]
-async fn active_len_tracks_bytes_written_to_the_active_segment() {
+async fn active_segment_len_tracks_bytes_written_to_the_active_segment() {
     let dir = testing::tempdir();
     let staging = open(dir.path()).await;
     let (key, value) = encode(b"hello");
     let expected = RECORD_HEADER_LEN + value.len() as u64;
 
-    assert_eq!(staging.active_len(), 0);
+    assert_eq!(staging.active_segment_len(), 0);
     staging.put(key, value).await.unwrap();
-    assert_eq!(staging.active_len(), expected);
+    assert_eq!(staging.active_segment_len(), expected);
 }
 
 #[tokio::test]
-async fn rotate_moves_the_active_segment_into_pending_and_resets_active_len() {
+async fn rotate_moves_the_active_segment_into_pending_and_resets_active_segment_len() {
     let dir = testing::tempdir();
     let staging = open(dir.path()).await;
     let (key, value) = encode(b"hello");
@@ -64,7 +64,7 @@ async fn rotate_moves_the_active_segment_into_pending_and_resets_active_len() {
 
     let segment = staging.rotate().await.unwrap();
 
-    assert_eq!(staging.active_len(), 0);
+    assert_eq!(staging.active_segment_len(), 0);
     assert_eq!(staging.pending_segments(), vec![segment]);
     assert!(staging.contains(key).await);
 }

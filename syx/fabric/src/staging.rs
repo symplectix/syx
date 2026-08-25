@@ -119,17 +119,17 @@ struct Committer {
     /// `Segment`'s own doc for why. Tracked here alongside `segment`. A
     /// fresh replacement comes from `file_id::next`, not by
     /// incrementing this directly.
-    file_id:    FileId,
+    file_id: FileId,
     /// The published view of the active segment, shared with `Staging`
     /// for `get`/`contains`; see `Active`'s own doc.
-    active:     Arc<RwLock<Active>>,
+    active: Arc<RwLock<Active>>,
     /// The active segment's current length, and the next unwritten
     /// offset within it.
-    active_len: Arc<AtomicU64>,
+    active_segment_len: Arc<AtomicU64>,
     /// The active segment. A private working copy: writes go through
     /// this directly without taking `active`'s lock, so a `put`'s
     /// `append`+`flush` never waits behind a `get`/`contains` reader.
-    segment:    Segment,
+    segment: Segment,
 
     /// Rotated out, not yet `finish`ed. Structurally can never contain
     /// the active segment, so nothing removing from it needs to guard
@@ -199,7 +199,7 @@ impl Committer {
     /// many `put`s happened to be ready when this batch was drained.
     async fn commit(&mut self, batch: &mut Vec<PutMsg>) {
         let mut slots = Vec::with_capacity(batch.len());
-        let mut offset = self.active_len.load(Ordering::Relaxed);
+        let mut offset = self.active_segment_len.load(Ordering::Relaxed);
         let mut written = Ok(());
         for msg in batch.iter() {
             let value_offset = offset + RECORD_HEADER_LEN;
@@ -231,7 +231,7 @@ impl Committer {
 
         match result {
             Ok(()) => {
-                self.active_len.store(offset, Ordering::Relaxed);
+                self.active_segment_len.store(offset, Ordering::Relaxed);
                 let mut active = self.active.write().await;
                 for (msg, slot) in batch.drain(..).zip(slots) {
                     active.records.insert(msg.key, slot);
@@ -243,7 +243,7 @@ impl Committer {
                     let _ = msg.reply.send(Err(io::Error::new(e.kind(), e.to_string())));
                 }
                 // `O_APPEND` still lands whatever it managed to write
-                // even though this batch failed, so `active_len` can no
+                // even though this batch failed, so `active_segment_len` can no
                 // longer be trusted as this segment's true length.
                 let _ = self.poison().await;
             }
@@ -293,7 +293,7 @@ impl Committer {
         let next = file_id::next();
         let segment = Segment::create(file_id::path(&self.dir, next)).await?;
 
-        self.active_len.store(0, Ordering::Relaxed);
+        self.active_segment_len.store(0, Ordering::Relaxed);
         self.file_id = next;
         self.segment = segment.clone();
 
@@ -308,16 +308,16 @@ impl Committer {
 /// committer doesn't.
 pub(crate) struct Staging {
     /// The directory segments live in.
-    dir:         PathBuf,
+    dir: PathBuf,
     /// The active segment's current length, published by the committer
     /// after every batch it commits.
-    active_len:  Arc<AtomicU64>,
+    active_segment_len: Arc<AtomicU64>,
     /// The active segment and its records so far; see `Committer`'s own
     /// field of the same name.
-    active:      Arc<RwLock<Active>>,
+    active: Arc<RwLock<Active>>,
     /// Rotated out, not yet `finish`ed; see `Committer`'s own field of
     /// the same name.
-    pending:     Arc<SkipMap<FileId, Pending>>,
+    pending: Arc<SkipMap<FileId, Pending>>,
     /// `put` refuses new writes once pending segments reach this many,
     /// so a persistently failing `flush_pending` bounds local disk usage
     /// instead of growing it without limit.
@@ -325,7 +325,7 @@ pub(crate) struct Staging {
     /// Where `put`/`rotate` send their requests; the committer task
     /// holds the matching receiver for as long as any `Staging` handle,
     /// and thus any clone of this sender, is still alive.
-    commands:    mpsc::UnboundedSender<Command>,
+    commands: mpsc::UnboundedSender<Command>,
 }
 
 impl Staging {
@@ -380,7 +380,7 @@ impl Staging {
         let next = file_id::next();
         let segment = Segment::create(file_id::path(&dir, next)).await?;
 
-        let active_len = Arc::new(AtomicU64::new(0));
+        let active_segment_len = Arc::new(AtomicU64::new(0));
         let active =
             Arc::new(RwLock::new(Active { segment: segment.clone(), records: Records::new() }));
 
@@ -390,13 +390,13 @@ impl Staging {
             file_id: next,
             segment,
             codec,
-            active_len: Arc::clone(&active_len),
+            active_segment_len: Arc::clone(&active_segment_len),
             active: Arc::clone(&active),
             pending: Arc::clone(&pending),
         };
         tokio::spawn(committer.run(rx));
 
-        Ok(Self { dir, active_len, active, pending, max_pending, commands })
+        Ok(Self { dir, active_segment_len, active, pending, max_pending, commands })
     }
 
     /// The `Pending` entry for `id`. Panics if it isn't tracked: its
@@ -465,8 +465,8 @@ impl Staging {
     /// returns this for its own caller; this is for querying it
     /// independently of any particular write, e.g. `flush_pending`
     /// checking whether the active segment has anything worth rotating.
-    pub(crate) fn active_len(&self) -> u64 {
-        self.active_len.load(Ordering::Relaxed)
+    pub(crate) fn active_segment_len(&self) -> u64 {
+        self.active_segment_len.load(Ordering::Relaxed)
     }
 
     /// Closes the active segment out as a new pending segment and starts
