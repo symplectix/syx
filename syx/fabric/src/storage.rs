@@ -3,11 +3,11 @@
 //!
 //! # Data layout
 //!
-//! ## Staging
+//! ## Forgetter
 //!
-//! Not-yet-packed blobs are staged in `staging`, a local durable log, not
-//! in `db`. `db` only ever holds pointers to already-packed content; see
-//! `staging`'s own module doc for why.
+//! Not-yet-packed blobs are staged in `forgetter`, a local durable log,
+//! not in `db`. `db` only ever holds pointers to already-packed content;
+//! see `forgetter`'s own module doc for why.
 //!
 //! ## Packing
 //!
@@ -21,15 +21,15 @@
 //!   not hex; `sha256` names the hashing scheme so a future switch to a different one, e.g.
 //!   `blake3`, can live alongside these keys instead of colliding with them). The value is
 //!   [`Entry::encode`]'s output: `[pack_id: 32 bytes][offset: u64][length: u64]`. Written once,
-//!   when `flush_pending` consolidates a staging segment into a pack.
+//!   when `flush_pending` consolidates a forgetter segment into a pack.
 //!
 //! ## Object Store
 //!
 //! - `cas/sha256/{pack_id:x}`: one object per consolidated segment, hex-encoded. A pack object's
-//!   bytes are exactly the staging segment's own sealed bytes; see `staging`'s module doc for its
-//!   `[key][len][value]` framing. They are uploaded as-is, not decoded and reassembled first. An
-//!   `Entry`'s `offset`/`length` point past a record's header, at its value, the same offsets
-//!   `staging` already parsed out of the segment.
+//!   bytes are exactly the forgetter segment's own sealed bytes; see `forgetter`'s module doc for
+//!   its `[key][len][value]` framing. They are uploaded as-is, not decoded and reassembled first.
+//!   An `Entry`'s `offset`/`length` point past a record's header, at its value, the same offsets
+//!   `forgetter` already parsed out of the segment.
 use std::io;
 use std::ops::Range;
 use std::pin::pin;
@@ -81,9 +81,9 @@ use tokio::task;
 #[cfg(test)]
 mod tests;
 
-use crate::staging::{
+use forgetter::{
     self,
-    Staging,
+    Forgetter,
 };
 
 fn invalid_data(msg: impl Into<String>) -> io::Error {
@@ -106,12 +106,12 @@ pub(crate) const DEFAULT_CAS_PREFIX: &str = "cas/";
 /// dozen chunks per pack.
 pub(crate) const DEFAULT_FLUSH_THRESHOLD: u64 = Chunking::AVG_SIZE as u64 * 64;
 
-/// The default `max_staging_duration`: bounds how long a blob can stay
+/// The default `max_forgetter_duration`: bounds how long a blob can stay
 /// invisible to every other reader of `Graph` even when write volume
 /// never crosses `flush_threshold` on its own.
-pub(crate) const DEFAULT_MAX_STAGING_DURATION: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_MAX_FORGETTER_DURATION: Duration = Duration::from_secs(30);
 
-/// The default `max_pending_segments`: bounds `staging`'s local disk
+/// The default `max_pending_segments`: bounds `forgetter`'s local disk
 /// usage, at this default roughly `16 * flush_threshold`, to a finite
 /// amount even if `flush_pending` fails indefinitely.
 pub(crate) const DEFAULT_MAX_PENDING_SEGMENTS: u16 = 16;
@@ -132,7 +132,7 @@ pub(crate) struct Flushing {
     /// regardless of `bytes_threshold`.
     duration_threshold: Duration,
     /// When the active segment currently being staged into started.
-    staging_since: Arc<std::sync::Mutex<Instant>>,
+    forgetter_since: Arc<std::sync::Mutex<Instant>>,
 }
 
 impl Flushing {
@@ -145,23 +145,23 @@ impl Flushing {
             failures: Arc::new(AtomicU32::new(0)),
             bytes_threshold,
             duration_threshold,
-            staging_since: Arc::new(std::sync::Mutex::new(Instant::now())),
+            forgetter_since: Arc::new(std::sync::Mutex::new(Instant::now())),
         }
     }
 
     /// Whether enough has accumulated since the last flush to make one
     /// due now: `active_segment_len` crossing `bytes_threshold`, or
-    /// enough time having passed since `staging_since` regardless of
+    /// enough time having passed since `forgetter_since` regardless of
     /// `active_segment_len`.
     fn is_due(&self, active_segment_len: u64) -> bool {
         active_segment_len >= self.bytes_threshold
-            || self.staging_since.lock().unwrap().elapsed() >= self.duration_threshold
+            || self.forgetter_since.lock().unwrap().elapsed() >= self.duration_threshold
     }
 
     /// Restarts the clock `is_due` measures elapsed time against, for
     /// the segment that just became active.
-    fn reset_staging_since(&self) {
-        *self.staging_since.lock().unwrap() = Instant::now();
+    fn reset_forgetter_since(&self) {
+        *self.forgetter_since.lock().unwrap() = Instant::now();
     }
 
     /// Consecutive `flush_pending` failures so far.
@@ -230,7 +230,7 @@ impl Entry {
 pub struct Cas<'a> {
     db:         &'a slatedb::Db,
     blobs:      &'a Arc<dyn ObjectStore>,
-    staging:    &'a Arc<Staging>,
+    forgetter:  &'a Arc<Forgetter>,
     cas_prefix: &'a str,
     flushing:   &'a Flushing,
     chunking:   Chunking,
@@ -256,13 +256,13 @@ impl<'a> Cas<'a> {
     pub(crate) fn new(
         db: &'a slatedb::Db,
         blobs: &'a Arc<dyn ObjectStore>,
-        staging: &'a Arc<Staging>,
+        forgetter: &'a Arc<Forgetter>,
         cas_prefix: &'a str,
         flushing: &'a Flushing,
         chunking: Chunking,
         codec: Codec,
     ) -> Self {
-        Self { db, blobs, staging, cas_prefix, flushing, chunking, codec }
+        Self { db, blobs, forgetter, cas_prefix, flushing, chunking, codec }
     }
 
     fn entry_key(&self, key: Digest) -> Vec<u8> {
@@ -311,7 +311,7 @@ impl<'a> Cas<'a> {
 
     /// Whether `key` is already stored, without fetching its value.
     async fn contains_blob(&self, key: Digest) -> io::Result<bool> {
-        if self.staging.contains(key).await {
+        if self.forgetter.contains(key).await {
             return Ok(true);
         }
         Ok(self.db.get(self.entry_key(key)).await.map_err(other)?.is_some())
@@ -319,7 +319,7 @@ impl<'a> Cas<'a> {
 
     /// Fetch bytes stored under `key`, if present.
     async fn get_blob(&self, key: Digest) -> io::Result<Option<Bytes>> {
-        if let Some(bytes) = self.staging.get(key).await? {
+        if let Some(bytes) = self.forgetter.get(key).await? {
             return Ok(Some(bytes));
         }
         let Some(entry) = self.get_entry(key).await? else {
@@ -328,7 +328,7 @@ impl<'a> Cas<'a> {
         Ok(Some(self.get_range(entry.pack_id, entry.offset, entry.length).await?))
     }
 
-    /// Stages `bytes` under `key` durably in `staging`.
+    /// Stages `bytes` under `key` durably in `forgetter`.
     ///
     /// If enough has accumulated since the last flush, by size or by
     /// time (see `Flushing::is_due`), triggers `flush_pending` in the
@@ -337,9 +337,9 @@ impl<'a> Cas<'a> {
     /// failed `MAX_CONSECUTIVE_FLUSH_FAILURES` times in a row, switches
     /// to waiting on it and propagating its error instead, so a
     /// persistently broken flush path is surfaced to callers rather than
-    /// growing `staging` without bound.
+    /// growing `forgetter` without bound.
     async fn put_blob(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
-        let active_segment_len = self.staging.put(key, bytes).await?;
+        let active_segment_len = self.forgetter.put(key, bytes).await?;
 
         if !self.flushing.is_due(active_segment_len) {
             return Ok(());
@@ -356,12 +356,12 @@ impl<'a> Cas<'a> {
         // path: once it's failed this many times in a row, run it inline
         // and propagate its error instead of spawning another background
         // attempt, so a persistently broken flush surfaces to callers
-        // rather than growing `staging` unboundedly in silence.
+        // rather than growing `forgetter` unboundedly in silence.
         if self.flushing.failures() >= Self::MAX_CONSECUTIVE_FLUSH_FAILURES {
             return flush_pending(
                 self.db,
                 self.blobs,
-                self.staging,
+                self.forgetter,
                 self.cas_prefix,
                 self.flushing,
                 guard,
@@ -371,11 +371,11 @@ impl<'a> Cas<'a> {
 
         let db = self.db.clone();
         let blobs = Arc::clone(self.blobs);
-        let staging = Arc::clone(self.staging);
+        let forgetter = Arc::clone(self.forgetter);
         let cas_prefix = self.cas_prefix.to_string();
         let flushing = self.flushing.clone();
         tokio::spawn(async move {
-            let _ = flush_pending(&db, &blobs, &staging, &cas_prefix, &flushing, guard).await;
+            let _ = flush_pending(&db, &blobs, &forgetter, &cas_prefix, &flushing, guard).await;
         });
         Ok(())
     }
@@ -388,7 +388,7 @@ impl<'a> Cas<'a> {
         let Some(guard) = self.flushing.try_claim() else {
             return Ok(());
         };
-        flush_pending(self.db, self.blobs, self.staging, self.cas_prefix, self.flushing, guard)
+        flush_pending(self.db, self.blobs, self.forgetter, self.cas_prefix, self.flushing, guard)
             .await
     }
 
@@ -609,7 +609,7 @@ fn pack_path(cas_prefix: &str, pack_id: Digest) -> Path {
     Path::from(cas_prefix).join("sha256").join(format!("{pack_id:x}"))
 }
 
-/// Consolidates every currently-pending `staging` segment into pack
+/// Consolidates every currently-pending `forgetter` segment into pack
 /// objects, taking owned references so `put_blob`'s background trigger
 /// can run this after the `Cas<'_>` that requested it has gone out of
 /// scope.
@@ -620,22 +620,22 @@ fn pack_path(cas_prefix: &str, pack_id: Digest) -> Path {
 async fn flush_pending(
     db: &slatedb::Db,
     blobs: &Arc<dyn ObjectStore>,
-    staging: &Staging,
+    forgetter: &Forgetter,
     cas_prefix: &str,
     flushing: &Flushing,
     _guard: OwnedMutexGuard<()>,
 ) -> io::Result<()> {
-    let mut segments = staging.pending_segments();
-    if staging.active_segment_len() > 0 {
-        segments.push(staging.rotate().await?);
-        flushing.reset_staging_since();
+    let mut segments = forgetter.pending_segments();
+    if forgetter.active_segment_len() > 0 {
+        segments.push(forgetter.rotate().await?);
+        flushing.reset_forgetter_since();
     }
     if segments.is_empty() {
         flushing.record_success();
         return Ok(());
     }
 
-    let result = flush_segments(db, blobs, staging, cas_prefix, segments).await;
+    let result = flush_segments(db, blobs, forgetter, cas_prefix, segments).await;
     match &result {
         Ok(()) => flushing.record_success(),
         Err(_) => flushing.record_failure(),
@@ -646,19 +646,19 @@ async fn flush_pending(
 async fn flush_segments(
     db: &slatedb::Db,
     blobs: &Arc<dyn ObjectStore>,
-    staging: &Staging,
+    forgetter: &Forgetter,
     cas_prefix: &str,
-    segments: Vec<staging::FileId>,
+    segments: Vec<forgetter::FileId>,
 ) -> io::Result<()> {
     for segment in segments {
-        let (buf, records) = staging.segment_bytes(segment).await?;
+        let (buf, records) = forgetter.segment_bytes(segment).await?;
         if records.is_empty() {
-            staging.finish(segment).await?;
+            forgetter.forget(segment).await?;
             continue;
         }
 
-        // A pack object's bytes are exactly a staging segment's own
-        // sealed bytes; see `Staging::segment_bytes`. So `buf` is
+        // A pack object's bytes are exactly a forgetter segment's own
+        // sealed bytes; see `Forgetter::segment_bytes`. So `buf` is
         // uploaded as-is instead of being decoded and reassembled into
         // a fresh payload. Only `pack_id`, a hash of just the values and
         // not the `[key][len]` framing around them, still needs
@@ -686,7 +686,7 @@ async fn flush_segments(
         }
         db.write(batch).await.map_err(other)?;
 
-        staging.finish(segment).await?;
+        forgetter.forget(segment).await?;
     }
     Ok(())
 }

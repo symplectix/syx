@@ -63,11 +63,11 @@ async fn s3_graph(
     );
 
     let db_backend: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    // Leaked, not returned: `Staging` keeps writing into this directory
+    // Leaked, not returned: `Forgetter` keeps writing into this directory
     // for as long as `graph` lives, and these tests never outlive the
     // process, so there's nothing to clean up on drop that matters here.
-    let staging_dir = testing::tempdir().keep();
-    let graph = fabric::Graph::builder(staging_dir)
+    let forgetter_dir = testing::tempdir().keep();
+    let graph = fabric::Graph::builder(forgetter_dir)
         .db_prefix("test")
         .db_backend(db_backend)
         .blobs(remote.clone())

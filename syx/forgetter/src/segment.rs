@@ -71,10 +71,10 @@ impl Segment {
     }
 
     /// Opens the segment file at `path`, checking that it's really one
-    /// of `staging`'s own before treating it as one.
+    /// of `forgetter`'s own before treating it as one.
     ///
     /// Returns `None` for anything that isn't confidently one of
-    /// `staging`'s own segments.
+    /// `forgetter`'s own segments.
     ///
     /// Seals a `Some` result before returning it: once `MAGIC` is
     /// confirmed, this is a real segment, and this call's own view of
@@ -109,7 +109,7 @@ impl Segment {
         fs::OpenOptions::new().write(true).open(&path).await?.set_len(len).await?;
         Segment::open(&path).await?.ok_or_else(|| {
             io::Error::other(format!(
-                "staging: {path:?} lost its magic after truncating to {len} bytes"
+                "forgetter: {path:?} lost its magic after truncating to {len} bytes"
             ))
         })
     }
@@ -188,7 +188,7 @@ impl<T: RangeBounds<u64>> BytesIndex for T {
 }
 
 impl File {
-    /// Opens an existing segment file read-only, for one `Staging::open`
+    /// Opens an existing segment file read-only, for one `Forgetter::open`
     /// found already on disk left over from a previous run.
     async fn open(path: PathBuf) -> io::Result<Self> {
         task::spawn_blocking(move || std::fs::File::open(path).map(Arc::new).map(File))

@@ -33,7 +33,7 @@ mod file_id;
 mod segment;
 
 use committer::RECORD_HEADER_LEN;
-pub(crate) use file_id::FileId;
+pub use file_id::FileId;
 use segment::{
     BytesIndex,
     Segment,
@@ -45,9 +45,11 @@ mod tests;
 /// Where a record's value lives within a segment's bytes: `offset`/
 /// `length` point past the `[key][len]` header, at the value.
 #[derive(Clone, Copy)]
-pub(crate) struct Slot {
-    pub(crate) offset: u64,
-    pub(crate) length: u32,
+pub struct Slot {
+    /// Byte offset of the value, past the `[key][len]` header.
+    pub offset: u64,
+    /// Length of the value in bytes.
+    pub length: u32,
 }
 
 impl BytesIndex for Slot {
@@ -59,7 +61,7 @@ impl BytesIndex for Slot {
 /// A segment's records, keyed by digest for the O(1) lookup `get`/
 /// `contains` need. Order doesn't matter: each `Slot` is a self-
 /// contained byte range, independent of every other one.
-pub(crate) type Records = HashMap<Digest, Slot>;
+pub type Records = HashMap<Digest, Slot>;
 
 /// One entry of `pending`: a rotated-out segment together with every
 /// record it holds. Same shape as the committer's own `Active`, but
@@ -70,17 +72,18 @@ struct Pending {
     records: Records,
 }
 
-/// The staging area's public handle. `committer::spawn` runs the actual
-/// write path in its own task; `Staging` holds the same active/pending
-/// state through shared `Arc`s, so its own reads never see something
-/// the committer doesn't.
-pub(crate) struct Staging {
+/// A place to durably drop content and forget about it, until it's ready
+/// to be packed elsewhere. `committer::spawn` runs the actual write path
+/// in its own task; `Forgetter` holds the same active/pending state
+/// through shared `Arc`s, so its own reads never see something the
+/// committer doesn't.
+pub struct Forgetter {
     /// The directory segments live in.
     dir:         PathBuf,
     /// Observes and drives the running committer task; see `Handle`'s
     /// own doc.
     handle:      committer::Handle,
-    /// Rotated out, not yet `finish`ed; shared with the committer,
+    /// Rotated out, not yet forgotten; shared with the committer,
     /// which is the only thing that ever inserts into it.
     pending:     Arc<SkipMap<FileId, Pending>>,
     /// `put` refuses new writes once pending segments reach this many,
@@ -89,23 +92,19 @@ pub(crate) struct Staging {
     max_pending: u16,
 }
 
-impl Staging {
-    /// Opens the staging directory at `dir`, creating it if needed, and
-    /// replays whatever segments are already there.
+impl Forgetter {
+    /// Opens `dir`, creating it if needed, and replays whatever segments
+    /// are already there.
     ///
     /// `codec` decodes each replayed record to verify it against its
-    /// own key; it must match whatever `Cas` itself uses, since a
+    /// own key; it must match whatever the caller itself uses, since a
     /// value's digest is only meaningful once decoded back to its
     /// original content.
     ///
     /// `max_pending` is enforced from this point on, even if replay
     /// already found more pending segments than that: `put` refuses
     /// further writes until enough of the backlog clears.
-    pub(crate) async fn open(
-        dir: impl Into<PathBuf>,
-        codec: Codec,
-        max_pending: u16,
-    ) -> io::Result<Self> {
+    pub async fn open(dir: impl Into<PathBuf>, codec: Codec, max_pending: u16) -> io::Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir).await?;
 
@@ -161,11 +160,11 @@ impl Staging {
     /// Refuses the write if pending segments already number `max_pending`:
     /// at that point `flush_pending` isn't keeping up, and accepting more
     /// would grow local disk usage without bound.
-    pub(crate) async fn put(&self, key: Digest, value: Bytes) -> io::Result<u64> {
+    pub async fn put(&self, key: Digest, value: Bytes) -> io::Result<u64> {
         let pending_len = self.pending.len();
         if pending_len >= self.max_pending as usize {
             return Err(io::Error::other(format!(
-                "staging: {pending_len} segments already pending (max {})",
+                "forgetter: {pending_len} segments already pending (max {})",
                 self.max_pending
             )));
         }
@@ -174,7 +173,7 @@ impl Staging {
 
     /// Fetches the value staged under `key`, if any. Checks the active
     /// segment first, then every pending one.
-    pub(crate) async fn get(&self, key: Digest) -> io::Result<Option<Bytes>> {
+    pub async fn get(&self, key: Digest) -> io::Result<Option<Bytes>> {
         if let Some(bytes) = self.handle.get(key).await? {
             return Ok(Some(bytes));
         }
@@ -187,7 +186,7 @@ impl Staging {
     }
 
     /// Whether `key` is currently staged, without reading its value.
-    pub(crate) async fn contains(&self, key: Digest) -> bool {
+    pub async fn contains(&self, key: Digest) -> bool {
         if self.handle.contains(key).await {
             return true;
         }
@@ -196,30 +195,30 @@ impl Staging {
 
     /// How many bytes the active segment currently holds. `put` already
     /// returns this for its own caller; this is for querying it
-    /// independently of any particular write, e.g. `flush_pending`
-    /// checking whether the active segment has anything worth rotating.
-    pub(crate) fn active_segment_len(&self) -> u64 {
+    /// independently of any particular write, e.g. a caller checking
+    /// whether the active segment has anything worth rotating.
+    pub fn active_segment_len(&self) -> u64 {
         self.handle.active_segment_len()
     }
 
     /// Closes the active segment out as a new pending segment and starts
     /// a fresh one. Returns the segment that was just closed out, for
-    /// `entries`/`finish`.
-    pub(crate) async fn rotate(&self) -> io::Result<FileId> {
+    /// `entries`/`forget`.
+    pub async fn rotate(&self) -> io::Result<FileId> {
         self.handle.rotate().await
     }
 
-    /// Segments rotated out but not yet `finish`ed. Covers both a
+    /// Segments rotated out but not yet forgotten. Covers both a
     /// previous flush that failed partway and, after a restart, whatever
     /// `open` found already on disk.
-    pub(crate) fn pending_segments(&self) -> Vec<FileId> {
+    pub fn pending_segments(&self) -> Vec<FileId> {
         self.pending.iter().map(|entry| *entry.key()).collect()
     }
 
     /// The sealed segment's records, and every one's key, offset, and
     /// length within them. `id` must have come from `rotate` or
     /// `pending_segments`; it is never the active segment.
-    pub(crate) async fn segment_bytes(&self, id: FileId) -> io::Result<(Bytes, Records)> {
+    pub async fn segment_bytes(&self, id: FileId) -> io::Result<(Bytes, Records)> {
         let pending = self.find(id);
         let buf = pending.segment.bytes(..).await?;
         Ok((buf, pending.records))
@@ -233,7 +232,7 @@ impl Staging {
     /// Just removes `id` from `pending`: there's no second, flat index
     /// to keep in sync with it, so nothing else needs touching before
     /// the file itself comes off disk.
-    pub(crate) async fn finish(&self, id: FileId) -> io::Result<()> {
+    pub async fn forget(&self, id: FileId) -> io::Result<()> {
         self.pending.remove(&id);
         fs::remove_file(self.file_path(id)).await
     }
@@ -245,10 +244,11 @@ impl Staging {
     /// Every `(key, value)` pair in `id`'s segment. Each value is a
     /// zero-copy `Bytes` view into `segment_bytes`'s buffer.
     ///
-    /// Test-only: `flush_segments` uses `segment_bytes` directly instead,
-    /// since it needs the record offsets/lengths, not decoded values.
+    /// Test-only: a real caller doing `flush_segments`-style packing
+    /// uses `segment_bytes` directly instead, since it needs the record
+    /// offsets/lengths, not decoded values.
     #[cfg(test)]
-    pub(crate) async fn entries(&self, id: FileId) -> io::Result<Vec<(Digest, Bytes)>> {
+    async fn entries(&self, id: FileId) -> io::Result<Vec<(Digest, Bytes)>> {
         let (buf, records) = self.segment_bytes(id).await?;
         Ok(records
             .into_iter()
@@ -309,7 +309,7 @@ async fn revalidate_segment(
     verify: Option<Codec>,
 ) -> io::Result<Option<(Segment, Records)>> {
     let Some(segment) = Segment::open(path).await? else {
-        // Not confidently one of `staging`'s own; see `Segment::open`.
+        // Not confidently one of `forgetter`'s own; see `Segment::open`.
         // Left untouched, whatever it is.
         return Ok(None);
     };

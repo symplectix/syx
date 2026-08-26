@@ -7,7 +7,6 @@ use object_store::ObjectStore;
 mod blob;
 mod function;
 mod graph;
-mod staging;
 mod storage;
 
 pub use blob::{
@@ -38,15 +37,15 @@ pub use storage::Cas;
 /// leaving old ones untouched.
 #[derive(Clone)]
 pub struct Graph {
-    // Local durable staging for not-yet-packed content. The only thing
-    // `Graph` can't default: everything below can fall back to living
-    // under the same directory.
-    staging: Arc<staging::Staging>,
+    // Durably holds not-yet-packed content until it's forgotten (packed
+    // elsewhere). The only thing `Graph` can't default: everything below
+    // can fall back to living under the same directory.
+    forgetter: Arc<forgetter::Forgetter>,
 
     // `db`: the pointer/relation store.
     db: slatedb::Db,
 
-    // Packed blob object storage, and when to consolidate staged
+    // Packed blob object storage, and when to consolidate `forgetter`'s
     // content into it.
     blobs:    Arc<dyn ObjectStore>,
     flushing: storage::Flushing,

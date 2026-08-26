@@ -1,4 +1,4 @@
-//! A segment's identity: `{id:020}.log` in `Staging`'s directory.
+//! A segment's identity: `{id:020}.log` in `Forgetter`'s directory.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -25,8 +25,9 @@ pub(super) fn next() -> FileId {
     FileId(ID.fetch_add(1, Ordering::Relaxed))
 }
 
+/// A segment's identity, and the `{id:020}.log` name it's stored under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct FileId(u64);
+pub struct FileId(u64);
 
 impl fmt::Display for FileId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

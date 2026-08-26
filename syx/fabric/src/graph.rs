@@ -18,17 +18,17 @@ use crate::{
 /// Builds a `Graph`, opening the `slatedb::Db` it and its blob-storage
 /// parts share.
 ///
-/// `staging_dir` is the only thing that must be specified: a local
-/// directory `Graph` stages not-yet-packed blobs in. Everything else,
-/// including where `db`/`blobs` physically live, defaults to also
-/// living under `staging_dir` via a local `object_store`, so a `Graph`
+/// `forgetter_dir` is the only thing that must be specified: a local
+/// directory `Graph` durably holds not-yet-packed blobs in. Everything
+/// else, including where `db`/`blobs` physically live, defaults to also
+/// living under `forgetter_dir` via a local `object_store`, so a `Graph`
 /// works standalone with zero external setup; override `db_backend`/
 /// `blobs` to point at S3 (or any other `object_store` backend) instead.
 pub struct Builder {
-    // staging
-    staging_dir:          PathBuf,
-    max_staging_duration: Option<Duration>,
-    max_pending_segments: Option<u16>,
+    // forgetter
+    forgetter_dir:          PathBuf,
+    max_forgetter_duration: Option<Duration>,
+    max_pending_segments:   Option<u16>,
 
     // db
     db_prefix:  Option<String>,
@@ -45,10 +45,10 @@ pub struct Builder {
 }
 
 impl Builder {
-    fn new(staging_dir: impl Into<PathBuf>) -> Self {
+    fn new(forgetter_dir: impl Into<PathBuf>) -> Self {
         Self {
-            staging_dir: staging_dir.into(),
-            max_staging_duration: None,
+            forgetter_dir: forgetter_dir.into(),
+            max_forgetter_duration: None,
             max_pending_segments: None,
             db_prefix: None,
             db_backend: None,
@@ -63,15 +63,15 @@ impl Builder {
     /// How long to let a blob sit staged, unpacked, before consolidating
     /// regardless of `flush_threshold`. Bounds how long staged content
     /// stays invisible to every other reader of this `Graph`.
-    pub fn max_staging_duration(mut self, max_staging_duration: Duration) -> Self {
-        self.max_staging_duration = Some(max_staging_duration);
+    pub fn max_forgetter_duration(mut self, max_forgetter_duration: Duration) -> Self {
+        self.max_forgetter_duration = Some(max_forgetter_duration);
         self
     }
 
-    /// How many pending (rotated, not yet packed) segments `staging` lets
-    /// accumulate before refusing further writes. Bounds local disk usage
-    /// if `flush_pending` starts failing persistently, e.g. once this
-    /// node is fenced.
+    /// How many pending (rotated, not yet packed) segments `forgetter`
+    /// lets accumulate before refusing further writes. Bounds local disk
+    /// usage if `flush_pending` starts failing persistently, e.g. once
+    /// this node is fenced.
     pub fn max_pending_segments(mut self, max_pending_segments: u16) -> Self {
         self.max_pending_segments = Some(max_pending_segments);
         self
@@ -86,7 +86,7 @@ impl Builder {
     }
 
     /// Where `db` (the pointer/relation store) lives. Defaults to a
-    /// local `object_store` under `staging_dir` when not set.
+    /// local `object_store` under `forgetter_dir` when not set.
     pub fn db_backend(mut self, db_backend: Arc<dyn ObjectStore>) -> Self {
         self.db_backend = Some(db_backend);
         self
@@ -131,16 +131,16 @@ impl Builder {
         self
     }
 
-    /// Opens `db` and `staging`, and builds the `Graph`.
+    /// Opens `db` and `forgetter`, and builds the `Graph`.
     // TODO: `Graph`'s own relation storage will need its own merge
     // operator eventually, e.g. for growable reference sets, see
     // hypergraph.md. Nothing registers one on `db` today, since the blob
-    // storage engine no longer needs merge semantics now that staging
-    // lives in `staging`, not `db`.
+    // storage engine no longer needs merge semantics now that
+    // not-yet-packed content lives in `forgetter`, not `db`.
     pub async fn build(self) -> io::Result<Graph> {
         let Self {
-            staging_dir,
-            max_staging_duration,
+            forgetter_dir,
+            max_forgetter_duration,
             max_pending_segments,
             db_prefix,
             db_backend,
@@ -154,7 +154,7 @@ impl Builder {
         let db_backend = match db_backend {
             Some(backend) => backend,
             None => {
-                let dir = staging_dir.join("db");
+                let dir = forgetter_dir.join("db");
                 fs::create_dir_all(&dir).await?;
                 let local = LocalFileSystem::new_with_prefix(dir).map_err(io::Error::other)?;
                 Arc::new(local) as Arc<dyn ObjectStore>
@@ -170,41 +170,45 @@ impl Builder {
         let max_pending_segments =
             max_pending_segments.unwrap_or(storage::DEFAULT_MAX_PENDING_SEGMENTS);
         // Its own subdirectory, the same way `db_backend`'s default gets
-        // `staging_dir.join("db")` above: `Staging::open` lists every
+        // `forgetter_dir.join("db")` above: `Forgetter::open` lists every
         // entry in whatever directory it's given and treats matches as
         // its own segments, so it needs one nothing else ever writes
-        // into, not `staging_dir` itself (which `db`/`blobs` also live
+        // into, not `forgetter_dir` itself (which `db`/`blobs` also live
         // under by default).
-        let staging = Arc::new(
-            crate::staging::Staging::open(staging_dir.join("staging"), codec, max_pending_segments)
-                .await?,
+        let forgetter = Arc::new(
+            forgetter::Forgetter::open(
+                forgetter_dir.join("forgetter"),
+                codec,
+                max_pending_segments,
+            )
+            .await?,
         );
 
         let blobs = blobs_backend.unwrap_or_else(|| db_backend.clone());
         let flush_threshold = flush_threshold.unwrap_or(storage::DEFAULT_FLUSH_THRESHOLD);
-        let max_staging_duration =
-            max_staging_duration.unwrap_or(storage::DEFAULT_MAX_STAGING_DURATION);
+        let max_forgetter_duration =
+            max_forgetter_duration.unwrap_or(storage::DEFAULT_MAX_FORGETTER_DURATION);
         let chunking = chunking.unwrap_or_default();
         let cas_prefix: Arc<str> =
             Arc::from(cas_prefix.unwrap_or_else(|| storage::DEFAULT_CAS_PREFIX.to_string()));
 
-        let flushing = storage::Flushing::new(flush_threshold, max_staging_duration);
-        Ok(Graph::new(staging, db, blobs, flushing, cas_prefix, chunking, codec))
+        let flushing = storage::Flushing::new(flush_threshold, max_forgetter_duration);
+        Ok(Graph::new(forgetter, db, blobs, flushing, cas_prefix, chunking, codec))
     }
 }
 
 impl Graph {
     /// Starts building a `Graph`. See [`Builder`]'s own doc for what's
     /// required vs. defaulted.
-    pub fn builder(staging_dir: impl Into<PathBuf>) -> Builder {
-        Builder::new(staging_dir)
+    pub fn builder(forgetter_dir: impl Into<PathBuf>) -> Builder {
+        Builder::new(forgetter_dir)
     }
 
     /// Only `Builder::build` calls this. Construct a `Graph` via
     /// `Graph::builder` instead of opening `db`/building these parts
     /// yourself.
     const fn new(
-        staging: Arc<crate::staging::Staging>,
+        forgetter: Arc<forgetter::Forgetter>,
         db: slatedb::Db,
         blobs: Arc<dyn ObjectStore>,
         flushing: storage::Flushing,
@@ -212,7 +216,7 @@ impl Graph {
         chunking: cas::Chunking,
         codec: cas::Codec,
     ) -> Self {
-        Self { staging, db, blobs, flushing, cas_prefix, chunking, codec }
+        Self { forgetter, db, blobs, flushing, cas_prefix, chunking, codec }
     }
 
     /// The blob-storage facet of this `Graph`: `get`/`put`/`read_into`/
@@ -222,7 +226,7 @@ impl Graph {
         Cas::new(
             &self.db,
             &self.blobs,
-            &self.staging,
+            &self.forgetter,
             &self.cas_prefix,
             &self.flushing,
             self.chunking,

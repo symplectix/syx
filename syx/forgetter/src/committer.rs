@@ -37,10 +37,10 @@ use super::{
 
 /// A record's on-disk header: a 32-byte digest, then a big-endian u32
 /// value length. `commit` is what actually writes this layout; `parse`
-/// (in `staging`) just has to keep reading it the same way.
+/// (in `forgetter`) just has to keep reading it the same way.
 pub(super) const RECORD_HEADER_LEN: u64 = 32 + 4;
 
-/// What `spawn` hands back to `Staging`: everything it needs to observe
+/// What `spawn` hands back to `Forgetter`: everything it needs to observe
 /// and drive a running committer, without exposing the committer itself.
 pub(super) struct Handle {
     commands: mpsc::UnboundedSender<Command>,
@@ -83,7 +83,7 @@ impl Handle {
     }
 
     /// Fetches the value staged under `key` in the active segment, if
-    /// any. Knows nothing about `pending`; `Staging::get` walks that
+    /// any. Knows nothing about `pending`; `Forgetter::get` walks that
     /// itself once this comes back empty.
     pub(super) async fn get(&self, key: Digest) -> io::Result<Option<Bytes>> {
         let found = {
@@ -97,7 +97,7 @@ impl Handle {
     }
 
     /// Whether `key` is staged in the active segment. Knows nothing
-    /// about `pending`; `Staging::contains` checks that itself once
+    /// about `pending`; `Forgetter::contains` checks that itself once
     /// this is `false`.
     pub(super) async fn contains(&self, key: Digest) -> bool {
         self.active.read().await.records.contains_key(&key)
@@ -109,8 +109,8 @@ impl Handle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Put(Put { key, value, reply }))
-            .map_err(|_| io::Error::other("staging: committer task is gone"))?;
-        response.await.map_err(|_| io::Error::other("staging: committer task is gone"))?
+            .map_err(|_| io::Error::other("forgetter: committer task is gone"))?;
+        response.await.map_err(|_| io::Error::other("forgetter: committer task is gone"))?
     }
 
     /// Closes the active segment out as a new pending segment and starts
@@ -119,8 +119,8 @@ impl Handle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Rotate(Rotate { reply }))
-            .map_err(|_| io::Error::other("staging: committer task is gone"))?;
-        response.await.map_err(|_| io::Error::other("staging: committer task is gone"))?
+            .map_err(|_| io::Error::other("forgetter: committer task is gone"))?;
+        response.await.map_err(|_| io::Error::other("forgetter: committer task is gone"))?
     }
 
     /// A clone of the active segment right now. Exists for tests: lets
@@ -135,8 +135,8 @@ impl Handle {
 
 /// Builds a committer around a fresh active segment, wired to
 /// `pending`, spawns it in its own task, and returns the `Handle`
-/// `Staging` uses to observe and drive it. Kept separate from
-/// `Staging::open`'s own setup so a future multi-committer `Staging`
+/// `Forgetter` uses to observe and drive it. Kept separate from
+/// `Forgetter::open`'s own setup so a future multi-committer `Forgetter`
 /// could spin up several of these the same way, each with its own
 /// segment and channel.
 pub(super) async fn spawn(
@@ -211,7 +211,7 @@ impl Committer {
     const MAX_BATCH_SIZE: usize = 1024;
 
     /// Runs until the `Handle` holding the other end of `commands` is
-    /// dropped, and with it the `Staging` it backs.
+    /// dropped, and with it the `Forgetter` it backs.
     async fn run(mut self) {
         // A `Rotate` peeked while draining a batch.
         let mut carried: Option<Command> = None;
@@ -354,7 +354,7 @@ impl Committer {
     /// immediately so later commits don't inherit a stale segment.
     ///
     /// Re-derives, best-effort, what actually landed durably in the
-    /// old segment. This is the same recovery `Staging::open` runs at
+    /// old segment. This is the same recovery `Forgetter::open` runs at
     /// startup, and it publishes whatever of the old segment is valid.
     ///
     /// If that recovery itself fails, it's still on disk.

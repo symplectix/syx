@@ -31,24 +31,24 @@ fn local_fs() -> (testing::TempDir, Arc<dyn ObjectStore>) {
 
 /// Everything a test needs to drive a `Cas` against: a fresh in-memory
 /// `slatedb::Db`, packs written to `packs_backend`, and blobs staged in
-/// a `Staging` rooted at a fresh local `TempDir`. No test overrides
+/// a `Forgetter` rooted at a fresh local `TempDir`. No test overrides
 /// `cas_prefix`/chunking/encoding, so `cas()` just uses their defaults.
 struct Env {
-    _staging_dir: testing::TempDir,
-    db:           slatedb::Db,
-    blobs:        Arc<dyn ObjectStore>,
-    staging:      Arc<Staging>,
-    flushing:     Flushing,
+    _forgetter_dir: testing::TempDir,
+    db: slatedb::Db,
+    blobs: Arc<dyn ObjectStore>,
+    forgetter: Arc<Forgetter>,
+    flushing: Flushing,
 }
 
 impl Env {
     async fn with_threshold(blobs_backend: Arc<dyn ObjectStore>, threshold: u64) -> Self {
         let db = slatedb::Db::builder("test", in_memory()).build().await.unwrap();
-        let staging_dir = testing::tempdir();
-        let staging =
-            Arc::new(Staging::open(staging_dir.path(), Codec::new(), u16::MAX).await.unwrap());
+        let forgetter_dir = testing::tempdir();
+        let forgetter =
+            Arc::new(Forgetter::open(forgetter_dir.path(), Codec::new(), u16::MAX).await.unwrap());
         let flushing = Flushing::new(threshold, std::time::Duration::from_secs(3600));
-        Self { _staging_dir: staging_dir, db, blobs: blobs_backend, staging, flushing }
+        Self { _forgetter_dir: forgetter_dir, db, blobs: blobs_backend, forgetter, flushing }
     }
 
     async fn new(blobs_backend: Arc<dyn ObjectStore>) -> Self {
@@ -59,7 +59,7 @@ impl Env {
         Cas::new(
             &self.db,
             &self.blobs,
-            &self.staging,
+            &self.forgetter,
             DEFAULT_CAS_PREFIX,
             &self.flushing,
             Chunking::new(),
@@ -157,17 +157,17 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
 }
 
 #[tokio::test]
-async fn flush_pending_moves_a_staged_entry_out_of_staging_and_into_a_pack() {
+async fn flush_pending_moves_a_staged_entry_out_of_the_forgetter_and_into_a_pack() {
     let env = Env::with_threshold(in_memory(), 1024 * 1024).await;
     let cas = env.cas();
 
     let content = Bytes::from_static(b"0123456789");
     let d = cas.put(&content).await.unwrap();
-    assert!(env.staging.contains(d).await);
+    assert!(env.forgetter.contains(d).await);
     assert!(cas.get_entry(d).await.unwrap().is_none());
 
     cas.flush_pending().await.unwrap();
-    assert!(!env.staging.contains(d).await);
+    assert!(!env.forgetter.contains(d).await);
     assert!(cas.get_entry(d).await.unwrap().is_some());
 
     assert_eq!(cas.get::<Bytes>(&d).await.unwrap(), Some(content));
