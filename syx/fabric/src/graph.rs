@@ -179,7 +179,7 @@ impl Builder {
             forgetter::Forgetter::open(forgetter_dir.join("forgetter"), max_pending_segments)
                 .await?;
         let forgetter = Arc::new(forgetter);
-        let staged = Arc::new(storage::StagedIndex::rebuild(replayed, codec));
+        let staged = Arc::new(storage::KeyDir::rebuild(replayed, codec));
 
         let blobs = blobs_backend.unwrap_or_else(|| db_backend.clone());
         let flush_threshold = flush_threshold.unwrap_or(storage::DEFAULT_FLUSH_THRESHOLD);
@@ -207,7 +207,7 @@ impl Graph {
     #[allow(clippy::too_many_arguments)]
     const fn new(
         forgetter: Arc<forgetter::Forgetter>,
-        staged: Arc<storage::StagedIndex>,
+        staged: Arc<storage::KeyDir>,
         db: slatedb::Db,
         blobs: Arc<dyn ObjectStore>,
         flushing: storage::Flushing,

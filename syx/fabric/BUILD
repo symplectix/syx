@@ -18,6 +18,7 @@ rust.library(
         "@crates//:bytes",
         "@crates//:cbor2",
         "@crates//:crossbeam-skiplist",
+        "@crates//:dashmap",
         "@crates//:futures",
         "@crates//:object_store",
         "@crates//:serde",

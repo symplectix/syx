@@ -42,9 +42,9 @@ pub struct Graph {
     // can fall back to living under the same directory.
     forgetter: Arc<forgetter::Forgetter>,
     // Maps a blob's digest to where `forgetter` is holding it; see
-    // `storage::StagedIndex`'s own doc for why this lives here and not
+    // `storage::KeyDir`'s own doc for why this lives here and not
     // in `forgetter` itself.
-    staged:    Arc<storage::StagedIndex>,
+    staged:    Arc<storage::KeyDir>,
 
     // `db`: the pointer/relation store.
     db: slatedb::Db,

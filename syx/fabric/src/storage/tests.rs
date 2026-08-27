@@ -38,7 +38,7 @@ struct Env {
     db: slatedb::Db,
     blobs: Arc<dyn ObjectStore>,
     forgetter: Arc<Forgetter>,
-    staged: Arc<StagedIndex>,
+    staged: Arc<KeyDir>,
     flushing: Flushing,
 }
 
@@ -49,7 +49,7 @@ impl Env {
         let (forgetter, replayed) = Forgetter::open(forgetter_dir.path(), u16::MAX).await.unwrap();
         assert!(replayed.is_empty());
         let forgetter = Arc::new(forgetter);
-        let staged = Arc::new(StagedIndex::rebuild(replayed, Codec::new()));
+        let staged = Arc::new(KeyDir::rebuild(replayed, Codec::new()));
         let flushing = Flushing::new(threshold, std::time::Duration::from_secs(3600));
         Self {
             _forgetter_dir: forgetter_dir,

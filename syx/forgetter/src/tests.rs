@@ -14,9 +14,8 @@ async fn open(dir: impl AsRef<Path>) -> Forgetter {
     forgetter
 }
 
-/// Reads back what `locator` points at, straight from its own `segment`.
 async fn read(locator: &Locator) -> Bytes {
-    locator.segment.bytes(locator.slot).await.unwrap()
+    locator.bytes().await.unwrap()
 }
 
 #[tokio::test]
@@ -71,11 +70,11 @@ async fn find_reports_active_vs_pending_correctly() {
     let forgetter = open(dir.path()).await;
     let locator = forgetter.save(Bytes::from_static(b"hello")).await.unwrap();
 
-    assert!(matches!(forgetter.find(locator.file).await, Some(Found::Active(_))));
+    assert!(matches!(forgetter.find(locator.file()).await, Some(Found::Active(_))));
 
     forgetter.rotate().await.unwrap();
 
-    assert!(matches!(forgetter.find(locator.file).await, Some(Found::Pending(_))));
+    assert!(matches!(forgetter.find(locator.file()).await, Some(Found::Pending(_))));
 }
 
 #[tokio::test]
@@ -105,8 +104,8 @@ async fn reopening_finds_pending_segments_left_by_a_previous_instance() {
 
     assert_eq!(reopened.pending_segments(), vec![segment]);
     assert_eq!(replayed.len(), 1);
-    assert_eq!(replayed[0].0.file, locator.file);
-    assert_eq!(replayed[0].0.slot, locator.slot);
+    assert_eq!(replayed[0].0.file(), locator.file());
+    assert_eq!(replayed[0].0.slot(), locator.slot());
     assert_eq!(replayed[0].1, value);
 }
 

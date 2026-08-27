@@ -27,10 +27,8 @@ mod segment;
 
 use committer::RECORD_HEADER_LEN;
 pub use file_id::FileId;
-pub use segment::{
-    BytesIndex,
-    Segment,
-};
+use segment::BytesIndex;
+pub use segment::Segment;
 
 #[cfg(test)]
 mod tests;
@@ -52,18 +50,36 @@ impl BytesIndex for Slot {
 }
 
 /// Where a record physically lives: which segment, and where within it.
-/// Carries the `Segment` itself (a cheap, `Clone`-able handle), not just
-/// `file`, so a caller holding one can read straight from `segment`
-/// without a separate lookup back into `Forgetter` that could race
-/// against that same segment being forgotten in between.
+/// Carries the `Segment` itself (a cheap, `Clone`-able handle) internally,
+/// not just `file`, so `bytes` can read directly from it without a
+/// separate lookup back into `Forgetter` that could race against that
+/// same segment being forgotten in between. `file`/`segment`/`slot`
+/// stay private: a `Locator` only ever comes from `save` or `open`'s
+/// replay, never built by hand from mismatched parts.
 #[derive(Clone)]
 pub struct Locator {
+    file:    FileId,
+    segment: Segment,
+    slot:    Slot,
+}
+
+impl Locator {
     /// Which segment the record is in.
-    pub file:    FileId,
-    /// The segment itself, for reading `slot` directly.
-    pub segment: Segment,
+    pub fn file(&self) -> FileId {
+        self.file
+    }
+
     /// Where within that segment.
-    pub slot:    Slot,
+    pub fn slot(&self) -> Slot {
+        self.slot
+    }
+
+    /// Reads the bytes this locator points at, straight from its own
+    /// segment: no separate lookup back into `Forgetter` that could
+    /// race against that same segment being forgotten in between.
+    pub async fn bytes(&self) -> io::Result<Bytes> {
+        self.segment.bytes(self.slot).await
+    }
 }
 
 impl std::fmt::Debug for Locator {

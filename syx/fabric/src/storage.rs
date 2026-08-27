@@ -59,6 +59,7 @@ use content_addressing::{
     ToBytes,
 };
 use crossbeam_skiplist::SkipMap;
+use dashmap::DashMap;
 use futures::StreamExt as _;
 use futures::stream::{
     self,
@@ -90,14 +91,30 @@ use forgetter::{
 /// A digest's position among whatever `forgetter` currently holds, not
 /// yet packed. `forgetter` itself is content-agnostic (see its own
 /// module doc), so this crate is the one place that maps a blob's own
-/// digest to where `forgetter` put it.
-pub(crate) struct StagedIndex {
-    by_digest: SkipMap<Digest, forgetter::Locator>,
+/// digest to where `forgetter` put it. Named after Bitcask's own
+/// in-memory index of the same role.
+///
+/// Grouped by segment rather than a flat digest map: `entries_in`/
+/// `forget` (packing) need exactly that grouping, and `get`/`contains`
+/// (point lookups) can afford to check every segment's own small map in
+/// turn, since there are at most `max_pending + 1` of them at once (see
+/// `Forgetter::save`'s own backpressure) rather than scanning every
+/// staged digest across all of them.
+///
+/// Each segment's own map is a `DashMap`, not another `SkipMap`: writes
+/// to it concentrate entirely on whichever one segment is currently
+/// active, so it's shared-locked hash sharding, not an ordered skip
+/// list, that actually matches this access pattern -- nothing here ever
+/// needed the ordering, and `by_file` itself (rarely mutated, only on
+/// rotation/forget) is where a lock-free skip list actually earns its
+/// keep.
+pub(crate) struct KeyDir {
+    by_file: SkipMap<forgetter::FileId, DashMap<Digest, forgetter::Locator>>,
 }
 
-impl StagedIndex {
+impl KeyDir {
     fn new() -> Self {
-        Self { by_digest: SkipMap::new() }
+        Self { by_file: SkipMap::new() }
     }
 
     /// Rebuilds the index from whatever `Forgetter::open` recovered on
@@ -117,44 +134,35 @@ impl StagedIndex {
             if Hasher::new().part(&decoded).digest() != key {
                 continue;
             }
-            index.by_digest.insert(key, locator);
+            index.insert(key, locator);
         }
         index
     }
 
     fn insert(&self, key: Digest, locator: forgetter::Locator) {
-        self.by_digest.insert(key, locator);
+        self.by_file.get_or_insert_with(locator.file(), DashMap::new).value().insert(key, locator);
     }
 
     fn get(&self, key: Digest) -> Option<forgetter::Locator> {
-        self.by_digest.get(&key).map(|entry| entry.value().clone())
+        self.by_file.iter().find_map(|entry| entry.value().get(&key).map(|r| r.value().clone()))
     }
 
     fn contains(&self, key: Digest) -> bool {
-        self.by_digest.get(&key).is_some()
+        self.by_file.iter().any(|entry| entry.value().contains_key(&key))
     }
 
     /// Every `(digest, slot)` staged in segment `file`, for packing.
     fn entries_in(&self, file: forgetter::FileId) -> Vec<(Digest, forgetter::Slot)> {
-        self.by_digest
-            .iter()
-            .filter(|entry| entry.value().file == file)
-            .map(|entry| (*entry.key(), entry.value().slot))
-            .collect()
+        match self.by_file.get(&file) {
+            Some(entry) => entry.value().iter().map(|r| (*r.key(), r.value().slot())).collect(),
+            None => Vec::new(),
+        }
     }
 
     /// Removes every entry belonging to segment `file`, once it's been
     /// packed and `forgetter.forget(file)` is about to be called.
     fn forget(&self, file: forgetter::FileId) {
-        let keys: Vec<Digest> = self
-            .by_digest
-            .iter()
-            .filter(|entry| entry.value().file == file)
-            .map(|entry| *entry.key())
-            .collect();
-        for key in keys {
-            self.by_digest.remove(&key);
-        }
+        self.by_file.remove(&file);
     }
 }
 
@@ -206,7 +214,7 @@ pub(crate) struct Flushing {
     /// When the active segment currently being staged into started.
     forgetter_since: Arc<std::sync::Mutex<Instant>>,
     /// Guards the gap between `forgetter.save` returning a `Locator` and
-    /// `put_blob` publishing it into `StagedIndex`. `put_blob` holds a
+    /// `put_blob` publishing it into `KeyDir`. `put_blob` holds a
     /// read lock across that gap; rotating the active segment out takes
     /// a write lock first, so it can never happen while a `save` that
     /// already landed in that segment hasn't been indexed yet. Reads
@@ -311,7 +319,7 @@ pub struct Cas<'a> {
     db:         &'a slatedb::Db,
     blobs:      &'a Arc<dyn ObjectStore>,
     forgetter:  &'a Arc<Forgetter>,
-    staged:     &'a Arc<StagedIndex>,
+    staged:     &'a Arc<KeyDir>,
     cas_prefix: &'a str,
     flushing:   &'a Flushing,
     chunking:   Chunking,
@@ -339,7 +347,7 @@ impl<'a> Cas<'a> {
         db: &'a slatedb::Db,
         blobs: &'a Arc<dyn ObjectStore>,
         forgetter: &'a Arc<Forgetter>,
-        staged: &'a Arc<StagedIndex>,
+        staged: &'a Arc<KeyDir>,
         cas_prefix: &'a str,
         flushing: &'a Flushing,
         chunking: Chunking,
@@ -402,11 +410,11 @@ impl<'a> Cas<'a> {
 
     /// Fetch bytes stored under `key`, if present.
     async fn get_blob(&self, key: Digest) -> io::Result<Option<Bytes>> {
-        // `Locator` carries its own `segment`, so this reads straight
-        // from it: no separate lookup back into `forgetter` that could
-        // race against that segment being forgotten out from under it.
+        // `Locator::bytes` reads straight from its own segment: no
+        // separate lookup back into `forgetter` that could race against
+        // that segment being forgotten out from under it.
         if let Some(locator) = self.staged.get(key) {
-            let combined = locator.segment.bytes(locator.slot).await?;
+            let combined = locator.bytes().await?;
             return Ok(Some(combined.slice(32..)));
         }
         let Some(entry) = self.get_entry(key).await? else {
@@ -730,7 +738,7 @@ async fn flush_pending(
     db: &slatedb::Db,
     blobs: &Arc<dyn ObjectStore>,
     forgetter: &Forgetter,
-    staged: &StagedIndex,
+    staged: &KeyDir,
     cas_prefix: &str,
     flushing: &Flushing,
     _guard: OwnedMutexGuard<()>,
@@ -765,7 +773,7 @@ async fn flush_segments(
     db: &slatedb::Db,
     blobs: &Arc<dyn ObjectStore>,
     forgetter: &Forgetter,
-    staged: &StagedIndex,
+    staged: &KeyDir,
     cas_prefix: &str,
     segments: Vec<forgetter::FileId>,
 ) -> io::Result<()> {
@@ -784,7 +792,7 @@ async fn flush_segments(
         // A pack object's bytes are exactly a forgetter segment's own
         // sealed bytes, uploaded as-is instead of being decoded and
         // reassembled into a fresh payload. Each slot points at a whole
-        // `key(32) || value` record (see `StagedIndex`); only `value`
+        // `key(32) || value` record (see `KeyDir`); only `value`
         // gets hashed into `pack_id`, and only `value`'s own range is
         // what `Entry` needs to point at later, so both skip the 32-byte
         // key at the front of each slot.
