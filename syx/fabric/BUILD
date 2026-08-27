@@ -17,6 +17,7 @@ rust.library(
         "//syx/forgetter",
         "@crates//:bytes",
         "@crates//:cbor2",
+        "@crates//:crossbeam-skiplist",
         "@crates//:futures",
         "@crates//:object_store",
         "@crates//:serde",

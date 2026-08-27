@@ -32,9 +32,10 @@ const MAGIC: &[u8] = b"SEGv1";
 const MAGIC_LEN: u64 = MAGIC.len() as u64;
 
 /// A segment's open file, whether it's the one currently being appended
-/// to or one already rotated out.
+/// to or one already rotated out. Reading works the same either way;
+/// only `forgetter`'s own committer ever writes to one.
 #[derive(Clone)]
-pub(super) struct Segment {
+pub struct Segment {
     /// This segment's open file. `mmap` itself, once sealing calls for
     /// it, maps this same file. While this is the active segment, it's
     /// also the one handle `Committer` appends through.
@@ -131,7 +132,7 @@ impl Segment {
     /// mapping `seal` established, if there is one. `index` is
     /// record-relative: 0 means the first byte past `MAGIC`, not the
     /// first byte of the file.
-    pub(super) async fn bytes(&self, index: impl BytesIndex) -> io::Result<Bytes> {
+    pub async fn bytes(&self, index: impl BytesIndex) -> io::Result<Bytes> {
         index.read_from(self).await
     }
 
@@ -158,7 +159,8 @@ impl Segment {
 /// Every index is record-relative; `read_from`'s own implementations are
 /// where `MAGIC_LEN` gets added back before actually touching the
 /// file, once and only here.
-pub(super) trait BytesIndex {
+pub trait BytesIndex {
+    /// Reads the bytes this index selects from `segment`.
     async fn read_from(&self, segment: &Segment) -> io::Result<Bytes>;
 }
 

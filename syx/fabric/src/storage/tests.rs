@@ -38,6 +38,7 @@ struct Env {
     db: slatedb::Db,
     blobs: Arc<dyn ObjectStore>,
     forgetter: Arc<Forgetter>,
+    staged: Arc<StagedIndex>,
     flushing: Flushing,
 }
 
@@ -45,10 +46,19 @@ impl Env {
     async fn with_threshold(blobs_backend: Arc<dyn ObjectStore>, threshold: u64) -> Self {
         let db = slatedb::Db::builder("test", in_memory()).build().await.unwrap();
         let forgetter_dir = testing::tempdir();
-        let forgetter =
-            Arc::new(Forgetter::open(forgetter_dir.path(), Codec::new(), u16::MAX).await.unwrap());
+        let (forgetter, replayed) = Forgetter::open(forgetter_dir.path(), u16::MAX).await.unwrap();
+        assert!(replayed.is_empty());
+        let forgetter = Arc::new(forgetter);
+        let staged = Arc::new(StagedIndex::rebuild(replayed, Codec::new()));
         let flushing = Flushing::new(threshold, std::time::Duration::from_secs(3600));
-        Self { _forgetter_dir: forgetter_dir, db, blobs: blobs_backend, forgetter, flushing }
+        Self {
+            _forgetter_dir: forgetter_dir,
+            db,
+            blobs: blobs_backend,
+            forgetter,
+            staged,
+            flushing,
+        }
     }
 
     async fn new(blobs_backend: Arc<dyn ObjectStore>) -> Self {
@@ -60,6 +70,7 @@ impl Env {
             &self.db,
             &self.blobs,
             &self.forgetter,
+            &self.staged,
             DEFAULT_CAS_PREFIX,
             &self.flushing,
             Chunking::new(),
@@ -163,11 +174,11 @@ async fn flush_pending_moves_a_staged_entry_out_of_the_forgetter_and_into_a_pack
 
     let content = Bytes::from_static(b"0123456789");
     let d = cas.put(&content).await.unwrap();
-    assert!(env.forgetter.contains(d).await);
+    assert!(env.staged.contains(d));
     assert!(cas.get_entry(d).await.unwrap().is_none());
 
     cas.flush_pending().await.unwrap();
-    assert!(!env.forgetter.contains(d).await);
+    assert!(!env.staged.contains(d));
     assert!(cas.get_entry(d).await.unwrap().is_some());
 
     assert_eq!(cas.get::<Bytes>(&d).await.unwrap(), Some(content));

@@ -41,6 +41,10 @@ pub struct Graph {
     // elsewhere). The only thing `Graph` can't default: everything below
     // can fall back to living under the same directory.
     forgetter: Arc<forgetter::Forgetter>,
+    // Maps a blob's digest to where `forgetter` is holding it; see
+    // `storage::StagedIndex`'s own doc for why this lives here and not
+    // in `forgetter` itself.
+    staged:    Arc<storage::StagedIndex>,
 
     // `db`: the pointer/relation store.
     db: slatedb::Db,

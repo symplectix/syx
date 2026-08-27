@@ -58,6 +58,7 @@ use content_addressing::{
     Hasher,
     ToBytes,
 };
+use crossbeam_skiplist::SkipMap;
 use futures::StreamExt as _;
 use futures::stream::{
     self,
@@ -85,6 +86,77 @@ use forgetter::{
     self,
     Forgetter,
 };
+
+/// A digest's position among whatever `forgetter` currently holds, not
+/// yet packed. `forgetter` itself is content-agnostic (see its own
+/// module doc), so this crate is the one place that maps a blob's own
+/// digest to where `forgetter` put it.
+pub(crate) struct StagedIndex {
+    by_digest: SkipMap<Digest, forgetter::Locator>,
+}
+
+impl StagedIndex {
+    fn new() -> Self {
+        Self { by_digest: SkipMap::new() }
+    }
+
+    /// Rebuilds the index from whatever `Forgetter::open` recovered on
+    /// disk. Each record is `key(32 bytes) || encoded value`, the same
+    /// shape `put_blob` writes; a record that doesn't decode and hash
+    /// back to its own key is dropped rather than indexed, the same
+    /// tail-corruption check `forgetter` itself used to do before this
+    /// became its caller's responsibility instead.
+    pub(crate) fn rebuild(replayed: Vec<(forgetter::Locator, Bytes)>, codec: Codec) -> Self {
+        let index = Self::new();
+        for (locator, combined) in replayed {
+            if combined.len() < 32 {
+                continue;
+            }
+            let key = Digest::new(combined[..32].try_into().unwrap());
+            let Ok((_, decoded)) = codec.decode(combined.slice(32..)) else { continue };
+            if Hasher::new().part(&decoded).digest() != key {
+                continue;
+            }
+            index.by_digest.insert(key, locator);
+        }
+        index
+    }
+
+    fn insert(&self, key: Digest, locator: forgetter::Locator) {
+        self.by_digest.insert(key, locator);
+    }
+
+    fn get(&self, key: Digest) -> Option<forgetter::Locator> {
+        self.by_digest.get(&key).map(|entry| entry.value().clone())
+    }
+
+    fn contains(&self, key: Digest) -> bool {
+        self.by_digest.get(&key).is_some()
+    }
+
+    /// Every `(digest, slot)` staged in segment `file`, for packing.
+    fn entries_in(&self, file: forgetter::FileId) -> Vec<(Digest, forgetter::Slot)> {
+        self.by_digest
+            .iter()
+            .filter(|entry| entry.value().file == file)
+            .map(|entry| (*entry.key(), entry.value().slot))
+            .collect()
+    }
+
+    /// Removes every entry belonging to segment `file`, once it's been
+    /// packed and `forgetter.forget(file)` is about to be called.
+    fn forget(&self, file: forgetter::FileId) {
+        let keys: Vec<Digest> = self
+            .by_digest
+            .iter()
+            .filter(|entry| entry.value().file == file)
+            .map(|entry| *entry.key())
+            .collect();
+        for key in keys {
+            self.by_digest.remove(&key);
+        }
+    }
+}
 
 fn invalid_data(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
@@ -133,6 +205,13 @@ pub(crate) struct Flushing {
     duration_threshold: Duration,
     /// When the active segment currently being staged into started.
     forgetter_since: Arc<std::sync::Mutex<Instant>>,
+    /// Guards the gap between `forgetter.save` returning a `Locator` and
+    /// `put_blob` publishing it into `StagedIndex`. `put_blob` holds a
+    /// read lock across that gap; rotating the active segment out takes
+    /// a write lock first, so it can never happen while a `save` that
+    /// already landed in that segment hasn't been indexed yet. Reads
+    /// never block each other, so this costs nothing on the common path.
+    rotate_barrier: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl Flushing {
@@ -146,6 +225,7 @@ impl Flushing {
             bytes_threshold,
             duration_threshold,
             forgetter_since: Arc::new(std::sync::Mutex::new(Instant::now())),
+            rotate_barrier: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -231,6 +311,7 @@ pub struct Cas<'a> {
     db:         &'a slatedb::Db,
     blobs:      &'a Arc<dyn ObjectStore>,
     forgetter:  &'a Arc<Forgetter>,
+    staged:     &'a Arc<StagedIndex>,
     cas_prefix: &'a str,
     flushing:   &'a Flushing,
     chunking:   Chunking,
@@ -253,16 +334,18 @@ impl<'a> Cas<'a> {
     const MAX_CONCURRENT_CHUNKS: usize = 8;
 
     /// Only `Graph::cas()` calls this.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         db: &'a slatedb::Db,
         blobs: &'a Arc<dyn ObjectStore>,
         forgetter: &'a Arc<Forgetter>,
+        staged: &'a Arc<StagedIndex>,
         cas_prefix: &'a str,
         flushing: &'a Flushing,
         chunking: Chunking,
         codec: Codec,
     ) -> Self {
-        Self { db, blobs, forgetter, cas_prefix, flushing, chunking, codec }
+        Self { db, blobs, forgetter, staged, cas_prefix, flushing, chunking, codec }
     }
 
     fn entry_key(&self, key: Digest) -> Vec<u8> {
@@ -311,7 +394,7 @@ impl<'a> Cas<'a> {
 
     /// Whether `key` is already stored, without fetching its value.
     async fn contains_blob(&self, key: Digest) -> io::Result<bool> {
-        if self.forgetter.contains(key).await {
+        if self.staged.contains(key) {
             return Ok(true);
         }
         Ok(self.db.get(self.entry_key(key)).await.map_err(other)?.is_some())
@@ -319,8 +402,12 @@ impl<'a> Cas<'a> {
 
     /// Fetch bytes stored under `key`, if present.
     async fn get_blob(&self, key: Digest) -> io::Result<Option<Bytes>> {
-        if let Some(bytes) = self.forgetter.get(key).await? {
-            return Ok(Some(bytes));
+        // `Locator` carries its own `segment`, so this reads straight
+        // from it: no separate lookup back into `forgetter` that could
+        // race against that segment being forgotten out from under it.
+        if let Some(locator) = self.staged.get(key) {
+            let combined = locator.segment.bytes(locator.slot).await?;
+            return Ok(Some(combined.slice(32..)));
         }
         let Some(entry) = self.get_entry(key).await? else {
             return Ok(None);
@@ -339,9 +426,20 @@ impl<'a> Cas<'a> {
     /// persistently broken flush path is surfaced to callers rather than
     /// growing `forgetter` without bound.
     async fn put_blob(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
-        let active_segment_len = self.forgetter.put(key, bytes).await?;
+        let mut combined = BytesMut::with_capacity(32 + bytes.len());
+        combined.extend_from_slice(key.as_ref());
+        combined.extend_from_slice(&bytes);
 
-        if !self.flushing.is_due(active_segment_len) {
+        // Held across `save`+`staged.insert` so a concurrent rotate
+        // (which takes a write lock on the same `RwLock`) can never see
+        // this segment as fully indexed while this record is still
+        // in flight; see `Flushing::rotate_barrier`'s own doc.
+        let _hold = self.flushing.rotate_barrier.read().await;
+        let locator = self.forgetter.save(combined.freeze()).await?;
+        self.staged.insert(key, locator);
+        drop(_hold);
+
+        if !self.flushing.is_due(self.forgetter.active_segment_len()) {
             return Ok(());
         }
 
@@ -362,6 +460,7 @@ impl<'a> Cas<'a> {
                 self.db,
                 self.blobs,
                 self.forgetter,
+                self.staged,
                 self.cas_prefix,
                 self.flushing,
                 guard,
@@ -372,10 +471,12 @@ impl<'a> Cas<'a> {
         let db = self.db.clone();
         let blobs = Arc::clone(self.blobs);
         let forgetter = Arc::clone(self.forgetter);
+        let staged = Arc::clone(self.staged);
         let cas_prefix = self.cas_prefix.to_string();
         let flushing = self.flushing.clone();
         tokio::spawn(async move {
-            let _ = flush_pending(&db, &blobs, &forgetter, &cas_prefix, &flushing, guard).await;
+            let _ = flush_pending(&db, &blobs, &forgetter, &staged, &cas_prefix, &flushing, guard)
+                .await;
         });
         Ok(())
     }
@@ -388,8 +489,16 @@ impl<'a> Cas<'a> {
         let Some(guard) = self.flushing.try_claim() else {
             return Ok(());
         };
-        flush_pending(self.db, self.blobs, self.forgetter, self.cas_prefix, self.flushing, guard)
-            .await
+        flush_pending(
+            self.db,
+            self.blobs,
+            self.forgetter,
+            self.staged,
+            self.cas_prefix,
+            self.flushing,
+            guard,
+        )
+        .await
     }
 
     /// Fetch and decode the blob stored under `digest`.
@@ -621,13 +730,22 @@ async fn flush_pending(
     db: &slatedb::Db,
     blobs: &Arc<dyn ObjectStore>,
     forgetter: &Forgetter,
+    staged: &StagedIndex,
     cas_prefix: &str,
     flushing: &Flushing,
     _guard: OwnedMutexGuard<()>,
 ) -> io::Result<()> {
     let mut segments = forgetter.pending_segments();
     if forgetter.active_segment_len() > 0 {
-        segments.push(forgetter.rotate().await?);
+        // Waits for every `put_blob` already holding a read lock (i.e.
+        // that already called `forgetter.save` and hasn't published the
+        // result into `staged` yet) to finish, so `staged` is guaranteed
+        // to know about everything in the segment being rotated out.
+        let rotated = {
+            let _hold = flushing.rotate_barrier.write().await;
+            forgetter.rotate().await?
+        };
+        segments.push(rotated);
         flushing.reset_forgetter_since();
     }
     if segments.is_empty() {
@@ -635,7 +753,7 @@ async fn flush_pending(
         return Ok(());
     }
 
-    let result = flush_segments(db, blobs, forgetter, cas_prefix, segments).await;
+    let result = flush_segments(db, blobs, forgetter, staged, cas_prefix, segments).await;
     match &result {
         Ok(()) => flushing.record_success(),
         Err(_) => flushing.record_failure(),
@@ -647,26 +765,33 @@ async fn flush_segments(
     db: &slatedb::Db,
     blobs: &Arc<dyn ObjectStore>,
     forgetter: &Forgetter,
+    staged: &StagedIndex,
     cas_prefix: &str,
     segments: Vec<forgetter::FileId>,
 ) -> io::Result<()> {
-    for segment in segments {
-        let (buf, records) = forgetter.segment_bytes(segment).await?;
+    for segment_id in segments {
+        let records = staged.entries_in(segment_id);
         if records.is_empty() {
-            forgetter.forget(segment).await?;
+            forgetter.forget(segment_id).await?;
             continue;
         }
 
+        let found = forgetter.find(segment_id).await.ok_or_else(|| {
+            io::Error::other(format!("forgetter: pending segment {segment_id} vanished"))
+        })?;
+        let buf = found.segment().bytes(..).await?;
+
         // A pack object's bytes are exactly a forgetter segment's own
-        // sealed bytes; see `Forgetter::segment_bytes`. So `buf` is
-        // uploaded as-is instead of being decoded and reassembled into
-        // a fresh payload. Only `pack_id`, a hash of just the values and
-        // not the `[key][len]` framing around them, still needs
-        // computing.
+        // sealed bytes, uploaded as-is instead of being decoded and
+        // reassembled into a fresh payload. Each slot points at a whole
+        // `key(32) || value` record (see `StagedIndex`); only `value`
+        // gets hashed into `pack_id`, and only `value`'s own range is
+        // what `Entry` needs to point at later, so both skip the 32-byte
+        // key at the front of each slot.
         let mut hasher = Hasher::new();
-        for slot in records.values() {
-            let value =
-                buf.slice(slot.offset as usize..(slot.offset + u64::from(slot.length)) as usize);
+        for (_, slot) in &records {
+            let value = buf
+                .slice(slot.offset as usize + 32..(slot.offset + u64::from(slot.length)) as usize);
             hasher.part(value.as_ref());
         }
         let pack_id = hasher.digest();
@@ -680,13 +805,15 @@ async fn flush_segments(
         blobs.put(&path, PutPayload::from_bytes(buf)).await.map_err(io::Error::from)?;
 
         let mut batch = slatedb::WriteBatch::new();
-        for (digest, slot) in records {
-            let entry = Entry { pack_id, offset: slot.offset, length: u64::from(slot.length) };
-            batch.put_bytes(Bytes::from(entry_key(cas_prefix, digest)), entry.encode());
+        for (digest, slot) in &records {
+            let entry =
+                Entry { pack_id, offset: slot.offset + 32, length: u64::from(slot.length) - 32 };
+            batch.put_bytes(Bytes::from(entry_key(cas_prefix, *digest)), entry.encode());
         }
         db.write(batch).await.map_err(other)?;
 
-        forgetter.forget(segment).await?;
+        staged.forget(segment_id);
+        forgetter.forget(segment_id).await?;
     }
     Ok(())
 }

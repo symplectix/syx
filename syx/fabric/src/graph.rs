@@ -175,14 +175,11 @@ impl Builder {
         // its own segments, so it needs one nothing else ever writes
         // into, not `forgetter_dir` itself (which `db`/`blobs` also live
         // under by default).
-        let forgetter = Arc::new(
-            forgetter::Forgetter::open(
-                forgetter_dir.join("forgetter"),
-                codec,
-                max_pending_segments,
-            )
-            .await?,
-        );
+        let (forgetter, replayed) =
+            forgetter::Forgetter::open(forgetter_dir.join("forgetter"), max_pending_segments)
+                .await?;
+        let forgetter = Arc::new(forgetter);
+        let staged = Arc::new(storage::StagedIndex::rebuild(replayed, codec));
 
         let blobs = blobs_backend.unwrap_or_else(|| db_backend.clone());
         let flush_threshold = flush_threshold.unwrap_or(storage::DEFAULT_FLUSH_THRESHOLD);
@@ -193,7 +190,7 @@ impl Builder {
             Arc::from(cas_prefix.unwrap_or_else(|| storage::DEFAULT_CAS_PREFIX.to_string()));
 
         let flushing = storage::Flushing::new(flush_threshold, max_forgetter_duration);
-        Ok(Graph::new(forgetter, db, blobs, flushing, cas_prefix, chunking, codec))
+        Ok(Graph::new(forgetter, staged, db, blobs, flushing, cas_prefix, chunking, codec))
     }
 }
 
@@ -207,8 +204,10 @@ impl Graph {
     /// Only `Builder::build` calls this. Construct a `Graph` via
     /// `Graph::builder` instead of opening `db`/building these parts
     /// yourself.
+    #[allow(clippy::too_many_arguments)]
     const fn new(
         forgetter: Arc<forgetter::Forgetter>,
+        staged: Arc<storage::StagedIndex>,
         db: slatedb::Db,
         blobs: Arc<dyn ObjectStore>,
         flushing: storage::Flushing,
@@ -216,7 +215,7 @@ impl Graph {
         chunking: cas::Chunking,
         codec: cas::Codec,
     ) -> Self {
-        Self { forgetter, db, blobs, flushing, cas_prefix, chunking, codec }
+        Self { forgetter, staged, db, blobs, flushing, cas_prefix, chunking, codec }
     }
 
     /// The blob-storage facet of this `Graph`: `get`/`put`/`read_into`/
@@ -227,6 +226,7 @@ impl Graph {
             &self.db,
             &self.blobs,
             &self.forgetter,
+            &self.staged,
             &self.cas_prefix,
             &self.flushing,
             self.chunking,

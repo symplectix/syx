@@ -14,10 +14,6 @@ use bytes::{
     Bytes,
     BytesMut,
 };
-use content_addressing::{
-    Codec,
-    Digest,
-};
 use crossbeam_skiplist::SkipMap;
 use tokio::sync::{
     RwLock,
@@ -27,48 +23,47 @@ use tokio::sync::{
 
 use super::{
     FileId,
-    Pending,
-    Records,
+    Locator,
     Segment,
     Slot,
     file_id,
     revalidate_segment,
 };
 
-/// A record's on-disk header: a 32-byte digest, then a big-endian u32
-/// value length. `commit` is what actually writes this layout; `parse`
-/// (in `forgetter`) just has to keep reading it the same way.
-pub(super) const RECORD_HEADER_LEN: u64 = 32 + 4;
+/// A record's on-disk header: a big-endian u32 value length. `commit` is
+/// what actually writes this layout; `parse` (in `forgetter`) just has
+/// to keep reading it the same way.
+pub(super) const RECORD_HEADER_LEN: u64 = 4;
 
 /// What `spawn` hands back to `Forgetter`: everything it needs to observe
 /// and drive a running committer, without exposing the committer itself.
 pub(super) struct Handle {
     commands: mpsc::UnboundedSender<Command>,
-    active: Arc<RwLock<Active>>,
+    active: Arc<RwLock<ActiveSegment>>,
     active_segment_len: Arc<AtomicU64>,
 }
 
-/// The active segment with every record committed to it so far.
-struct Active {
+/// The active segment right now: which `FileId` it is, and a handle to
+/// read from it. `Handle::segment_if_active` compares against `file` to
+/// tell `Forgetter::find` whether a lookup belongs here or in `pending`.
+struct ActiveSegment {
+    file:    FileId,
     segment: Segment,
-    records: Records,
 }
 
 /// A request handed to the committer task over its `commands` channel.
 /// Private: `Handle` is the only thing that ever sends one, and
 /// `Committer` the only thing that ever receives one.
 enum Command {
-    Put(Put),
+    Save(Save),
     Rotate(Rotate),
 }
 
-/// One `put` waiting on the committer.
-struct Put {
-    key:   Digest,
+/// One `save` waiting on the committer.
+struct Save {
     value: Bytes,
-    /// Replied with the active segment's length once this `put`'s bytes
-    /// have landed in it.
-    reply: oneshot::Sender<io::Result<u64>>,
+    /// Replied with this record's locator once its bytes have landed.
+    reply: oneshot::Sender<io::Result<Locator>>,
 }
 
 /// One `rotate` waiting on the committer.
@@ -82,33 +77,19 @@ impl Handle {
         self.active_segment_len.load(Ordering::Relaxed)
     }
 
-    /// Fetches the value staged under `key` in the active segment, if
-    /// any. Knows nothing about `pending`; `Forgetter::get` walks that
-    /// itself once this comes back empty.
-    pub(super) async fn get(&self, key: Digest) -> io::Result<Option<Bytes>> {
-        let found = {
-            let active = self.active.read().await;
-            active.records.get(&key).map(|slot| (active.segment.clone(), *slot))
-        };
-        match found {
-            Some((segment, slot)) => segment.bytes(slot).await.map(Some),
-            None => Ok(None),
-        }
+    /// The active segment, if `file` is currently it. `Forgetter::find`
+    /// falls back to `pending` when this is `None`.
+    pub(super) async fn segment_if_active(&self, file: FileId) -> Option<Segment> {
+        let active = self.active.read().await;
+        (active.file == file).then(|| active.segment.clone())
     }
 
-    /// Whether `key` is staged in the active segment. Knows nothing
-    /// about `pending`; `Forgetter::contains` checks that itself once
-    /// this is `false`.
-    pub(super) async fn contains(&self, key: Digest) -> bool {
-        self.active.read().await.records.contains_key(&key)
-    }
-
-    /// Durably appends `value` under `key` to the active segment, and
-    /// returns its length immediately after.
-    pub(super) async fn put(&self, key: Digest, value: Bytes) -> io::Result<u64> {
+    /// Durably appends `value` to the active segment, and returns where
+    /// it landed.
+    pub(super) async fn save(&self, value: Bytes) -> io::Result<Locator> {
         let (reply, response) = oneshot::channel();
         self.commands
-            .send(Command::Put(Put { key, value, reply }))
+            .send(Command::Save(Save { value, reply }))
             .map_err(|_| io::Error::other("forgetter: committer task is gone"))?;
         response.await.map_err(|_| io::Error::other("forgetter: committer task is gone"))?
     }
@@ -141,20 +122,18 @@ impl Handle {
 /// segment and channel.
 pub(super) async fn spawn(
     dir: PathBuf,
-    codec: Codec,
-    pending: Arc<SkipMap<FileId, Pending>>,
+    pending: Arc<SkipMap<FileId, Segment>>,
 ) -> io::Result<Handle> {
     let file_id = file_id::next();
     let segment = Segment::create(file_id::path(&dir, file_id)).await?;
 
     let active_segment_len = Arc::new(AtomicU64::new(0));
     let active =
-        Arc::new(RwLock::new(Active { segment: segment.clone(), records: Records::new() }));
+        Arc::new(RwLock::new(ActiveSegment { file: file_id, segment: segment.clone() }));
 
     let (tx, commands) = mpsc::unbounded_channel();
     let committer = Committer {
         dir,
-        codec,
         file_id,
         active: Arc::clone(&active),
         active_segment_len: Arc::clone(&active_segment_len),
@@ -167,13 +146,10 @@ pub(super) async fn spawn(
 }
 
 /// Owns the active segment's write side: the only thing that ever
-/// writes to a segment file. Many concurrent `put`s can share one
+/// writes to a segment file. Many concurrent `save`s can share one
 /// `write`+`sync_data` call instead of each paying for its own.
 struct Committer {
-    dir:   PathBuf,
-    /// Verifies a poisoned segment's recovered tail the same way `open`
-    /// verifies a crash-torn one; see `poison`.
-    codec: Codec,
+    dir: PathBuf,
 
     /// The active segment's id. `Segment` itself doesn't carry one; see
     /// `Segment`'s own doc for why. Tracked here alongside `segment`. A
@@ -181,31 +157,31 @@ struct Committer {
     /// incrementing this directly.
     file_id: FileId,
     /// The published view of the active segment, shared with `Handle`'s
-    /// `get`/`contains`; see `Active`'s own doc.
-    active: Arc<RwLock<Active>>,
+    /// `segment_if_active`; see `ActiveSegment`'s own doc.
+    active: Arc<RwLock<ActiveSegment>>,
     /// The active segment's current length, and the next unwritten
     /// offset within it.
     active_segment_len: Arc<AtomicU64>,
     /// The active segment. A private working copy: writes go through
-    /// this directly without taking `active`'s lock, so a `put`'s
-    /// `append`+`flush` never waits behind a `get`/`contains` reader.
+    /// this directly without taking `active`'s lock, so a `save`'s
+    /// `append`+`flush` never waits behind a concurrent `find`.
     segment: Segment,
 
-    /// Rotated out, not yet `finish`ed. Structurally can never contain
+    /// Rotated out, not yet forgotten. Structurally can never contain
     /// the active segment, so nothing removing from it needs to guard
     /// against accidentally sealing the one still being written to.
-    pending: Arc<SkipMap<FileId, Pending>>,
+    pending: Arc<SkipMap<FileId, Segment>>,
 
-    /// Where `Handle::put`/`rotate` send their requests.
+    /// Where `Handle::save`/`rotate` send their requests.
     commands: mpsc::UnboundedReceiver<Command>,
 }
 
 impl Committer {
-    /// Caps how many `Put`s the drain loop in `run` gathers into one
+    /// Caps how many `Save`s the drain loop in `run` gathers into one
     /// batch before forcing a `commit`, even if the channel still has
     /// more queued. The drain loop's `try_recv` calls are synchronous,
     /// with no `.await` between them; without this cap, a sustained
-    /// burst of concurrent `put`s could keep it going indefinitely,
+    /// burst of concurrent `save`s could keep it going indefinitely,
     /// never reaching an `.await` point to yield back to the executor.
     /// Large enough that ordinary bursts never come close to it.
     const MAX_BATCH_SIZE: usize = 1024;
@@ -215,12 +191,12 @@ impl Committer {
     async fn run(mut self) {
         // A `Rotate` peeked while draining a batch.
         let mut carried: Option<Command> = None;
-        // Reused across every `Put` batch, `commit` drains it empty
+        // Reused across every `Save` batch, `commit` drains it empty
         // (keeping its capacity) rather than consuming it.
-        let mut batch: Vec<Put> = Vec::new();
+        let mut batch: Vec<Save> = Vec::new();
         loop {
             // Each iteration handles exactly one `Command`: a `Rotate`
-            // runs by itself, a `Put` drains whatever else is already
+            // runs by itself, a `Save` drains whatever else is already
             // queued into one batch and commits all of it together,
             // shown below. `carried` is checked before the channel
             // every time, so a `Rotate` peeked ahead of its turn during
@@ -239,11 +215,11 @@ impl Committer {
                     let result = self.rotate().await;
                     let _ = msg.reply.send(result);
                 }
-                Command::Put(first) => {
+                Command::Save(first) => {
                     // `try_recv` only grabs what's already queued right
                     // now. There's no deliberate delay to let more
-                    // arrive, so the same burst of concurrent `put`s can
-                    // land in one commit or several depending on
+                    // arrive, so the same burst of concurrent `save`s
+                    // can land in one commit or several depending on
                     // scheduling. That's fine: under sustained load the
                     // next commit's own write keeps the queue filling
                     // while this one runs, so batches converge on their
@@ -251,7 +227,7 @@ impl Committer {
                     batch.push(first);
                     while batch.len() < Self::MAX_BATCH_SIZE {
                         match self.commands.try_recv() {
-                            Ok(Command::Put(msg)) => batch.push(msg),
+                            Ok(Command::Save(msg)) => batch.push(msg),
                             Ok(rotate @ Command::Rotate(_)) => {
                                 carried = Some(rotate);
                                 break;
@@ -268,8 +244,8 @@ impl Committer {
     /// Appends every record in `batch`, then syncs once with a single
     /// `flush` call, and publishes their locations and replies to every
     /// waiter. The cost of that one `flush` is shared across however
-    /// many `put`s happened to be ready when this batch was drained.
-    async fn commit(&mut self, batch: &mut Vec<Put>) {
+    /// many `save`s happened to be ready when this batch was drained.
+    async fn commit(&mut self, batch: &mut Vec<Save>) {
         let mut slots = Vec::with_capacity(batch.len());
         let mut offset = self.active_segment_len.load(Ordering::Relaxed);
         let mut written = Ok(());
@@ -278,7 +254,6 @@ impl Committer {
             offset += RECORD_HEADER_LEN + msg.value.len() as u64;
 
             let mut header = BytesMut::with_capacity(RECORD_HEADER_LEN as usize);
-            header.extend_from_slice(msg.key.as_ref());
             header.put_u32(msg.value.len() as u32);
             // Appended separately from `msg.value`, not concatenated into
             // one buffer first: `Bytes` is contiguous, so concatenating
@@ -307,18 +282,18 @@ impl Committer {
         match result {
             Ok(()) => {
                 self.active_segment_len.store(offset, Ordering::Relaxed);
-                // Replies go out after the lock is dropped: sending one
-                // doesn't touch `active` at all, so holding the lock
-                // across it would only make concurrent `get`/`contains`
-                // readers wait longer than the update itself needs.
-                {
-                    let mut active = self.active.write().await;
-                    for (msg, &slot) in batch.iter().zip(&slots) {
-                        active.records.insert(msg.key, slot);
-                    }
-                }
-                for msg in batch.drain(..) {
-                    let _ = msg.reply.send(Ok(offset));
+                // No lock to take here: unlike the active segment's
+                // identity (`ActiveSegment`, only touched on rotation),
+                // nothing else reads or writes per-record state that
+                // `commit` needs to publish. `Locator` carries `segment`
+                // itself, so a reply's recipient can read these bytes
+                // straight from it as soon as they're appended, with no
+                // separate lookup that could race against this segment
+                // eventually being forgotten.
+                for (msg, &slot) in batch.drain(..).zip(&slots) {
+                    let locator =
+                        Locator { file: self.file_id, segment: self.segment.clone(), slot };
+                    let _ = msg.reply.send(Ok(locator));
                 }
             }
             Err(e) => {
@@ -340,43 +315,50 @@ impl Committer {
     /// Seals the active segment into a new pending one and starts a
     /// fresh active segment. Correctly ordered against `commit` for
     /// free: both run inside the same single-consumer loop, so a
-    /// `Rotate` can never jump ahead of `Put`s that were sent first.
+    /// `Rotate` can never jump ahead of `Save`s that were sent first.
     async fn rotate(&mut self) -> io::Result<FileId> {
         let old_id = self.file_id;
         let old = self.start_fresh_segment().await?;
 
         let _ = old.segment.seal();
-        self.pending.insert(old_id, Pending { segment: old.segment, records: old.records });
+        self.pending.insert(old_id, old.segment);
         Ok(old_id)
     }
 
     /// Handles a `commit` that failed partway. Starts a fresh segment
     /// immediately so later commits don't inherit a stale segment.
     ///
-    /// Re-derives, best-effort, what actually landed durably in the
-    /// old segment. This is the same recovery `Forgetter::open` runs at
-    /// startup, and it publishes whatever of the old segment is valid.
+    /// Re-derives, best-effort, what actually landed durably in the old
+    /// segment, purely to keep the file itself trackable and eventually
+    /// forgettable; whatever records it holds are not reported anywhere
+    /// (the callers whose `save` landed in this batch already got an
+    /// `Err`, and this crate no longer tracks records by content, so
+    /// there's nothing for it to publish). Content addressing makes
+    /// this harmless: an `Err`'d caller retries with the same content
+    /// and lands a fresh, indexed copy elsewhere; these bytes just sit
+    /// as inert space in this segment until it's forgotten.
     ///
-    /// If that recovery itself fails, it's still on disk.
-    /// The next `open` will find and replay it like any other segment.
+    /// If recovery itself fails, the segment is still on disk. The next
+    /// `Forgetter::open` will find and replay it like any other segment.
     async fn poison(&mut self) -> io::Result<()> {
         let old_id = self.file_id;
-        // The replaced `Active` is discarded: whatever it believes it
-        // holds may not match what's actually durable, which is exactly
-        // what `revalidate_segment` below re-derives from disk instead.
+        // The replaced `ActiveSegment` is discarded: whatever it
+        // believes it holds may not match what's actually durable,
+        // which is exactly what `revalidate_segment` below re-derives
+        // from disk instead.
         let _ = self.start_fresh_segment().await?;
 
         let path = file_id::path(&self.dir, old_id);
-        if let Some((segment, records)) = revalidate_segment(&path, Some(self.codec)).await? {
-            self.pending.insert(old_id, Pending { segment, records });
+        if let Some((segment, _slots)) = revalidate_segment(&path).await? {
+            self.pending.insert(old_id, segment);
         }
         Ok(())
     }
 
-    /// Starts a brand new active segment, swapping it (and a fresh,
-    /// empty `Active`) in for both `self.segment` and the published
+    /// Starts a brand new active segment, swapping it (and a fresh
+    /// `ActiveSegment`) in for both `self.segment` and the published
     /// `active`.
-    async fn start_fresh_segment(&mut self) -> io::Result<Active> {
+    async fn start_fresh_segment(&mut self) -> io::Result<ActiveSegment> {
         let next = file_id::next();
         let segment = Segment::create(file_id::path(&self.dir, next)).await?;
 
@@ -384,33 +366,21 @@ impl Committer {
         self.file_id = next;
         self.segment = segment.clone();
 
-        let fresh = Active { segment, records: Records::new() };
+        let fresh = ActiveSegment { file: next, segment };
         Ok(std::mem::replace(&mut *self.active.write().await, fresh))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use content_addressing::{
-        ContentFlags,
-        Hasher,
-    };
-
     use super::*;
-
-    fn encode(payload: &[u8]) -> (Digest, Bytes) {
-        let key = Hasher::new().part(payload).digest();
-        let value = Codec::new().encode(ContentFlags::empty(), payload.to_vec());
-        (key, Bytes::from(value))
-    }
 
     #[tokio::test]
     async fn rotate_seals_a_mapping_a_segment_captured_before_it_can_see() {
         let dir = testing::tempdir();
         let pending = Arc::new(SkipMap::new());
-        let handle = spawn(dir.path().to_owned(), Codec::new(), pending).await.unwrap();
-        let (key, value) = encode(b"hello");
-        handle.put(key, value).await.unwrap();
+        let handle = spawn(dir.path().to_owned(), pending).await.unwrap();
+        handle.save(Bytes::from_static(b"hello")).await.unwrap();
 
         // Captured while the segment was still active: no mapping yet.
         let segment = handle.segment().await;

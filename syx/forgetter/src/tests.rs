@@ -1,57 +1,52 @@
 use std::path::Path;
 
-use content_addressing::ContentFlags;
 use tokio::io::AsyncWriteExt as _;
 
 use super::*;
 
-/// A `(key, value)` pair shaped like what a `Cas`-style caller would
-/// stage: `value` is `payload` run through `Codec::encode`, `key` is
-/// `payload`'s own pre-encode digest.
-fn encode(payload: &[u8]) -> (Digest, Bytes) {
-    let key = Hasher::new().part(payload).digest();
-    let value = Codec::new().encode(ContentFlags::empty(), payload.to_vec());
-    (key, Bytes::from(value))
-}
-
 /// `Forgetter::open` with a `max_pending` high enough that no test other
-/// than `put_refuses_once_max_pending_segments_are_stuck` needs to think
-/// about it.
+/// than `save_refuses_once_max_pending_segments_are_stuck` needs to
+/// think about it. Asserts replay found nothing, since every test opens
+/// a fresh `TempDir`.
 async fn open(dir: impl AsRef<Path>) -> Forgetter {
-    Forgetter::open(dir.as_ref(), Codec::new(), u16::MAX).await.unwrap()
+    let (forgetter, replayed) = Forgetter::open(dir.as_ref(), u16::MAX).await.unwrap();
+    assert!(replayed.is_empty());
+    forgetter
+}
+
+/// Reads back what `locator` points at, straight from its own `segment`.
+async fn read(locator: &Locator) -> Bytes {
+    locator.segment.bytes(locator.slot).await.unwrap()
 }
 
 #[tokio::test]
-async fn put_then_get_returns_the_same_bytes() {
+async fn save_then_find_returns_the_same_bytes() {
     let dir = testing::tempdir();
     let forgetter = open(dir.path()).await;
-    let (key, value) = encode(b"hello");
+    let value = Bytes::from_static(b"hello");
 
-    forgetter.put(key, value.clone()).await.unwrap();
+    let locator = forgetter.save(value.clone()).await.unwrap();
 
-    assert_eq!(forgetter.get(key).await.unwrap(), Some(value));
+    assert_eq!(read(&locator).await, value);
 }
 
 #[tokio::test]
-async fn contains_reflects_whether_a_key_is_staged() {
+async fn find_returns_none_for_an_unknown_file() {
     let dir = testing::tempdir();
     let forgetter = open(dir.path()).await;
-    let (key, value) = encode(b"hello");
 
-    assert!(!forgetter.contains(key).await);
-    forgetter.put(key, value).await.unwrap();
-    assert!(forgetter.contains(key).await);
+    assert!(forgetter.find(file_id::next()).await.is_none());
 }
 
 #[tokio::test]
 async fn active_segment_len_tracks_bytes_written_to_the_active_segment() {
     let dir = testing::tempdir();
     let forgetter = open(dir.path()).await;
-    let (key, value) = encode(b"hello");
+    let value = Bytes::from_static(b"hello");
     let expected = RECORD_HEADER_LEN + value.len() as u64;
 
     assert_eq!(forgetter.active_segment_len(), 0);
-    forgetter.put(key, value).await.unwrap();
+    forgetter.save(value).await.unwrap();
     assert_eq!(forgetter.active_segment_len(), expected);
 }
 
@@ -59,72 +54,69 @@ async fn active_segment_len_tracks_bytes_written_to_the_active_segment() {
 async fn rotate_moves_the_active_segment_into_pending_and_resets_active_segment_len() {
     let dir = testing::tempdir();
     let forgetter = open(dir.path()).await;
-    let (key, value) = encode(b"hello");
-    forgetter.put(key, value).await.unwrap();
+    let value = Bytes::from_static(b"hello");
+    let locator = forgetter.save(value.clone()).await.unwrap();
 
     let segment = forgetter.rotate().await.unwrap();
 
     assert_eq!(forgetter.active_segment_len(), 0);
     assert_eq!(forgetter.pending_segments(), vec![segment]);
-    assert!(forgetter.contains(key).await);
+    assert!(matches!(forgetter.find(segment).await, Some(Found::Pending(_))));
+    assert_eq!(read(&locator).await, value);
 }
 
 #[tokio::test]
-async fn entries_returns_everything_written_to_a_pending_segment() {
+async fn find_reports_active_vs_pending_correctly() {
     let dir = testing::tempdir();
     let forgetter = open(dir.path()).await;
-    let (key_a, value_a) = encode(b"a");
-    let (key_b, value_b) = encode(b"bb");
-    forgetter.put(key_a, value_a.clone()).await.unwrap();
-    forgetter.put(key_b, value_b.clone()).await.unwrap();
+    let locator = forgetter.save(Bytes::from_static(b"hello")).await.unwrap();
 
-    let segment = forgetter.rotate().await.unwrap();
+    assert!(matches!(forgetter.find(locator.file).await, Some(Found::Active(_))));
 
-    // Unordered: `entries` no longer promises write order now that
-    // `Pending::records` is keyed by digest, not a sequence.
-    let entries = forgetter.entries(segment).await.unwrap();
-    assert_eq!(entries.len(), 2);
-    assert!(entries.contains(&(key_a, value_a)));
-    assert!(entries.contains(&(key_b, value_b)));
+    forgetter.rotate().await.unwrap();
+
+    assert!(matches!(forgetter.find(locator.file).await, Some(Found::Pending(_))));
 }
 
 #[tokio::test]
-async fn forget_deletes_the_segment_and_evicts_its_entries() {
+async fn forget_deletes_the_segment() {
     let dir = testing::tempdir();
     let forgetter = open(dir.path()).await;
-    let (key, value) = encode(b"hello");
-    forgetter.put(key, value).await.unwrap();
+    forgetter.save(Bytes::from_static(b"hello")).await.unwrap();
     let segment = forgetter.rotate().await.unwrap();
 
     forgetter.forget(segment).await.unwrap();
 
     assert!(forgetter.pending_segments().is_empty());
-    assert!(!forgetter.contains(key).await);
+    assert!(forgetter.find(segment).await.is_none());
 }
 
 #[tokio::test]
 async fn reopening_finds_pending_segments_left_by_a_previous_instance() {
     let dir = testing::tempdir();
-    let (key, value) = encode(b"hello");
-    let segment = {
+    let value = Bytes::from_static(b"hello");
+    let (segment, locator) = {
         let forgetter = open(dir.path()).await;
-        forgetter.put(key, value.clone()).await.unwrap();
-        forgetter.rotate().await.unwrap()
+        let locator = forgetter.save(value.clone()).await.unwrap();
+        (forgetter.rotate().await.unwrap(), locator)
     };
 
-    let reopened = open(dir.path()).await;
+    let (reopened, replayed) = Forgetter::open(dir.path(), u16::MAX).await.unwrap();
 
     assert_eq!(reopened.pending_segments(), vec![segment]);
-    assert_eq!(reopened.get(key).await.unwrap(), Some(value));
+    assert_eq!(replayed.len(), 1);
+    assert_eq!(replayed[0].0.file, locator.file);
+    assert_eq!(replayed[0].0.slot, locator.slot);
+    assert_eq!(replayed[0].1, value);
 }
 
 #[tokio::test]
 async fn reopening_drops_a_torn_tail_record_and_keeps_the_valid_ones() {
     let dir = testing::tempdir();
-    let (key, value) = encode(b"hello");
+    let value = Bytes::from_static(b"hello");
     {
         let forgetter = open(dir.path()).await;
-        forgetter.put(key, value.clone()).await.unwrap();
+        forgetter.save(value.clone()).await.unwrap();
     }
 
     // Simulate a crash mid-write: append a record whose declared length
@@ -139,7 +131,6 @@ async fn reopening_drops_a_torn_tail_record_and_keeps_the_valid_ones() {
     };
     let valid_len = fs::metadata(&path).await.unwrap().len();
     let mut torn = Vec::new();
-    torn.extend_from_slice(Digest::new([0xaa; 32]).as_ref());
     torn.extend_from_slice(&100u32.to_be_bytes());
     torn.extend_from_slice(b"not enough bytes");
     // `sync_all` matters here: without it, the write isn't guaranteed
@@ -152,17 +143,18 @@ async fn reopening_drops_a_torn_tail_record_and_keeps_the_valid_ones() {
     drop(f);
     assert!(fs::metadata(&path).await.unwrap().len() > valid_len);
 
-    let reopened = open(dir.path()).await;
+    let (reopened, replayed) = Forgetter::open(dir.path(), u16::MAX).await.unwrap();
 
-    assert_eq!(reopened.get(key).await.unwrap(), Some(value));
+    assert_eq!(replayed.len(), 1);
+    assert_eq!(replayed[0].1, value);
     // The file on disk was truncated back to just the valid record.
     assert_eq!(fs::metadata(&path).await.unwrap().len(), valid_len);
 
     // Appends after reopening land right after the truncated point, not
     // after the torn bytes.
-    let (key2, value2) = encode(b"world");
-    reopened.put(key2, value2.clone()).await.unwrap();
-    assert_eq!(reopened.get(key2).await.unwrap(), Some(value2));
+    let value2 = Bytes::from_static(b"world");
+    let locator2 = reopened.save(value2.clone()).await.unwrap();
+    assert_eq!(read(&locator2).await, value2);
 }
 
 #[tokio::test]
@@ -197,26 +189,25 @@ async fn reopening_leaves_an_empty_foreign_file_untouched() {
 }
 
 #[tokio::test]
-async fn put_refuses_once_max_pending_segments_are_stuck() {
+async fn save_refuses_once_max_pending_segments_are_stuck() {
     let dir = testing::tempdir();
-    let forgetter = Forgetter::open(dir.path(), Codec::new(), 2).await.unwrap();
+    let (forgetter, _) = Forgetter::open(dir.path(), 2).await.unwrap();
 
     // Stage and rotate twice, reaching the cap without ever forgetting a
-    // segment, as if `flush_pending` were failing persistently.
+    // segment, as if a caller-side flush were failing persistently.
     for payload in [&b"a"[..], &b"b"[..]] {
-        let (key, value) = encode(payload);
-        forgetter.put(key, value).await.unwrap();
+        forgetter.save(Bytes::copy_from_slice(payload)).await.unwrap();
         forgetter.rotate().await.unwrap();
     }
     assert_eq!(forgetter.pending_segments().len(), 2);
 
-    let (key, value) = encode(b"c");
-    let err = forgetter.put(key, value.clone()).await.unwrap_err();
+    let value = Bytes::from_static(b"c");
+    let err = forgetter.save(value.clone()).await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::Other);
 
     // Forgetting one segment frees a slot for the next write.
     let oldest = forgetter.pending_segments()[0];
     forgetter.forget(oldest).await.unwrap();
-    forgetter.put(key, value.clone()).await.unwrap();
-    assert_eq!(forgetter.get(key).await.unwrap(), Some(value));
+    let locator = forgetter.save(value.clone()).await.unwrap();
+    assert_eq!(read(&locator).await, value);
 }
