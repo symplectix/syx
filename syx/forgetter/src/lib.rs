@@ -10,11 +10,9 @@
 //! records. Past that prefix, records are framed as:
 //! `[value_len: u32 BE][value]`.
 
+use std::collections::BTreeMap;
 use std::io;
-use std::path::{
-    Path,
-    PathBuf,
-};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -25,10 +23,12 @@ mod committer;
 mod file_id;
 mod segment;
 
-use committer::RECORD_HEADER_LEN;
 pub use file_id::FileId;
-use segment::BytesIndex;
 pub use segment::Segment;
+use segment::{
+    BytesIndex,
+    Slots,
+};
 
 #[cfg(test)]
 mod tests;
@@ -82,6 +82,29 @@ impl Locator {
     }
 }
 
+/// What `Forgetter::open` recovered from segments already on disk.
+/// Assembling a `Locator` needs nothing beyond what's already in each
+/// segment's own `(FileId, Segment, Slots)`, so this just chains all of
+/// them into one `Locator` sequence rather than building its own state
+/// machine to walk them one segment at a time.
+pub struct Replay(Box<dyn Iterator<Item = Locator> + Send>);
+
+impl Replay {
+    fn new(segments: BTreeMap<FileId, (Segment, Slots)>) -> Self {
+        Self(Box::new(segments.into_iter().flat_map(|(file, (segment, slots))| {
+            slots.map(move |slot| Locator { file, slot, segment: segment.clone() })
+        })))
+    }
+}
+
+impl Iterator for Replay {
+    type Item = Locator;
+
+    fn next(&mut self) -> Option<Locator> {
+        self.0.next()
+    }
+}
+
 impl std::fmt::Debug for Locator {
     // `segment` has no meaningful printable state of its own; `file`/
     // `slot` already identify a `Locator` uniquely.
@@ -99,14 +122,14 @@ pub enum Found {
     /// Still being appended to by the committer.
     Active(Segment),
     /// Sealed; rotated out into `pending`.
-    Pending(Segment),
+    Sealed(Segment),
 }
 
 impl Found {
     /// The segment either way, regardless of which variant this is.
     pub fn segment(&self) -> &Segment {
         match self {
-            Found::Active(segment) | Found::Pending(segment) => segment,
+            Found::Active(segment) | Found::Sealed(segment) => segment,
         }
     }
 }
@@ -145,13 +168,10 @@ impl Forgetter {
     /// further writes until enough of the backlog clears.
     ///
     /// The second return value is every record recovered from segments
-    /// already on disk, each alongside the exact bytes it was `save`d
-    /// with, for the caller to verify and index however it needs to.
-    /// This crate never verifies content itself; see the module doc.
-    pub async fn open(
-        dir: impl Into<PathBuf>,
-        max_pending: u16,
-    ) -> io::Result<(Self, Vec<(Locator, Bytes)>)> {
+    /// already on disk, for the caller to verify and index however it
+    /// needs to; `Locator::bytes` reads a record's own content back
+    /// (this crate never verifies content itself; see the module doc).
+    pub async fn open(dir: impl Into<PathBuf>, max_pending: u16) -> io::Result<(Self, Replay)> {
         let dir = dir.into();
         fs::create_dir_all(&dir).await?;
 
@@ -172,22 +192,18 @@ impl Forgetter {
         }
 
         let pending = Arc::new(SkipMap::new());
-        let mut replayed = Vec::new();
-        for &id in ids.iter() {
-            let path = file_id::path(&dir, id);
-            if let Some((segment, slots)) = revalidate_segment(&path).await? {
-                let buf = segment.bytes(..).await?;
-                replayed.extend(slots.into_iter().map(|slot| {
-                    let bytes = slot.read(&buf);
-                    (Locator { file: id, segment: segment.clone(), slot }, bytes)
-                }));
-                pending.insert(id, segment);
+        let mut segments = BTreeMap::new();
+        for &file in ids.iter() {
+            let path = file_id::path(&dir, file);
+            if let Some((segment, slots)) = Segment::open(&path).await? {
+                pending.insert(file, segment.clone());
+                segments.insert(file, (segment, slots));
             }
         }
 
         let handle = committer::spawn(dir.clone(), Arc::clone(&pending)).await?;
 
-        Ok((Self { dir, handle, pending, max_pending }, replayed))
+        Ok((Self { dir, handle, pending, max_pending }, Replay::new(segments)))
     }
 
     /// Durably appends `value` to the active segment. Once this
@@ -215,7 +231,7 @@ impl Forgetter {
         if let Some(segment) = self.handle.segment_if_active(id).await {
             return Some(Found::Active(segment));
         }
-        self.pending.get(&id).map(|entry| Found::Pending(entry.value().clone()))
+        self.pending.get(&id).map(|entry| Found::Sealed(entry.value().clone()))
     }
 
     /// How many bytes the active segment currently holds. `save`
@@ -264,65 +280,4 @@ impl Forgetter {
     fn file_path(&self, id: FileId) -> PathBuf {
         file_id::path(&self.dir, id)
     }
-}
-
-impl Slot {
-    fn read(&self, buf: &Bytes) -> Bytes {
-        buf.slice(self.offset as usize..(self.offset + u64::from(self.length)) as usize)
-    }
-}
-
-/// Parses records from `buf` in order, from the start, purely
-/// structurally: `[len: u32][value]` frames, with no interpretation of
-/// `value` at all. Returns every record's position, plus how many bytes
-/// from the start of `buf` are valid.
-///
-/// Stops at the first record whose declared length runs past the end of
-/// `buf`; everything from that point on is dropped, since a length that
-/// long can only mean the write that produced it never finished. This
-/// crate doesn't verify a record's content beyond that: a caller that
-/// wants to also detect bit-level corruption within an otherwise
-/// well-framed record does so itself, using `find`'s replay output.
-fn parse(buf: &Bytes) -> (u64, Vec<Slot>) {
-    let mut slots = Vec::new();
-    let mut offset = 0usize;
-    while offset as u64 + RECORD_HEADER_LEN <= buf.len() as u64 {
-        let length = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
-        let value_start = offset + 4;
-        let value_end = value_start + length as usize;
-        if value_end > buf.len() {
-            break;
-        }
-        slots.push(Slot { offset: value_start as u64, length });
-        offset = value_end;
-    }
-    (offset as u64, slots)
-}
-
-/// Re-reads the segment file at `path`, discarding any torn tail found
-/// past the last structurally complete record.
-///
-/// The returned `Segment` is sealed: both `Segment::open` and `truncate`
-/// seal before handing one back, so callers don't need to do it again.
-async fn revalidate_segment(path: &Path) -> io::Result<Option<(Segment, Vec<Slot>)>> {
-    let Some(segment) = Segment::open(path).await? else {
-        // Not confidently one of `forgetter`'s own; see `Segment::open`.
-        // Left untouched, whatever it is.
-        return Ok(None);
-    };
-
-    let buf = segment.bytes(..).await?;
-    let len = buf.len() as u64;
-    let (valid_len, slots) = parse(&buf);
-    let segment = if valid_len < len {
-        Segment::truncate(path.to_owned(), valid_len).await?
-    } else {
-        segment
-    };
-    if slots.is_empty() {
-        fs::remove_file(path).await?;
-        return Ok(None);
-    }
-
-    Ok(Some((segment, slots)))
 }

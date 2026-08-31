@@ -23,9 +23,12 @@ use tokio::{
     task,
 };
 
+use super::Slot;
+use super::committer::RECORD_HEADER_LEN;
+
 /// Every segment file starts with exactly these bytes.
-/// `Segment::open` uses this to tell a real segment apart from some
-/// other file that happens to match `FileId`'s naming.
+/// `open_raw` uses this to tell a real segment apart from some other
+/// file that happens to match `FileId`'s naming.
 const MAGIC: &[u8] = b"SEGv1";
 
 /// Where a segment's own records start, past `MAGIC`.
@@ -80,7 +83,7 @@ impl Segment {
     /// Seals a `Some` result before returning it: once `MAGIC` is
     /// confirmed, this is a real segment, and this call's own view of
     /// it never changes again.
-    pub(super) async fn open(path: &Path) -> io::Result<Option<Segment>> {
+    async fn open_raw(path: &Path) -> io::Result<Option<Segment>> {
         let segment = File::open(path.to_owned()).await.map(Segment::new)?;
         match segment.file.read_at(0, MAGIC_LEN as u32).await {
             Ok(prefix) if &prefix[..] == MAGIC => {
@@ -93,9 +96,40 @@ impl Segment {
         }
     }
 
+    /// Recovers the segment file at `path`: confirms it's really one of
+    /// `forgetter`'s own (`open_raw`), then reads its records
+    /// structurally and discards any torn tail found past the last
+    /// complete one. Deletes `path` entirely if nothing valid remains.
+    ///
+    /// Returns `None` for anything that isn't confidently one of
+    /// `forgetter`'s own segments, or that turned out to hold no valid
+    /// records at all.
+    pub(super) async fn open(path: &Path) -> io::Result<Option<(Segment, Slots)>> {
+        let Some(segment) = Self::open_raw(path).await? else {
+            // Not confidently one of `forgetter`'s own. Left untouched,
+            // whatever it is.
+            return Ok(None);
+        };
+
+        let buf = segment.bytes(..).await?;
+        let len = buf.len() as u64;
+        let (valid_len, slots) = parse(&buf);
+        let segment = if valid_len < len {
+            Self::truncate(path.to_owned(), valid_len).await?
+        } else {
+            segment
+        };
+        if slots.is_empty() {
+            fs::remove_file(path).await?;
+            return Ok(None);
+        }
+
+        Ok(Some((segment, slots)))
+    }
+
     /// Truncates the segment file at `path` to `len` bytes of records,
     /// discarding a torn tail found while revalidating it after a
-    /// crash, then reopens it through `open`.
+    /// crash, then reopens it through `open_raw`.
     ///
     /// `len` is record-relative: this adds `MAGIC_LEN` back before
     /// touching the file, so the caller never needs to know it exists.
@@ -105,10 +139,10 @@ impl Segment {
     /// always finds it, unless opening the truncated file failed in
     /// some other way, which is surfaced as an error rather than
     /// swallowed quietly.
-    pub(super) async fn truncate(path: PathBuf, len: u64) -> io::Result<Segment> {
+    async fn truncate(path: PathBuf, len: u64) -> io::Result<Segment> {
         let len = MAGIC_LEN + len;
         fs::OpenOptions::new().write(true).open(&path).await?.set_len(len).await?;
-        Segment::open(&path).await?.ok_or_else(|| {
+        Self::open_raw(&path).await?.ok_or_else(|| {
             io::Error::other(format!(
                 "forgetter: {path:?} lost its magic after truncating to {len} bytes"
             ))
@@ -152,6 +186,50 @@ impl Segment {
     pub(super) fn sealed(&self) -> bool {
         self.mmap.get().is_some()
     }
+}
+
+/// Every record position `parse` found in one segment's bytes, in order.
+pub(super) struct Slots(std::vec::IntoIter<Slot>);
+
+impl Slots {
+    fn is_empty(&self) -> bool {
+        self.0.len() == 0
+    }
+}
+
+impl Iterator for Slots {
+    type Item = Slot;
+
+    fn next(&mut self) -> Option<Slot> {
+        self.0.next()
+    }
+}
+
+/// Parses records from `buf` in order, from the start, purely
+/// structurally: `[len: u32][value]` frames, with no interpretation of
+/// `value` at all. Returns every record's position, plus how many bytes
+/// from the start of `buf` are valid.
+///
+/// Stops at the first record whose declared length runs past the end of
+/// `buf`; everything from that point on is dropped, since a length that
+/// long can only mean the write that produced it never finished. This
+/// crate doesn't verify a record's content beyond that: a caller that
+/// wants to also detect bit-level corruption within an otherwise
+/// well-framed record does so itself, using `find`'s replay output.
+fn parse(buf: &Bytes) -> (u64, Slots) {
+    let mut slots = Vec::new();
+    let mut offset = 0usize;
+    while offset as u64 + RECORD_HEADER_LEN <= buf.len() as u64 {
+        let length = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
+        let value_start = offset + 4;
+        let value_end = value_start + length as usize;
+        if value_end > buf.len() {
+            break;
+        }
+        slots.push(Slot { offset: value_start as u64, length });
+        offset = value_end;
+    }
+    (offset as u64, Slots(slots.into_iter()))
 }
 
 /// Something that can select a byte range within a `Segment`'s records.

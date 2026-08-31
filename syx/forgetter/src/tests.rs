@@ -3,14 +3,15 @@ use std::path::Path;
 use tokio::io::AsyncWriteExt as _;
 
 use super::*;
+use crate::committer::RECORD_HEADER_LEN;
 
 /// `Forgetter::open` with a `max_pending` high enough that no test other
 /// than `save_refuses_once_max_pending_segments_are_stuck` needs to
 /// think about it. Asserts replay found nothing, since every test opens
 /// a fresh `TempDir`.
 async fn open(dir: impl AsRef<Path>) -> Forgetter {
-    let (forgetter, replayed) = Forgetter::open(dir.as_ref(), u16::MAX).await.unwrap();
-    assert!(replayed.is_empty());
+    let (forgetter, mut replayed) = Forgetter::open(dir.as_ref(), u16::MAX).await.unwrap();
+    assert!(replayed.next().is_none());
     forgetter
 }
 
@@ -60,7 +61,7 @@ async fn rotate_moves_the_active_segment_into_pending_and_resets_active_segment_
 
     assert_eq!(forgetter.active_segment_len(), 0);
     assert_eq!(forgetter.pending_segments(), vec![segment]);
-    assert!(matches!(forgetter.find(segment).await, Some(Found::Pending(_))));
+    assert!(matches!(forgetter.find(segment).await, Some(Found::Sealed(_))));
     assert_eq!(read(&locator).await, value);
 }
 
@@ -74,7 +75,7 @@ async fn find_reports_active_vs_pending_correctly() {
 
     forgetter.rotate().await.unwrap();
 
-    assert!(matches!(forgetter.find(locator.file()).await, Some(Found::Pending(_))));
+    assert!(matches!(forgetter.find(locator.file()).await, Some(Found::Sealed(_))));
 }
 
 #[tokio::test]
@@ -100,13 +101,14 @@ async fn reopening_finds_pending_segments_left_by_a_previous_instance() {
         (forgetter.rotate().await.unwrap(), locator)
     };
 
-    let (reopened, replayed) = Forgetter::open(dir.path(), u16::MAX).await.unwrap();
+    let (reopened, mut replayed) = Forgetter::open(dir.path(), u16::MAX).await.unwrap();
 
     assert_eq!(reopened.pending_segments(), vec![segment]);
-    assert_eq!(replayed.len(), 1);
-    assert_eq!(replayed[0].0.file(), locator.file());
-    assert_eq!(replayed[0].0.slot(), locator.slot());
-    assert_eq!(replayed[0].1, value);
+    let first = replayed.next().unwrap();
+    assert!(replayed.next().is_none());
+    assert_eq!(first.file(), locator.file());
+    assert_eq!(first.slot(), locator.slot());
+    assert_eq!(read(&first).await, value);
 }
 
 #[tokio::test]
@@ -142,10 +144,10 @@ async fn reopening_drops_a_torn_tail_record_and_keeps_the_valid_ones() {
     drop(f);
     assert!(fs::metadata(&path).await.unwrap().len() > valid_len);
 
-    let (reopened, replayed) = Forgetter::open(dir.path(), u16::MAX).await.unwrap();
+    let (reopened, mut replayed) = Forgetter::open(dir.path(), u16::MAX).await.unwrap();
 
-    assert_eq!(replayed.len(), 1);
-    assert_eq!(replayed[0].1, value);
+    assert_eq!(read(&replayed.next().unwrap()).await, value);
+    assert!(replayed.next().is_none());
     // The file on disk was truncated back to just the valid record.
     assert_eq!(fs::metadata(&path).await.unwrap().len(), valid_len);
 

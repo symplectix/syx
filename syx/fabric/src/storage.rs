@@ -118,14 +118,13 @@ impl KeyDir {
     }
 
     /// Rebuilds the index from whatever `Forgetter::open` recovered on
-    /// disk. Each record is `key(32 bytes) || encoded value`, the same
-    /// shape `put_blob` writes; a record that doesn't decode and hash
-    /// back to its own key is dropped rather than indexed, the same
-    /// tail-corruption check `forgetter` itself used to do before this
-    /// became its caller's responsibility instead.
-    pub(crate) fn rebuild(replayed: Vec<(forgetter::Locator, Bytes)>, codec: Codec) -> Self {
+    /// disk, reading each one's own `key(32 bytes) || encoded value` back
+    /// via `Locator::bytes` (the same shape `put_blob` writes). A record
+    /// that doesn't decode and hash back to its own key is dropped.
+    pub(crate) async fn rebuild(replayed: forgetter::Replay, codec: Codec) -> Self {
         let index = Self::new();
-        for (locator, combined) in replayed {
+        for locator in replayed {
+            let Ok(combined) = locator.bytes().await else { continue };
             if combined.len() < 32 {
                 continue;
             }

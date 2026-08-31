@@ -27,7 +27,6 @@ use super::{
     Segment,
     Slot,
     file_id,
-    revalidate_segment,
 };
 
 /// A record's on-disk header: a big-endian u32 value length. `commit` is
@@ -344,12 +343,12 @@ impl Committer {
         let old_id = self.file_id;
         // The replaced `ActiveSegment` is discarded: whatever it
         // believes it holds may not match what's actually durable,
-        // which is exactly what `revalidate_segment` below re-derives
-        // from disk instead.
+        // which is exactly what `Segment::open` below re-derives from
+        // disk instead.
         let _ = self.start_fresh_segment().await?;
 
         let path = file_id::path(&self.dir, old_id);
-        if let Some((segment, _slots)) = revalidate_segment(&path).await? {
+        if let Some((segment, _slots)) = Segment::open(&path).await? {
             self.pending.insert(old_id, segment);
         }
         Ok(())

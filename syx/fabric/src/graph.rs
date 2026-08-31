@@ -179,7 +179,7 @@ impl Builder {
             forgetter::Forgetter::open(forgetter_dir.join("forgetter"), max_pending_segments)
                 .await?;
         let forgetter = Arc::new(forgetter);
-        let staged = Arc::new(storage::KeyDir::rebuild(replayed, codec));
+        let staged = Arc::new(storage::KeyDir::rebuild(replayed, codec).await);
 
         let blobs = blobs_backend.unwrap_or_else(|| db_backend.clone());
         let flush_threshold = flush_threshold.unwrap_or(storage::DEFAULT_FLUSH_THRESHOLD);
