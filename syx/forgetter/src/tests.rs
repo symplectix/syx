@@ -10,7 +10,8 @@ use crate::committer::RECORD_HEADER_LEN;
 /// think about it. Asserts replay found nothing, since every test opens
 /// a fresh `TempDir`.
 async fn open(dir: impl AsRef<Path>) -> Forgetter {
-    let (forgetter, mut replayed) = Forgetter::open(dir.as_ref(), u16::MAX).await.unwrap();
+    let (forgetter, mut replayed) =
+        Forgetter::open(dir.as_ref(), u16::MAX, u64::MAX, None).await.unwrap();
     assert!(replayed.next().is_none());
     forgetter
 }
@@ -66,6 +67,76 @@ async fn rotate_moves_the_active_segment_into_pending_and_resets_active_segment_
 }
 
 #[tokio::test]
+async fn rotate_notifies_rotated() {
+    let dir = testing::tempdir();
+    let forgetter = open(dir.path()).await;
+    let mut rotated = forgetter.rotated();
+    forgetter.save(Bytes::from_static(b"hello")).await.unwrap();
+
+    forgetter.rotate().await.unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_millis(200), rotated.changed())
+        .await
+        .expect("changed should resolve promptly")
+        .expect("rotated should still be open for an explicit rotate");
+}
+
+#[tokio::test]
+async fn dropping_forgetter_closes_rotated() {
+    let dir = testing::tempdir();
+    let forgetter = open(dir.path()).await;
+    let mut rotated = forgetter.rotated();
+
+    drop(forgetter);
+
+    tokio::time::timeout(std::time::Duration::from_millis(200), rotated.changed())
+        .await
+        .expect("changed should resolve promptly")
+        .expect_err("rotated should report closed once Forgetter is dropped");
+}
+
+#[tokio::test]
+async fn save_rotates_the_active_segment_on_its_own_once_rotate_threshold_is_crossed() {
+    let dir = testing::tempdir();
+    let value = Bytes::from_static(b"hello");
+    let threshold = RECORD_HEADER_LEN + value.len() as u64;
+    let (forgetter, _) = Forgetter::open(dir.path(), u16::MAX, threshold, None).await.unwrap();
+    let mut rotated = forgetter.rotated();
+
+    let locator = forgetter.save(value.clone()).await.unwrap();
+
+    assert_eq!(forgetter.active_segment_len(), 0);
+    assert_eq!(forgetter.pending_segments(), vec![locator.file()]);
+    assert!(matches!(forgetter.find(locator.file()).await, Some(Found::Sealed(_))));
+    assert_eq!(read(&locator).await, value);
+    tokio::time::timeout(std::time::Duration::from_millis(200), rotated.changed())
+        .await
+        .expect("changed should resolve promptly")
+        .expect("rotated should still be open for a size-triggered rotation");
+}
+
+#[tokio::test]
+async fn save_rotates_the_active_segment_on_its_own_once_rotate_after_elapses() {
+    let dir = testing::tempdir();
+    let value = Bytes::from_static(b"hello");
+    let (forgetter, _) =
+        Forgetter::open(dir.path(), u16::MAX, u64::MAX, Some(std::time::Duration::from_millis(20)))
+            .await
+            .unwrap();
+    let locator = forgetter.save(value.clone()).await.unwrap();
+    assert!(matches!(forgetter.find(locator.file()).await, Some(Found::Active(_))));
+
+    // No mocked time available (tokio's `test-util` isn't enabled for
+    // this crate), so this waits on the real clock; `rotate_after` is
+    // kept short and this margin generous to avoid flakiness.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert_eq!(forgetter.pending_segments(), vec![locator.file()]);
+    assert!(matches!(forgetter.find(locator.file()).await, Some(Found::Sealed(_))));
+    assert_eq!(read(&locator).await, value);
+}
+
+#[tokio::test]
 async fn find_reports_active_vs_pending_correctly() {
     let dir = testing::tempdir();
     let forgetter = open(dir.path()).await;
@@ -101,7 +172,8 @@ async fn reopening_finds_pending_segments_left_by_a_previous_instance() {
         (forgetter.rotate().await.unwrap(), locator)
     };
 
-    let (reopened, mut replayed) = Forgetter::open(dir.path(), u16::MAX).await.unwrap();
+    let (reopened, mut replayed) =
+        Forgetter::open(dir.path(), u16::MAX, u64::MAX, None).await.unwrap();
 
     assert_eq!(reopened.pending_segments(), vec![segment]);
     let first = replayed.next().unwrap();
@@ -144,7 +216,8 @@ async fn reopening_drops_a_torn_tail_record_and_keeps_the_valid_ones() {
     drop(f);
     assert!(fs::metadata(&path).await.unwrap().len() > valid_len);
 
-    let (reopened, mut replayed) = Forgetter::open(dir.path(), u16::MAX).await.unwrap();
+    let (reopened, mut replayed) =
+        Forgetter::open(dir.path(), u16::MAX, u64::MAX, None).await.unwrap();
 
     assert_eq!(read(&replayed.next().unwrap()).await, value);
     assert!(replayed.next().is_none());
@@ -192,7 +265,7 @@ async fn reopening_leaves_an_empty_foreign_file_untouched() {
 #[tokio::test]
 async fn save_refuses_once_max_pending_segments_are_stuck() {
     let dir = testing::tempdir();
-    let (forgetter, _) = Forgetter::open(dir.path(), 2).await.unwrap();
+    let (forgetter, _) = Forgetter::open(dir.path(), 2, u64::MAX, None).await.unwrap();
 
     // Stage and rotate twice, reaching the cap without ever forgetting a
     // segment, as if a caller-side flush were failing persistently.

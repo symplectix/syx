@@ -170,6 +170,18 @@ impl Segment {
         index.read_from(self).await
     }
 
+    /// Every record position in this sealed segment, parsed directly
+    /// from its own bytes the same way replay does, independent of
+    /// whatever index a caller keeps on the side. Errors for a
+    /// still-active segment.
+    pub async fn slots(&self) -> io::Result<impl Iterator<Item = Slot> + Send> {
+        if !self.sealed() {
+            return Err(io::Error::other("forgetter: slots() called on a still-active segment"));
+        }
+        let buf = self.bytes(..).await?;
+        Ok(parse(&buf).1)
+    }
+
     /// Establishes this segment's whole-file mapping, for a segment
     /// that's about to become pending or already is.
     ///
@@ -414,5 +426,14 @@ mod tests {
         // proves it's a shared cell, not a fresh mapping each clone
         // would have to establish for itself.
         assert!(clone.sealed());
+    }
+
+    #[tokio::test]
+    async fn slots_errors_on_a_still_active_segment() {
+        let dir = testing::tempdir();
+        let segment = Segment::create(dir.path().join("0.log")).await.unwrap();
+
+        assert!(!segment.sealed());
+        assert!(segment.slots().await.is_err());
     }
 }

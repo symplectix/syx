@@ -47,11 +47,11 @@ impl Env {
         let db = slatedb::Db::builder("test", in_memory()).build().await.unwrap();
         let forgetter_dir = testing::tempdir();
         let (forgetter, mut replayed) =
-            Forgetter::open(forgetter_dir.path(), u16::MAX).await.unwrap();
+            Forgetter::open(forgetter_dir.path(), u16::MAX, threshold, None).await.unwrap();
         assert!(replayed.next().is_none());
         let forgetter = Arc::new(forgetter);
         let staged = Arc::new(KeyDir::rebuild(replayed, Codec::new()).await);
-        let flushing = Flushing::new(threshold, std::time::Duration::from_secs(3600));
+        let flushing = Flushing::new();
         Self {
             _forgetter_dir: forgetter_dir,
             db,
@@ -97,6 +97,16 @@ fn encode(flags: ContentFlags, raw: Vec<u8>) -> Vec<u8> {
     Codec::new().encode(flags, raw)
 }
 
+/// Forces `forgetter`'s active segment out, then packs everything
+/// currently pending. `Cas::flush_pending` deliberately doesn't rotate
+/// the active segment itself, so tests that want a deterministic
+/// "everything staged so far is now packed" use this instead of calling
+/// `flush_pending` alone.
+async fn flush(cas: Cas<'_>) {
+    let _ = cas.forgetter.rotate().await;
+    cas.flush_pending().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_single_chunks_digest_is_the_content_digest_not_a_wrapped_one() {
     // This is what makes a small standalone blob dedup against the
@@ -136,16 +146,16 @@ async fn identical_chunks_across_different_blobs_are_stored_once() {
     // How many keys after putting `blob` and flushing it into packs.
     async fn count_keys(cas: Cas<'_>, blob: Bytes) -> usize {
         cas.put(&blob).await.unwrap();
-        cas.flush_pending().await.unwrap();
+        flush(cas).await;
         cas.entry_count().await.unwrap()
     }
 
     async fn check(cas: Cas<'_>, blob_a: &Bytes, blob_b: &Bytes, baseline: usize) {
         cas.put(blob_a).await.unwrap();
-        cas.flush_pending().await.unwrap();
+        flush(cas).await;
         let count_before = cas.entry_count().await.unwrap();
         cas.put(blob_b).await.unwrap();
-        cas.flush_pending().await.unwrap();
+        flush(cas).await;
         let count_after = cas.entry_count().await.unwrap();
 
         let new_keys = count_after - count_before;
@@ -178,7 +188,7 @@ async fn flush_pending_moves_a_staged_entry_out_of_the_forgetter_and_into_a_pack
     assert!(env.staged.contains(d));
     assert!(cas.get_entry(d).await.unwrap().is_none());
 
-    cas.flush_pending().await.unwrap();
+    flush(cas).await;
     assert!(!env.staged.contains(d));
     assert!(cas.get_entry(d).await.unwrap().is_some());
 
@@ -189,13 +199,13 @@ async fn flush_pending_moves_a_staged_entry_out_of_the_forgetter_and_into_a_pack
 async fn get_returns_invalid_data_for_tampered_content() {
     async fn check(cas: Cas<'_>) {
         let d = cas.put(&Bytes::from_static(b"hello")).await.unwrap();
-        cas.flush_pending().await.unwrap();
+        flush(cas).await;
 
         // Overwrite the stored bytes with content that doesn't hash
         // back to `d`, simulating corruption.
         let tampered = encode(ContentFlags::empty(), b"not hello".to_vec());
         cas.put_blob(d, Bytes::from(tampered)).await.unwrap();
-        cas.flush_pending().await.unwrap();
+        flush(cas).await;
 
         let err = cas.get::<Bytes>(&d).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -214,12 +224,12 @@ async fn get_returns_invalid_data_for_a_tampered_chunk() {
     let cas = env.cas();
     let content = testing::random_bytes(Chunking::MAX_SIZE * 2);
     let d = cas.put(&Bytes::from(content)).await.unwrap();
-    cas.flush_pending().await.unwrap();
+    flush(cas).await;
 
     let chunk_key = any_key_except(cas, d).await;
     let tampered = encode(ContentFlags::empty(), b"tampered chunk content".to_vec());
     cas.put_blob(chunk_key, Bytes::from(tampered)).await.unwrap();
-    cas.flush_pending().await.unwrap();
+    flush(cas).await;
 
     let err = cas.get::<Bytes>(&d).await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -229,11 +239,11 @@ async fn get_returns_invalid_data_for_a_tampered_chunk() {
 async fn read_into_returns_invalid_data_for_tampered_content() {
     async fn check(cas: Cas<'_>) {
         let d = cas.put(&Bytes::from_static(b"hello")).await.unwrap();
-        cas.flush_pending().await.unwrap();
+        flush(cas).await;
 
         let tampered = encode(ContentFlags::empty(), b"not hello".to_vec());
         cas.put_blob(d, Bytes::from(tampered)).await.unwrap();
-        cas.flush_pending().await.unwrap();
+        flush(cas).await;
 
         let mut out = Vec::new();
         let err = cas.read_into(&d, &mut out).await.unwrap_err();
@@ -253,12 +263,12 @@ async fn read_into_returns_invalid_data_for_a_tampered_chunk() {
     let cas = env.cas();
     let content = testing::random_bytes(Chunking::MAX_SIZE * 2);
     let d = cas.put(&Bytes::from(content)).await.unwrap();
-    cas.flush_pending().await.unwrap();
+    flush(cas).await;
 
     let chunk_key = any_key_except(cas, d).await;
     let tampered = encode(ContentFlags::empty(), b"tampered chunk content".to_vec());
     cas.put_blob(chunk_key, Bytes::from(tampered)).await.unwrap();
-    cas.flush_pending().await.unwrap();
+    flush(cas).await;
 
     let mut out = Vec::new();
     let err = cas.read_into(&d, &mut out).await.unwrap_err();
@@ -270,11 +280,11 @@ async fn get_returns_invalid_data_for_a_tampered_manifest() {
     async fn check(cas: Cas<'_>) {
         let content = testing::random_bytes(Chunking::MAX_SIZE * 2);
         let d = cas.put(&Bytes::from(content)).await.unwrap();
-        cas.flush_pending().await.unwrap();
+        flush(cas).await;
 
         let tampered = encode(ContentFlags::CHUNKED, b"not a valid manifest body".to_vec());
         cas.put_blob(d, Bytes::from(tampered)).await.unwrap();
-        cas.flush_pending().await.unwrap();
+        flush(cas).await;
 
         let err = cas.get::<Bytes>(&d).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -312,7 +322,7 @@ async fn get_returns_invalid_data_when_manifest_references_a_missing_chunk() {
         cas.put_blob(blob_digest, Bytes::from(encode(ContentFlags::CHUNKED, manifest)))
             .await
             .unwrap();
-        cas.flush_pending().await.unwrap();
+        flush(cas).await;
 
         let err = cas.get::<Bytes>(&blob_digest).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

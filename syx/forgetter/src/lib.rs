@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
@@ -153,9 +154,13 @@ pub struct Forgetter {
     /// Rotated out, not yet forgotten; shared with the committer,
     /// which is the only thing that ever inserts into it.
     pending:     Arc<SkipMap<FileId, Segment>>,
-    /// `save` refuses new writes once pending segments reach this many,
-    /// so a persistently failing caller-side flush bounds local disk
-    /// usage instead of growing it without limit.
+    rotated:     tokio::sync::watch::Sender<()>,
+    /// `save` refuses new writes once pending segments reach this many.
+    /// Not primarily about bounding local disk usage: it's what
+    /// guarantees a caller-side flush that's stuck failing can't stay
+    /// invisible forever just because nobody happens to be watching for
+    /// it. A caller that already checks its own flush health some other
+    /// way still hits this eventually if that check is ignored.
     max_pending: u16,
 }
 
@@ -167,11 +172,28 @@ impl Forgetter {
     /// already found more pending segments than that: `save` refuses
     /// further writes until enough of the backlog clears.
     ///
+    /// `rotate_threshold` rotates the active segment out on its own,
+    /// the moment a write lands that takes it past this many bytes, the
+    /// same way a typical logger's size-based rollover works: the
+    /// caller only decides how big a segment gets to be, never when the
+    /// rotation itself happens.
+    ///
+    /// `rotate_after`, if set, also rotates on this cadence regardless
+    /// of size, so a segment that never crosses `rotate_threshold` still
+    /// doesn't sit active forever, the way a typical logger's own
+    /// time-based rollover works. `None` leaves rotation purely size-
+    /// and caller-driven.
+    ///
     /// The second return value is every record recovered from segments
     /// already on disk, for the caller to verify and index however it
     /// needs to; `Locator::bytes` reads a record's own content back
     /// (this crate never verifies content itself; see the module doc).
-    pub async fn open(dir: impl Into<PathBuf>, max_pending: u16) -> io::Result<(Self, Replay)> {
+    pub async fn open(
+        dir: impl Into<PathBuf>,
+        max_pending: u16,
+        rotate_threshold: u64,
+        rotate_after: Option<Duration>,
+    ) -> io::Result<(Self, Replay)> {
         let dir = dir.into();
         fs::create_dir_all(&dir).await?;
 
@@ -201,18 +223,27 @@ impl Forgetter {
             }
         }
 
-        let handle = committer::spawn(dir.clone(), Arc::clone(&pending)).await?;
+        let (rotated, _) = tokio::sync::watch::channel(());
+        let handle = committer::spawn(
+            dir.clone(),
+            Arc::clone(&pending),
+            rotated.clone(),
+            rotate_threshold,
+            rotate_after,
+        )
+        .await?;
 
-        Ok((Self { dir, handle, pending, max_pending }, Replay::new(segments)))
+        Ok((Self { dir, handle, pending, rotated, max_pending }, Replay::new(segments)))
     }
 
     /// Durably appends `value` to the active segment. Once this
     /// returns, `value` survives a crash of this node.
     ///
     /// Refuses the write if pending segments already number
-    /// `max_pending`: at that point the caller isn't keeping up with
-    /// clearing them, and accepting more would grow local disk usage
-    /// without bound.
+    /// `max_pending`: at that point whatever's supposed to be clearing
+    /// them has clearly stopped working, and this is what forces that
+    /// fact into the open instead of letting writes keep landing on top
+    /// of a backlog nobody is draining.
     pub async fn save(&self, value: Bytes) -> io::Result<Locator> {
         let pending_len = self.pending.len();
         if pending_len >= self.max_pending as usize {
@@ -253,6 +284,28 @@ impl Forgetter {
     /// `open` found already on disk.
     pub fn pending_segments(&self) -> Vec<FileId> {
         self.pending.iter().map(|entry| *entry.key()).collect()
+    }
+
+    /// Whether any segment is currently pending. Cheaper than checking
+    /// `pending_segments().is_empty()`, for a caller that only needs to
+    /// know whether there's anything to flush at all.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Subscribes to rotation events. `changed()` on the returned
+    /// receiver resolves on every rotation, from any cause, until every
+    /// sender (this `Forgetter`'s own, and the committer's) is dropped,
+    /// after which it returns `Err` instead, the same way
+    /// `mpsc::Receiver::recv` returns `None` once every `Sender` is
+    /// gone. A caller can hold the receiver across an unbounded wait
+    /// without that keeping this `Forgetter` alive.
+    ///
+    /// Reuse one receiver to react to every rotation: like any `watch`
+    /// channel, it only remembers the latest change, not a history of
+    /// every rotation that happened while nobody was watching.
+    pub fn rotated(&self) -> tokio::sync::watch::Receiver<()> {
+        self.rotated.subscribe()
     }
 
     /// Deletes `id`'s segment. Only call this once its content is

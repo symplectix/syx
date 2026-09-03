@@ -28,6 +28,16 @@ async fn s3_graph(
     s3_server: &s3::Server,
     flush_threshold: u64,
 ) -> (fabric::Graph, Arc<dyn ObjectStore>) {
+    s3_graph_with(s3_server, flush_threshold, None).await
+}
+
+/// Like `s3_graph`, but also lets a test override `max_forgetter_duration`
+/// (left at the crate's own default when `None`).
+async fn s3_graph_with(
+    s3_server: &s3::Server,
+    flush_threshold: u64,
+    max_forgetter_duration: Option<std::time::Duration>,
+) -> (fabric::Graph, Arc<dyn ObjectStore>) {
     // A region is required by both clients below, but this server
     // doesn't validate it. "us-east-1" is just a conventional value.
     let s3_client = aws_sdk_s3::Client::from_conf(
@@ -67,14 +77,15 @@ async fn s3_graph(
     // for as long as `graph` lives, and these tests never outlive the
     // process, so there's nothing to clean up on drop that matters here.
     let forgetter_dir = testing::tempdir().keep();
-    let graph = fabric::Graph::builder(forgetter_dir)
+    let mut builder = fabric::Graph::builder(forgetter_dir)
         .db_prefix("test")
         .db_backend(db_backend)
         .blobs(remote.clone())
-        .flush_threshold(flush_threshold)
-        .build()
-        .await
-        .unwrap();
+        .flush_threshold(flush_threshold);
+    if let Some(d) = max_forgetter_duration {
+        builder = builder.max_forgetter_duration(d);
+    }
+    let graph = builder.build().await.unwrap();
     (graph, remote)
 }
 
@@ -89,6 +100,30 @@ async fn get_returns_what_was_put() {
 
     let content = cas::Bytes::from(testing::random_bytes(2 * 1024 * 1024));
     let d = graph.cas().put(&content).await.unwrap();
+    assert_eq!(graph.cas().get::<cas::Bytes>(&d).await.unwrap(), Some(content));
+}
+
+#[tokio::test]
+async fn idle_content_eventually_gets_packed_without_further_activity() {
+    let s3_server = s3::Server::spawn(testing::tempdir()).unwrap();
+    // `flush_threshold` large enough that this one small `put` never
+    // crosses it, and no further `put` ever happens after it: the only
+    // thing that can ever rotate this segment out is `forgetter`'s own
+    // `max_forgetter_duration` timer, which then wakes `Graph`'s
+    // background flush loop to pack it.
+    let (graph, remote) =
+        s3_graph_with(&s3_server, 1024 * 1024, Some(std::time::Duration::from_millis(20))).await;
+
+    let content = cas::Bytes::from_static(b"idle content");
+    let d = graph.cas().put(&content).await.unwrap();
+
+    for _ in 0..100 {
+        if remote.list(None).count().await > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(remote.list(None).count().await > 0, "background flush loop never packed idle content");
     assert_eq!(graph.cas().get::<cas::Bytes>(&d).await.unwrap(), Some(content));
 }
 
@@ -124,17 +159,21 @@ async fn crossing_the_threshold_eventually_flushes_and_stays_readable() {
 #[tokio::test]
 async fn content_in_different_packs_stays_independently_readable() {
     let s3_server = s3::Server::spawn(testing::tempdir()).unwrap();
-    // Large enough that nothing auto-flushes on its own -- each pack
-    // below is built up by staging several entries, then flushed
-    // explicitly, so it ends up holding more than just one entry.
-    let (graph, remote) = s3_graph(&s3_server, 1024 * 1024).await;
+    // Small enough that every value below crosses it on its own, so
+    // `forgetter` rotates (and each of these ends up in its own pack)
+    // without needing to batch several `put`s together first: grouping
+    // several entries into one pack via an explicit flush was never a
+    // feature `flush_pending` promised, just an incidental effect of an
+    // earlier design where it forced a rotation itself. `flush_pending`
+    // deliberately doesn't do that, so this test no longer controls
+    // which values land in which pack.
+    let (graph, remote) = s3_graph(&s3_server, 8).await;
 
-    async fn put_and_flush(graph: &fabric::Graph, values: &[cas::Bytes]) -> Vec<cas::Digest> {
+    async fn put_all(graph: &fabric::Graph, values: &[cas::Bytes]) -> Vec<cas::Digest> {
         let mut digests = Vec::with_capacity(values.len());
         for v in values {
             digests.push(graph.cas().put(v).await.unwrap());
         }
-        graph.cas().flush_pending().await.unwrap();
         digests
     }
 
@@ -143,16 +182,29 @@ async fn content_in_different_packs_stays_independently_readable() {
         cas::Bytes::from_static(b"pack-a-value-2"),
         cas::Bytes::from_static(b"pack-a-value-3"),
     ];
-    let pack_a_digests = put_and_flush(&graph, &pack_a).await;
-    assert_eq!(remote.list(None).count().await, 1);
+    let pack_a_digests = put_all(&graph, &pack_a).await;
 
     let pack_b = [
         cas::Bytes::from_static(b"pack-b-value-1"),
         cas::Bytes::from_static(b"pack-b-value-2"),
         cas::Bytes::from_static(b"pack-b-value-3"),
     ];
-    let pack_b_digests = put_and_flush(&graph, &pack_b).await;
-    assert_eq!(remote.list(None).count().await, 2);
+    let pack_b_digests = put_all(&graph, &pack_b).await;
+
+    // Each `put` above crossing the threshold rotates its own segment,
+    // each of which wakes `Graph`'s background flush loop; those race
+    // for `Flushing`'s claim, so most of them lose and give up without
+    // retrying, leaving their segment un-packed. A single explicit
+    // `flush_pending` call can lose that same race, so this retries it
+    // until every value has actually landed on `remote`.
+    for _ in 0..100 {
+        graph.cas().flush_pending().await.unwrap();
+        if remote.list(None).count().await > 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(remote.list(None).count().await > 1, "expected more than one pack on remote");
 
     let entries = pack_a.iter().zip(&pack_a_digests).chain(pack_b.iter().zip(&pack_b_digests));
     for (v, d) in entries {

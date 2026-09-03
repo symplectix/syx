@@ -60,18 +60,15 @@ impl Builder {
         }
     }
 
-    /// How long to let a blob sit staged, unpacked, before consolidating
-    /// regardless of `flush_threshold`. Bounds how long staged content
-    /// stays invisible to every other reader of this `Graph`.
+    /// How long `forgetter` lets a segment stay active before rotating
+    /// it out on its own, regardless of `flush_threshold`.
     pub fn max_forgetter_duration(mut self, max_forgetter_duration: Duration) -> Self {
         self.max_forgetter_duration = Some(max_forgetter_duration);
         self
     }
 
     /// How many pending (rotated, not yet packed) segments `forgetter`
-    /// lets accumulate before refusing further writes. Bounds local disk
-    /// usage if `flush_pending` starts failing persistently, e.g. once
-    /// this node is fenced.
+    /// lets accumulate before refusing further writes.
     pub fn max_pending_segments(mut self, max_pending_segments: u16) -> Self {
         self.max_pending_segments = Some(max_pending_segments);
         self
@@ -99,7 +96,8 @@ impl Builder {
         self
     }
 
-    /// How many bytes to stage before consolidating into a pack.
+    /// How many bytes `forgetter` stages before rotating a segment out
+    /// on its own and making it worth consolidating into a pack.
     pub fn flush_threshold(mut self, flush_threshold: u64) -> Self {
         self.flush_threshold = Some(flush_threshold);
         self
@@ -169,27 +167,52 @@ impl Builder {
         let codec = codec.unwrap_or_default();
         let max_pending_segments =
             max_pending_segments.unwrap_or(storage::DEFAULT_MAX_PENDING_SEGMENTS);
+        let flush_threshold = flush_threshold.unwrap_or(storage::DEFAULT_FLUSH_THRESHOLD);
+        let max_forgetter_duration =
+            max_forgetter_duration.unwrap_or(storage::DEFAULT_MAX_FORGETTER_DURATION);
         // Its own subdirectory, the same way `db_backend`'s default gets
         // `forgetter_dir.join("db")` above: `Forgetter::open` lists every
         // entry in whatever directory it's given and treats matches as
         // its own segments, so it needs one nothing else ever writes
         // into, not `forgetter_dir` itself (which `db`/`blobs` also live
-        // under by default).
-        let (forgetter, replayed) =
-            forgetter::Forgetter::open(forgetter_dir.join("forgetter"), max_pending_segments)
-                .await?;
+        // under by default). `flush_threshold` doubles as `forgetter`'s
+        // own rotate threshold: the size at which a segment is worth
+        // consolidating into a pack is the same size at which it's worth
+        // rotating out of the active slot in the first place.
+        // `max_forgetter_duration` likewise becomes `forgetter`'s own
+        // rotate-by-time cadence, so a segment that never crosses
+        // `flush_threshold` still doesn't sit active forever.
+        let (forgetter, replayed) = forgetter::Forgetter::open(
+            forgetter_dir.join("forgetter"),
+            max_pending_segments,
+            flush_threshold,
+            Some(max_forgetter_duration),
+        )
+        .await?;
+        let rotated = forgetter.rotated();
         let forgetter = Arc::new(forgetter);
         let staged = Arc::new(storage::KeyDir::rebuild(replayed, codec).await);
 
         let blobs = blobs_backend.unwrap_or_else(|| db_backend.clone());
-        let flush_threshold = flush_threshold.unwrap_or(storage::DEFAULT_FLUSH_THRESHOLD);
-        let max_forgetter_duration =
-            max_forgetter_duration.unwrap_or(storage::DEFAULT_MAX_FORGETTER_DURATION);
         let chunking = chunking.unwrap_or_default();
         let cas_prefix: Arc<str> =
             Arc::from(cas_prefix.unwrap_or_else(|| storage::DEFAULT_CAS_PREFIX.to_string()));
 
-        let flushing = storage::Flushing::new(flush_threshold, max_forgetter_duration);
+        let flushing = storage::Flushing::new();
+        // Packs whatever `forgetter` rotates out, reacting directly to
+        // its own rotation events rather than needing a write to happen
+        // afterward to notice.
+        storage::spawn_flush_loop(
+            Arc::downgrade(&forgetter),
+            rotated,
+            storage::PackTarget {
+                db:         db.clone(),
+                blobs:      Arc::clone(&blobs),
+                cas_prefix: Arc::clone(&cas_prefix),
+                staged:     Arc::clone(&staged),
+                flushing:   flushing.clone(),
+            },
+        );
         Ok(Graph::new(forgetter, staged, db, blobs, flushing, cas_prefix, chunking, codec))
     }
 }

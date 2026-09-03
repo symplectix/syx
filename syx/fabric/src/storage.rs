@@ -38,10 +38,7 @@ use std::sync::atomic::{
     AtomicU32,
     Ordering,
 };
-use std::time::{
-    Duration,
-    Instant,
-};
+use std::time::Duration;
 
 use bytes::{
     Buf,
@@ -94,12 +91,17 @@ use forgetter::{
 /// digest to where `forgetter` put it. Named after Bitcask's own
 /// in-memory index of the same role.
 ///
-/// Grouped by segment rather than a flat digest map: `entries_in`/
-/// `forget` (packing) need exactly that grouping, and `get`/`contains`
-/// (point lookups) can afford to check every segment's own small map in
-/// turn, since there are at most `max_pending + 1` of them at once (see
-/// `Forgetter::save`'s own backpressure) rather than scanning every
-/// staged digest across all of them.
+/// Purely a point-lookup cache for `get`/`contains`: `flush_segments`
+/// reads a segment's own records directly via `Segment::slots` instead
+/// of going through this, so this index never needs to be complete
+/// before a segment gets forgotten.
+///
+/// Grouped by segment rather than a flat digest map: `forget` needs
+/// exactly that grouping, and `get`/`contains` can afford to check every
+/// segment's own small map in turn, since there are at most
+/// `max_pending + 1` of them at once (see `Forgetter::save`'s own
+/// backpressure) rather than scanning every staged digest across all of
+/// them.
 ///
 /// Each segment's own map is a `DashMap`, not another `SkipMap`: writes
 /// to it concentrate entirely on whichever one segment is currently
@@ -150,14 +152,6 @@ impl KeyDir {
         self.by_file.iter().any(|entry| entry.value().contains_key(&key))
     }
 
-    /// Every `(digest, slot)` staged in segment `file`, for packing.
-    fn entries_in(&self, file: forgetter::FileId) -> Vec<(Digest, forgetter::Slot)> {
-        match self.by_file.get(&file) {
-            Some(entry) => entry.value().iter().map(|r| (*r.key(), r.value().slot())).collect(),
-            None => Vec::new(),
-        }
-    }
-
     /// Removes every entry belonging to segment `file`, once it's been
     /// packed and `forgetter.forget(file)` is about to be called.
     fn forget(&self, file: forgetter::FileId) {
@@ -190,65 +184,32 @@ pub(crate) const DEFAULT_FLUSH_THRESHOLD: u64 = Chunking::AVG_SIZE as u64 * 64;
 /// never crosses `flush_threshold` on its own.
 pub(crate) const DEFAULT_MAX_FORGETTER_DURATION: Duration = Duration::from_secs(30);
 
-/// The default `max_pending_segments`: bounds `forgetter`'s local disk
-/// usage, at this default roughly `16 * flush_threshold`, to a finite
-/// amount even if `flush_pending` fails indefinitely.
+/// The default `max_pending_segments`.
 pub(crate) const DEFAULT_MAX_PENDING_SEGMENTS: u16 = 16;
 
-/// Flush behavior: when to consolidate staged entries into a pack, and
-/// bookkeeping for that process.
+/// Flush behavior: bookkeeping for consolidating staged entries into a
+/// pack. `forgetter` decides for itself when a segment is worth rotating
+/// out, by size or by time; this just serializes flush attempts and
+/// tracks whether they're succeeding.
 #[derive(Clone)]
 pub(crate) struct Flushing {
     /// Serializes `flush_pending`.
-    mutex: Arc<tokio::sync::Mutex<()>>,
+    mutex:    Arc<tokio::sync::Mutex<()>>,
     /// Consecutive `flush_pending` failures, reset to 0 on success.
-    /// `put_blob` reads this to decide whether to run the next flush in
-    /// the background or wait on it and propagate its error.
+    /// Purely observational: nothing in this crate reads it to change
+    /// its own behavior. `Cas::flush_failures` exposes it so a caller
+    /// can decide for itself whether (and how) to react to a flush path
+    /// that's stuck.
     failures: Arc<AtomicU32>,
-    /// How many bytes to stage before consolidating into a pack.
-    bytes_threshold: u64,
-    /// How long to let a blob sit staged, unpacked, before consolidating
-    /// regardless of `bytes_threshold`.
-    duration_threshold: Duration,
-    /// When the active segment currently being staged into started.
-    forgetter_since: Arc<std::sync::Mutex<Instant>>,
-    /// Guards the gap between `forgetter.save` returning a `Locator` and
-    /// `put_blob` publishing it into `KeyDir`. `put_blob` holds a
-    /// read lock across that gap; rotating the active segment out takes
-    /// a write lock first, so it can never happen while a `save` that
-    /// already landed in that segment hasn't been indexed yet. Reads
-    /// never block each other, so this costs nothing on the common path.
-    rotate_barrier: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl Flushing {
-    /// Builds `Flushing` for `Graph` to hold directly. `Graph::Builder`
-    /// is the configuration surface, resolving defaults and overrides;
-    /// this just builds what it resolves.
-    pub(crate) fn new(bytes_threshold: u64, duration_threshold: Duration) -> Self {
+    /// Builds `Flushing` for `Graph` to hold directly.
+    pub(crate) fn new() -> Self {
         Self {
-            mutex: Arc::new(tokio::sync::Mutex::new(())),
+            mutex:    Arc::new(tokio::sync::Mutex::new(())),
             failures: Arc::new(AtomicU32::new(0)),
-            bytes_threshold,
-            duration_threshold,
-            forgetter_since: Arc::new(std::sync::Mutex::new(Instant::now())),
-            rotate_barrier: Arc::new(tokio::sync::RwLock::new(())),
         }
-    }
-
-    /// Whether enough has accumulated since the last flush to make one
-    /// due now: `active_segment_len` crossing `bytes_threshold`, or
-    /// enough time having passed since `forgetter_since` regardless of
-    /// `active_segment_len`.
-    fn is_due(&self, active_segment_len: u64) -> bool {
-        active_segment_len >= self.bytes_threshold
-            || self.forgetter_since.lock().unwrap().elapsed() >= self.duration_threshold
-    }
-
-    /// Restarts the clock `is_due` measures elapsed time against, for
-    /// the segment that just became active.
-    fn reset_forgetter_since(&self) {
-        *self.forgetter_since.lock().unwrap() = Instant::now();
     }
 
     /// Consecutive `flush_pending` failures so far.
@@ -326,11 +287,6 @@ pub struct Cas<'a> {
 }
 
 impl<'a> Cas<'a> {
-    /// How many consecutive `flush_pending` failures `put_blob` tolerates
-    /// before switching from running it in the background to waiting on
-    /// it and propagating its error.
-    const MAX_CONSECUTIVE_FLUSH_FAILURES: u32 = 3;
-
     /// How many chunks `copy_from`/`read_into` keep in flight at once.
     /// A large blob's chunks would otherwise be staged or fetched one at
     /// a time, each fully awaited before the next starts: group commit
@@ -422,73 +378,28 @@ impl<'a> Cas<'a> {
         Ok(Some(self.get_range(entry.pack_id, entry.offset, entry.length).await?))
     }
 
-    /// Stages `bytes` under `key` durably in `forgetter`.
+    /// Stages `bytes` under `key` durably in `forgetter`. Always
+    /// succeeds as long as `forgetter` itself accepts the write,
+    /// regardless of how the flush path is doing.
     ///
-    /// If enough has accumulated since the last flush, by size or by
-    /// time (see `Flushing::is_due`), triggers `flush_pending` in the
-    /// background rather than waiting on it, so this call returns as
-    /// soon as `bytes` is durable locally. Once `flush_pending` has
-    /// failed `MAX_CONSECUTIVE_FLUSH_FAILURES` times in a row, switches
-    /// to waiting on it and propagating its error instead, so a
-    /// persistently broken flush path is surfaced to callers rather than
-    /// growing `forgetter` without bound.
+    /// Doesn't trigger a flush itself: `Graph`'s own background flush
+    /// loop reacts to `forgetter`'s own rotation events directly, so
+    /// every rotation gets picked up regardless of whether a `put_blob`
+    /// call happens to follow it.
     async fn put_blob(&self, key: Digest, bytes: Bytes) -> io::Result<()> {
         let mut combined = BytesMut::with_capacity(32 + bytes.len());
         combined.extend_from_slice(key.as_ref());
         combined.extend_from_slice(&bytes);
 
-        // Held across `save`+`staged.insert` so a concurrent rotate
-        // (which takes a write lock on the same `RwLock`) can never see
-        // this segment as fully indexed while this record is still
-        // in flight; see `Flushing::rotate_barrier`'s own doc.
-        let _hold = self.flushing.rotate_barrier.read().await;
         let locator = self.forgetter.save(combined.freeze()).await?;
         self.staged.insert(key, locator);
-        drop(_hold);
-
-        if !self.flushing.is_due(self.forgetter.active_segment_len()) {
-            return Ok(());
-        }
-
-        // Group commit can report this same crossed threshold to every
-        // `put_blob` call batched into the same write; only the one that
-        // wins this claim spawns (or waits on) a flush at all.
-        let Some(guard) = self.flushing.try_claim() else {
-            return Ok(());
-        };
-
-        // The one deliberate exception to flushing staying off the write
-        // path: once it's failed this many times in a row, run it inline
-        // and propagate its error instead of spawning another background
-        // attempt, so a persistently broken flush surfaces to callers
-        // rather than growing `forgetter` unboundedly in silence.
-        if self.flushing.failures() >= Self::MAX_CONSECUTIVE_FLUSH_FAILURES {
-            return flush_pending(
-                self.db,
-                self.blobs,
-                self.forgetter,
-                self.staged,
-                self.cas_prefix,
-                self.flushing,
-                guard,
-            )
-            .await;
-        }
-
-        let db = self.db.clone();
-        let blobs = Arc::clone(self.blobs);
-        let forgetter = Arc::clone(self.forgetter);
-        let staged = Arc::clone(self.staged);
-        let cas_prefix = self.cas_prefix.to_string();
-        let flushing = self.flushing.clone();
-        tokio::spawn(async move {
-            let _ = flush_pending(&db, &blobs, &forgetter, &staged, &cas_prefix, &flushing, guard)
-                .await;
-        });
         Ok(())
     }
 
-    /// Consolidates all currently-staged entries into pack objects.
+    /// Consolidates whatever `forgetter` has already rotated out into
+    /// pack objects. Doesn't force the still-active segment to rotate:
+    /// content staged there stays unpacked, though still readable via
+    /// `get`, until `forgetter` rotates it out on its own.
     ///
     /// If another call is already in progress, this returns immediately
     /// without doing anything, rather than waiting its turn.
@@ -506,6 +417,17 @@ impl<'a> Cas<'a> {
             guard,
         )
         .await
+    }
+
+    /// How many times `flush_pending` has failed in a row, whether
+    /// triggered by `Graph`'s own background flush loop or by an
+    /// explicit `flush_pending` call. Reset to 0 as soon as one
+    /// succeeds. Purely observational: nothing in this crate reacts to
+    /// it on its own (`put_blob` always accepts writes regardless); a
+    /// caller that wants to alert on, or otherwise react to, a stuck
+    /// flush path polls this itself.
+    pub fn flush_failures(&self) -> u32 {
+        self.flushing.failures()
     }
 
     /// Fetch and decode the blob stored under `digest`.
@@ -726,9 +648,14 @@ fn pack_path(cas_prefix: &str, pack_id: Digest) -> Path {
 }
 
 /// Consolidates every currently-pending `forgetter` segment into pack
-/// objects, taking owned references so `put_blob`'s background trigger
-/// can run this after the `Cas<'_>` that requested it has gone out of
-/// scope.
+/// objects, taking owned references so `spawn_flush_loop`'s background
+/// task can call this without borrowing from any particular `Cas<'_>`.
+///
+/// Doesn't rotate the active segment out itself: that's `forgetter`'s
+/// own call, not something this forces just because a flush was
+/// requested. Content still in the active segment stays unpacked, though
+/// still readable (`Cas::get_blob` falls back to `staged`), until
+/// `forgetter` rotates it out on its own.
 ///
 /// `_guard` must come from `Flushing::try_claim`: callers claim it
 /// before deciding whether to spawn or wait on this at all, not just
@@ -742,19 +669,7 @@ async fn flush_pending(
     flushing: &Flushing,
     _guard: OwnedMutexGuard<()>,
 ) -> io::Result<()> {
-    let mut segments = forgetter.pending_segments();
-    if forgetter.active_segment_len() > 0 {
-        // Waits for every `put_blob` already holding a read lock (i.e.
-        // that already called `forgetter.save` and hasn't published the
-        // result into `staged` yet) to finish, so `staged` is guaranteed
-        // to know about everything in the segment being rotated out.
-        let rotated = {
-            let _hold = flushing.rotate_barrier.write().await;
-            forgetter.rotate().await?
-        };
-        segments.push(rotated);
-        flushing.reset_forgetter_since();
-    }
+    let segments = forgetter.pending_segments();
     if segments.is_empty() {
         flushing.record_success();
         return Ok(());
@@ -768,6 +683,54 @@ async fn flush_pending(
     result
 }
 
+/// Everything `flush_pending` needs besides `forgetter` itself and a
+/// claim on `flushing`. Bundled so `spawn_flush_loop` doesn't have to
+/// spell out each piece as its own parameter.
+pub(crate) struct PackTarget {
+    pub(crate) db:         slatedb::Db,
+    pub(crate) blobs:      Arc<dyn ObjectStore>,
+    pub(crate) cas_prefix: Arc<str>,
+    pub(crate) staged:     Arc<KeyDir>,
+    pub(crate) flushing:   Flushing,
+}
+
+/// Spawns the task that packs whatever `forgetter` rotates out, so a
+/// segment doesn't just sit pending forever if nothing else happens to
+/// call `flush_pending` afterward. Reacts to `rotated`
+/// (`Forgetter::rotated`), which fires for every rotation regardless of
+/// cause, so this needs no polling to stay responsive.
+///
+/// Holds `forgetter` only weakly, so waiting on `rotated`, potentially
+/// forever, doesn't keep it, and its committer task, alive past every
+/// `Graph` handle sharing it being dropped. `rotated` itself then closes
+/// once `forgetter` is gone, which is what wakes this up to notice and
+/// exit rather than leak.
+pub(crate) fn spawn_flush_loop(
+    forgetter: std::sync::Weak<Forgetter>,
+    mut rotated: tokio::sync::watch::Receiver<()>,
+    target: PackTarget,
+) {
+    let PackTarget { db, blobs, cas_prefix, staged, flushing } = target;
+    tokio::spawn(async move {
+        loop {
+            if rotated.changed().await.is_err() {
+                return;
+            }
+            let Some(forgetter) = forgetter.upgrade() else {
+                return;
+            };
+            if !forgetter.has_pending() {
+                continue;
+            }
+            let Some(guard) = flushing.try_claim() else {
+                continue;
+            };
+            let _ = flush_pending(&db, &blobs, &forgetter, &staged, &cas_prefix, &flushing, guard)
+                .await;
+        }
+    });
+}
+
 async fn flush_segments(
     db: &slatedb::Db,
     blobs: &Arc<dyn ObjectStore>,
@@ -777,16 +740,30 @@ async fn flush_segments(
     segments: Vec<forgetter::FileId>,
 ) -> io::Result<()> {
     for segment_id in segments {
-        let records = staged.entries_in(segment_id);
+        let found = forgetter.find(segment_id).await.ok_or_else(|| {
+            io::Error::other(format!("forgetter: pending segment {segment_id} vanished"))
+        })?;
+        let segment = found.segment();
+        let slots = segment.slots().await?;
+        let buf = segment.bytes(..).await?;
+
+        // Each record's own digest, read straight from the segment's
+        // bytes rather than from `staged`: `put_blob` writes
+        // `key(32) || value` per record, so this needs no external
+        // index to be complete, and packing never has to wait for
+        // `staged` to catch up with what
+        // `forgetter` already rotated out on its own.
+        let records: Vec<(Digest, forgetter::Slot)> = slots
+            .filter_map(|slot| {
+                let start = slot.offset as usize;
+                (slot.length as usize >= 32)
+                    .then(|| (Digest::new(buf[start..start + 32].try_into().unwrap()), slot))
+            })
+            .collect();
         if records.is_empty() {
             forgetter.forget(segment_id).await?;
             continue;
         }
-
-        let found = forgetter.find(segment_id).await.ok_or_else(|| {
-            io::Error::other(format!("forgetter: pending segment {segment_id} vanished"))
-        })?;
-        let buf = found.segment().bytes(..).await?;
 
         // A pack object's bytes are exactly a forgetter segment's own
         // sealed bytes, uploaded as-is instead of being decoded and

@@ -8,6 +8,7 @@ use std::sync::atomic::{
     AtomicU64,
     Ordering,
 };
+use std::time::Duration;
 
 use bytes::{
     BufMut,
@@ -122,6 +123,9 @@ impl Handle {
 pub(super) async fn spawn(
     dir: PathBuf,
     pending: Arc<SkipMap<FileId, Segment>>,
+    rotated: tokio::sync::watch::Sender<()>,
+    rotate_threshold: u64,
+    rotate_after: Option<Duration>,
 ) -> io::Result<Handle> {
     let file_id = file_id::next();
     let segment = Segment::create(file_id::path(&dir, file_id)).await?;
@@ -138,6 +142,13 @@ pub(super) async fn spawn(
         active_segment_len: Arc::clone(&active_segment_len),
         segment,
         pending,
+        rotated,
+        rotate_threshold,
+        // `interval`'s own first tick fires immediately rather than
+        // after a full period; `interval_at` with an explicit first
+        // deadline avoids rotating a segment that just barely started.
+        rotate_after: rotate_after
+            .map(|period| tokio::time::interval_at(tokio::time::Instant::now() + period, period)),
         commands,
     };
     tokio::spawn(committer.run());
@@ -169,7 +180,11 @@ struct Committer {
     /// Rotated out, not yet forgotten. Structurally can never contain
     /// the active segment, so nothing removing from it needs to guard
     /// against accidentally sealing the one still being written to.
-    pending: Arc<SkipMap<FileId, Segment>>,
+    pending:          Arc<SkipMap<FileId, Segment>>,
+    /// Dropped along with the rest of `self` once `run` returns.
+    rotated:          tokio::sync::watch::Sender<()>,
+    rotate_threshold: u64,
+    rotate_after:     Option<tokio::time::Interval>,
 
     /// Where `Handle::save`/`rotate` send their requests.
     commands: mpsc::UnboundedReceiver<Command>,
@@ -203,10 +218,31 @@ impl Committer {
             // channel. Send order holds without a lock to enforce it.
             let command = match carried.take() {
                 Some(command) => command,
-                None => match self.commands.recv().await {
-                    Some(command) => command,
-                    None => return,
-                },
+                None => {
+                    // `ticker`'s borrow of `self.rotate_after` ends once
+                    // this `match` produces `woken`, before `self.rotate`
+                    // (which needs the whole of `self`) is ever called
+                    // below.
+                    let woken = match &mut self.rotate_after {
+                        Some(ticker) => tokio::select! {
+                            command = self.commands.recv() => Some(command),
+                            _ = ticker.tick() => None,
+                        },
+                        None => Some(self.commands.recv().await),
+                    };
+                    let Some(command) = woken else {
+                        // Ticked over: rotate if there's anything worth
+                        // rotating, then go back to waiting.
+                        if self.active_segment_len.load(Ordering::Relaxed) > 0 {
+                            let _ = self.rotate().await;
+                        }
+                        continue;
+                    };
+                    match command {
+                        Some(command) => command,
+                        None => return,
+                    }
+                }
             };
 
             match command {
@@ -281,17 +317,25 @@ impl Committer {
         match result {
             Ok(()) => {
                 self.active_segment_len.store(offset, Ordering::Relaxed);
-                // No lock to take here: unlike the active segment's
-                // identity (`ActiveSegment`, only touched on rotation),
-                // nothing else reads or writes per-record state that
-                // `commit` needs to publish. `Locator` carries `segment`
-                // itself, so a reply's recipient can read these bytes
-                // straight from it as soon as they're appended, with no
-                // separate lookup that could race against this segment
-                // eventually being forgotten.
+                // Captured before a possible `rotate` below changes
+                // `self.file_id`/`self.segment`: this batch's own
+                // records belong to the segment as it was when they
+                // landed, not whatever becomes active next.
+                let file_id = self.file_id;
+                let segment = self.segment.clone();
+
+                // Rotating before replying means a caller with its
+                // `Locator` back never observes a stale
+                // `active_segment_len`/`pending_segments`. Best-effort:
+                // a failure here just means this segment keeps growing
+                // past `rotate_threshold`, and the next commit past it
+                // tries again.
+                if offset >= self.rotate_threshold {
+                    let _ = self.rotate().await;
+                }
+
                 for (msg, &slot) in batch.drain(..).zip(&slots) {
-                    let locator =
-                        Locator { file: self.file_id, segment: self.segment.clone(), slot };
+                    let locator = Locator { file: file_id, segment: segment.clone(), slot };
                     let _ = msg.reply.send(Ok(locator));
                 }
             }
@@ -321,6 +365,7 @@ impl Committer {
 
         let _ = old.segment.seal();
         self.pending.insert(old_id, old.segment);
+        let _ = self.rotated.send(());
         Ok(old_id)
     }
 
@@ -350,6 +395,9 @@ impl Committer {
         let path = file_id::path(&self.dir, old_id);
         if let Some((segment, _slots)) = Segment::open(&path).await? {
             self.pending.insert(old_id, segment);
+            // Same as `rotate`: sent only after the insert a receiver's
+            // `has_pending` check would actually see, not before.
+            let _ = self.rotated.send(());
         }
         Ok(())
     }
@@ -378,7 +426,8 @@ mod tests {
     async fn rotate_seals_a_mapping_a_segment_captured_before_it_can_see() {
         let dir = testing::tempdir();
         let pending = Arc::new(SkipMap::new());
-        let handle = spawn(dir.path().to_owned(), pending).await.unwrap();
+        let (rotated, _) = tokio::sync::watch::channel(());
+        let handle = spawn(dir.path().to_owned(), pending, rotated, u64::MAX, None).await.unwrap();
         handle.save(Bytes::from_static(b"hello")).await.unwrap();
 
         // Captured while the segment was still active: no mapping yet.
@@ -391,5 +440,48 @@ mod tests {
         // `seal` established while rotating, proving it's a shared cell
         // doing this and not a fresh lookup back into `pending`.
         assert!(segment.sealed());
+    }
+
+    #[tokio::test]
+    async fn poison_notifies_rotated_once_something_is_salvaged() {
+        let dir = testing::tempdir();
+        let file_id = file_id::next();
+        let segment = Segment::create(file_id::path(dir.path(), file_id)).await.unwrap();
+        // A durable record, written directly rather than through `commit`,
+        // standing in for whatever a real batch already landed before it
+        // failed partway.
+        let value = Bytes::from_static(b"hello");
+        let mut header = BytesMut::with_capacity(RECORD_HEADER_LEN as usize);
+        header.put_u32(value.len() as u32);
+        segment.append(header.freeze()).await.unwrap();
+        segment.append(value.clone()).await.unwrap();
+        segment.flush().await.unwrap();
+
+        let pending = Arc::new(SkipMap::new());
+        let (rotated, mut rotated_rx) = tokio::sync::watch::channel(());
+        let (_tx, commands) = mpsc::unbounded_channel();
+        let mut committer = Committer {
+            dir: dir.path().to_owned(),
+            file_id,
+            active: Arc::new(RwLock::new(ActiveSegment {
+                file:    file_id,
+                segment: segment.clone(),
+            })),
+            active_segment_len: Arc::new(AtomicU64::new(RECORD_HEADER_LEN + value.len() as u64)),
+            segment,
+            pending: Arc::clone(&pending),
+            rotated,
+            rotate_threshold: u64::MAX,
+            rotate_after: None,
+            commands,
+        };
+
+        committer.poison().await.unwrap();
+
+        assert_eq!(pending.len(), 1);
+        tokio::time::timeout(std::time::Duration::from_millis(200), rotated_rx.changed())
+            .await
+            .expect("changed should resolve promptly")
+            .expect("rotated should still be open after a salvaging poison");
     }
 }
