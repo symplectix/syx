@@ -41,6 +41,31 @@ crate.spec(
     version = "1",
 )
 
+# Read-only memory-mapped files, for zero-copy reads of segments that are
+# already sealed (and so never written to again -- see syx/forgetter)
+# into an `Arc`-shared, `Bytes::from_owner`-wrapped buffer.
+crate.spec(
+    package = "memmap2",
+    version = "0.9",
+)
+
+# Lock-free ordered map: used by syx/forgetter to track pending segments
+# without a lock shared between the committer and readers, and by
+# syx/fabric to group staged digests per segment.
+crate.spec(
+    package = "crossbeam-skiplist",
+    version = "0.1",
+)
+
+# Sharded concurrent hash map: syx/fabric uses this for the per-segment
+# digest map inside its `KeyDir`, where writes concentrate on whichever
+# one segment is currently active rather than spreading across keys, a
+# pattern shared locking scales better for than a lock-free skip list.
+crate.spec(
+    package = "dashmap",
+    version = "6",
+)
+
 # (De)serialization framework.
 crate.spec(
     features = ["derive"],

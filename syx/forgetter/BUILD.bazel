@@ -1,0 +1,28 @@
+load("//bazel:rust.bzl", "rust")
+
+rust.library(
+    name = "forgetter",
+    srcs = [
+        "src/committer.rs",
+        "src/file_id.rs",
+        "src/lib.rs",
+        "src/segment.rs",
+        "src/tests.rs",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@crates//:bytes",
+        "@crates//:crossbeam-skiplist",
+        "@crates//:memmap2",
+        "@crates//:tokio",
+    ],
+)
+
+rust.test(
+    name = "forgetter_test",
+    size = "small",
+    crate = ":forgetter",
+    deps = [
+        "//syx/testing",
+    ],
+)

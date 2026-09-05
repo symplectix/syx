@@ -22,29 +22,40 @@ pub use storage::Cas;
 
 /// A content-addressable (hyper)graph.
 ///
-/// `Graph` is not a database, it's git for your application's data: not
-/// just files but any fact, and not just commits a human makes but any
-/// derivation a Function makes.
+/// `Graph` is built directly on content addressing: sources,
+/// derivations, and the relations between them all live in one address
+/// space, not across separate systems. That is what makes `Graph` a
+/// plausible git for application data: not just files, but any fact;
+/// not just commits a human makes, but any derivation a Function makes.
+///
+/// A relation's source is just more content in the graph, so ingesting
+/// external data needs no special pipeline and nothing external to keep
+/// in sync. Lineage and re-extraction follow for free: every relation
+/// traces back to its true source through the graph itself, and because
+/// a source is pinned by its digest forever, rerunning extraction after
+/// a logic change only adds new relations against the same source,
+/// leaving old ones untouched.
 #[derive(Clone)]
 pub struct Graph {
-    /// `Graph` is built directly on content addressing, so a relation's own
-    /// source material lives in the same content-addressed space as the
-    /// relation itself, not in a separate system.
-    ///
-    /// One ingestion pipeline delivers two consequences for free: store the source as a blob, run
-    /// extraction (a Function), then write the resulting relations against that digest. Ingestion
-    /// itself is just a relation between the graph and an external resource, the same mechanism
-    /// any other derivation uses. That means there is no external store to sync with, since a
-    /// relation's source lives inside the graph itself, and lineage runs all the way back to the
-    /// true source for free, with no separate provenance mechanism needed.
-    ///
-    /// Re-extraction never re-fetches anything, because the source is pinned by digest forever.
-    /// Changing extraction logic and rerunning it just adds new relations against the same
-    /// source, leaving old ones intact.
-    db:         slatedb::Db,
-    store:      Arc<dyn ObjectStore>,
-    cas_prefix: String,
-    flushing:   storage::Flushing,
+    // Durably holds not-yet-packed content until it's forgotten (packed
+    // elsewhere). The only thing `Graph` can't default: everything below
+    // can fall back to living under the same directory.
+    forgetter: Arc<forgetter::Forgetter>,
+    // Maps a blob's digest to where `forgetter` is holding it; see
+    // `storage::KeyDir`'s own doc for why this lives here and not
+    // in `forgetter` itself.
+    staged:    Arc<storage::KeyDir>,
+
+    // `db`: the pointer/relation store.
+    db: slatedb::Db,
+
+    // Packed blob object storage, and when to consolidate `forgetter`'s
+    // content into it.
+    blobs:    Arc<dyn ObjectStore>,
+    flushing: storage::Flushing,
+
+    // Content addressing, applies uniformly regardless of backend.
+    cas_prefix: Arc<str>,
     chunking:   content_addressing::Chunking,
     codec:      content_addressing::Codec,
 }
