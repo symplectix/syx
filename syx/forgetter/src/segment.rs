@@ -2,6 +2,7 @@
 //! A segment is created empty, then appended to sequentially while
 //! it's the active one; once rotated out it never changes again.
 
+use std::future::Future;
 use std::io;
 use std::io::Write as _;
 use std::ops::{
@@ -111,9 +112,8 @@ impl Segment {
             return Ok(None);
         };
 
-        let buf = segment.bytes(..).await?;
-        let len = buf.len() as u64;
-        let (valid_len, slots) = parse(&buf);
+        let len = segment.bytes(..).await?.len() as u64;
+        let (valid_len, slots) = segment.parse().await?;
         let segment = if valid_len < len {
             Self::truncate(path.to_owned(), valid_len).await?
         } else {
@@ -178,8 +178,36 @@ impl Segment {
         if !self.sealed() {
             return Err(io::Error::other("forgetter: slots() called on a still-active segment"));
         }
+        Ok(self.parse().await?.1)
+    }
+
+    /// Parses this segment's own records in order, from the start,
+    /// purely structurally: `[len: u32][value]` frames, with no
+    /// interpretation of `value` at all. Returns every value's
+    /// position.
+    ///
+    /// Stops at the first record whose declared length runs past the
+    /// end; everything from that point on is dropped, since a length
+    /// that long can only mean the write that produced it never
+    /// finished. This crate doesn't verify a record's content beyond
+    /// that: a caller that wants to also detect bit-level corruption
+    /// within an otherwise well-framed record does so itself, using
+    /// `find`'s replay output.
+    async fn parse(&self) -> io::Result<(u64, Slots)> {
         let buf = self.bytes(..).await?;
-        Ok(parse(&buf).1)
+        let mut slots = Vec::new();
+        let mut offset = 0usize;
+        while offset as u64 + RECORD_HEADER_LEN <= buf.len() as u64 {
+            let length = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
+            let value_start = offset + 4;
+            let value_end = value_start + length as usize;
+            if value_end > buf.len() {
+                break;
+            }
+            slots.push(Slot { offset: value_start as u64, length });
+            offset = value_end;
+        }
+        Ok((offset as u64, Slots(slots.into_iter())))
     }
 
     /// Establishes this segment's whole-file mapping, for a segment
@@ -200,7 +228,8 @@ impl Segment {
     }
 }
 
-/// Every record position `parse` found in one segment's bytes, in order.
+/// Every record position `Segment::parse` found in one segment's bytes,
+/// in order.
 pub(super) struct Slots(std::vec::IntoIter<Slot>);
 
 impl Slots {
@@ -217,33 +246,6 @@ impl Iterator for Slots {
     }
 }
 
-/// Parses records from `buf` in order, from the start, purely
-/// structurally: `[len: u32][value]` frames, with no interpretation of
-/// `value` at all. Returns every record's position, plus how many bytes
-/// from the start of `buf` are valid.
-///
-/// Stops at the first record whose declared length runs past the end of
-/// `buf`; everything from that point on is dropped, since a length that
-/// long can only mean the write that produced it never finished. This
-/// crate doesn't verify a record's content beyond that: a caller that
-/// wants to also detect bit-level corruption within an otherwise
-/// well-framed record does so itself, using `find`'s replay output.
-fn parse(buf: &Bytes) -> (u64, Slots) {
-    let mut slots = Vec::new();
-    let mut offset = 0usize;
-    while offset as u64 + RECORD_HEADER_LEN <= buf.len() as u64 {
-        let length = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
-        let value_start = offset + 4;
-        let value_end = value_start + length as usize;
-        if value_end > buf.len() {
-            break;
-        }
-        slots.push(Slot { offset: value_start as u64, length });
-        offset = value_end;
-    }
-    (offset as u64, Slots(slots.into_iter()))
-}
-
 /// Something that can select a byte range within a `Segment`'s records.
 ///
 /// Every index is record-relative; `read_from`'s own implementations are
@@ -251,10 +253,10 @@ fn parse(buf: &Bytes) -> (u64, Slots) {
 /// file, once and only here.
 pub trait BytesIndex {
     /// Reads the bytes this index selects from `segment`.
-    async fn read_from(&self, segment: &Segment) -> io::Result<Bytes>;
+    fn read_from(&self, segment: &Segment) -> impl Future<Output = io::Result<Bytes>> + Send;
 }
 
-impl<T: RangeBounds<u64>> BytesIndex for T {
+impl<T: RangeBounds<u64> + Send + Sync> BytesIndex for T {
     async fn read_from(&self, segment: &Segment) -> io::Result<Bytes> {
         let start = MAGIC_LEN
             + match self.start_bound() {
