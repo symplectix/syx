@@ -250,7 +250,7 @@ crate.spec(
 # Extra iterator adaptors.
 crate.spec(
     package = "itertools",
-    version = "0.14",
+    version = "0.15",
 )
 
 # Numeric traits and types.
