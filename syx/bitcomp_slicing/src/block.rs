@@ -48,7 +48,7 @@ pub enum BlockData<'a> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct BlocksHeader<'a> {
-    chunks: slice::Iter<'a, [u8; BLOCK_INFO_SIZE]>,
+    chunks:    slice::Iter<'a, [u8; BLOCK_INFO_SIZE]>,
     #[cfg_attr(not(test), allow(dead_code))]
     remainder: &'a [u8],
 }
@@ -98,7 +98,9 @@ impl<'a> BlocksHeader<'a> {
 impl<'a> Iterator for BlocksHeader<'a> {
     type Item = BlockInfo;
     fn next(&mut self) -> Option<Self::Item> {
-        self.chunks.next().map(|slice| BlockInfo { index: slice[0] as u16, bits: slice[1] as u16 + 1 })
+        self.chunks
+            .next()
+            .map(|slice| BlockInfo { index: slice[0] as u16, bits: slice[1] as u16 + 1 })
     }
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
