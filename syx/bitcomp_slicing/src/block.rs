@@ -47,7 +47,11 @@ pub enum BlockData<'a> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct BlocksHeader<'a>(slice::ChunksExact<'a, u8>);
+pub(crate) struct BlocksHeader<'a> {
+    chunks: slice::Iter<'a, [u8; BLOCK_INFO_SIZE]>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    remainder: &'a [u8],
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BlockInfo {
@@ -82,25 +86,23 @@ impl<'a> ExactSizeIterator for Blocks<'a> {}
 
 impl<'a> BlocksHeader<'a> {
     fn new(header: &'a [u8]) -> Self {
-        BlocksHeader(header.chunks_exact(BLOCK_INFO_SIZE))
+        let (chunks, remainder) = header.as_chunks::<BLOCK_INFO_SIZE>();
+        BlocksHeader { chunks: chunks.iter(), remainder }
     }
 
     #[cfg(test)]
     pub(crate) fn remainder(&self) -> &[u8] {
-        self.0.remainder()
+        self.remainder
     }
 }
 impl<'a> Iterator for BlocksHeader<'a> {
     type Item = BlockInfo;
     fn next(&mut self) -> Option<Self::Item> {
-        self.0.next().map(|slice| {
-            debug_assert_eq!(slice.len(), BLOCK_INFO_SIZE, "bug: malformed blocks header");
-            BlockInfo { index: slice[0] as u16, bits: slice[1] as u16 + 1 }
-        })
+        self.chunks.next().map(|slice| BlockInfo { index: slice[0] as u16, bits: slice[1] as u16 + 1 })
     }
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.0.size_hint()
+        self.chunks.size_hint()
     }
 }
 impl<'a> ExactSizeIterator for BlocksHeader<'a> {}

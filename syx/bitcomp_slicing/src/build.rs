@@ -101,7 +101,7 @@ impl SparseChunkStats {
 
     #[inline]
     pub(crate) fn bits(&self) -> u32 {
-        self.header.chunks_exact(2).map(|c| c[1] as u32 + 1).sum()
+        self.header.as_chunks::<HEADER2_BYTES>().0.iter().map(|c| c[1] as u32 + 1).sum()
     }
 
     #[inline]
@@ -111,10 +111,10 @@ impl SparseChunkStats {
 }
 
 pub(crate) fn sparse_chunk_stats(chunk: &[u64]) -> SparseChunkStats {
-    let mut blocks = chunk.chunks_exact((BLOCK_BITS / u64::BITS as u64) as usize);
+    let (blocks, remainder) = chunk.as_chunks::<BLOCK_U64_LEN>();
     let mut stats = SparseChunkStats::default();
 
-    for (i, block) in blocks.by_ref().enumerate() {
+    for (i, block) in blocks.iter().enumerate() {
         let bits = block.count1();
         if bits == 0 {
             stats.empty_blocks += 1;
@@ -138,7 +138,7 @@ pub(crate) fn sparse_chunk_stats(chunk: &[u64]) -> SparseChunkStats {
         }
     }
 
-    assert_eq!(blocks.remainder().len(), 0, "bug: chunk must have 1<<16 bits");
+    assert_eq!(remainder.len(), 0, "bug: chunk must have 1<<16 bits");
     stats
 }
 

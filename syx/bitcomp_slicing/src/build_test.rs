@@ -11,7 +11,10 @@ use crate::build::{
     sparse_chunk_stats,
 };
 use crate::chunk::Chunk;
-use crate::consts::DENSE_CHUNK_BYTES;
+use crate::consts::{
+    BLOCK_U64_LEN,
+    DENSE_CHUNK_BYTES,
+};
 
 fn setwords(bits: &mut [u64], x: u64) {
     for b in bits {
@@ -69,7 +72,7 @@ impl ChunkBitPattern {
                 assert_eq!(stats.sparse_blocks, 256);
             }
             SparseWithTwoTypesOfBlocks => {
-                for (i, b) in bits.chunks_exact_mut(4).enumerate() {
+                for (i, b) in bits.as_chunks_mut::<BLOCK_U64_LEN>().0.iter_mut().enumerate() {
                     match i {
                         0 => setwords(b, 1),
                         1 => b.set1(0),
