@@ -161,7 +161,7 @@ crate.spec(
 crate.spec(
     features = ["tokio"],
     package = "fastcdc",
-    version = "4.0",
+    version = "5.0",
 )
 
 # Type-safe bitflag sets.
