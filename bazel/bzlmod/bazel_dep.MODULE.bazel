@@ -35,19 +35,7 @@ bazel_dep(
 )
 
 # Hermetic C/C++ toolchain using Zig-bundled Clang.
-#
-# TODO: match the LLVM version between rustc and zig cc.
-#
-# hermetic_cc_toolchain bundles a different LLVM version than rustc does.
-# This mismatch breaks rust_proc_macro deps under fat LTO (see
-# crate.MODULE.bazel), and could affect other LTO/bitcode-sensitive
-# builds too.
-#
-# Compare the two with:
-#
-#   bazel run @rules_rust//tools/upstream_wrapper:rustc -- --version --verbose
-#   bazel run @zig_sdk//:zig -- cc --version
-bazel_dep(name = "hermetic_cc_toolchain", version = "4.1.0")
+bazel_dep(name = "hermetic_cc_toolchain", version = "4.3.0")
 
 # C++ rules
 # An auto-detecting toolchain that expects to find tools installed on the host machine.
