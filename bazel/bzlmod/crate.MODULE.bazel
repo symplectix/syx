@@ -142,7 +142,7 @@ crate.spec(
 # LSM-tree storage engine built directly on object storage (S3 etc).
 crate.spec(
     package = "slatedb",
-    version = "0.15",
+    version = "0.16",
 )
 
 # Unified async API over object storage backends (S3, GCS, Azure, local fs).
