@@ -12,11 +12,18 @@ bazel_dep(
     dev_dependency = True,
 )
 
-# Required to enable pre-built protoc binaries (avoid C++ compilation of protoc,
-# which fails with the Zig/lld toolchain).
+# Required to enable pre-built protoc binaries.
+# Avoid C++ compilation of protoc, which fails
+# with the Zig/lld toolchain.
+#
+# Pinned to 34.1: starting at 35.0, protobuf's MODULE.bazel stopped
+# marking its crate_universe usage as dev_dependency, so any consumer
+# using rules_rust >= 0.71.1 fails to resolve with "crates is in a
+# non-root module but has no lockfile". Fix pending upstream.
+# https://github.com/protocolbuffers/protobuf/issues/28224
 bazel_dep(
     name = "protobuf",
-    version = "33.4",
+    version = "34.1",
     dev_dependency = True,
 )
 
