@@ -304,38 +304,6 @@ crate.spec(
     version = "1",
 )
 
-# rust_proc_macro dependencies.
-#
-# - hermetic_cc_toolchain's LLVM and rustc's LLVM are different versions.
-# - Under --config=release, rules_rust itself sets -Clinker-plugin-lto on
-#   rust_proc_macro dependencies. With that enabled, rustc emits no native
-#   object code for these rlibs, only bitcode.
-#   The linker (lld from hermetic_cc_toolchain) then has to read that bitcode
-#   directly to link a proc-macro against it, which fails on the LLVM version
-#   mismatch.
-# - With -Clinker-plugin-lto=off, rustc embeds native object too. The linker
-#   just links the object code as usual and never has to touch the bitcode,
-#   so the version mismatch stops mattering.
-#
-# Matching the two LLVM versions would fix this at the source, but is a
-# bigger change than this warrants right now.
-crate.annotation(
-    crate = "proc-macro2",
-    rustc_flags = ["-Clinker-plugin-lto=off"],
-)
-crate.annotation(
-    crate = "syn",
-    rustc_flags = ["-Clinker-plugin-lto=off"],
-)
-crate.annotation(
-    crate = "quote",
-    rustc_flags = ["-Clinker-plugin-lto=off"],
-)
-crate.annotation(
-    crate = "unicode-ident",
-    rustc_flags = ["-Clinker-plugin-lto=off"],
-)
-
 # TODO: see bazel_dep.MODULE.bazel for why this is disabled
 # (bazelbuild/rules_rust#3993).
 # crate.annotation(
