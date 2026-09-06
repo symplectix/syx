@@ -116,7 +116,7 @@ crate.spec(
 # zstd compression bindings.
 crate.spec(
     package = "zstd",
-    version = "0.13",
+    version = "0.14",
 )
 crate.spec(
     features = [
