@@ -102,5 +102,9 @@ mod consts {
     // of a single slice per chunk.
     pub(crate) const CHUNK_U16_LEN: usize = HEADER1_BYTES / (u16::BITS / u8::BITS) as usize;
 
+    // Blocks are represented as [u64], and BLOCK_U64_LEN is the length
+    // of a single slice per block.
+    pub(crate) const BLOCK_U64_LEN: usize = (BLOCK_BITS / u64::BITS as u64) as usize;
+
     pub(crate) const BLOCK_INFO_SIZE: usize = 2;
 }
