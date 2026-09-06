@@ -280,7 +280,7 @@ crate.spec(
 # Parses a derive macro's input into a syntax tree.
 crate.spec(
     package = "syn",
-    version = "2",
+    version = "3",
 )
 
 # Quasi-quotation for generating token streams.
