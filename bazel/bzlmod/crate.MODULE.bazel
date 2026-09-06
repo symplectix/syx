@@ -10,7 +10,7 @@ crate.spec(
 )
 crate.spec(
     package = "thiserror",
-    version = "1",
+    version = "2",
 )
 
 # Async runtime and utilities.
@@ -89,15 +89,15 @@ crate.spec(
 # Protobuf code generation and runtime.
 crate.spec(
     package = "prost",
-    version = "0.13",
-)
-crate.spec(
-    package = "prost-reflect",
     version = "0.14",
 )
 crate.spec(
     package = "prost-types",
-    version = "0.13",
+    version = "0.14",
+)
+crate.spec(
+    package = "prost-reflect",
+    version = "0.16",
 )
 
 # Command-line argument parsing.
@@ -116,7 +116,7 @@ crate.spec(
 # zstd compression bindings.
 crate.spec(
     package = "zstd",
-    version = "0.13",
+    version = "0.14",
 )
 crate.spec(
     features = [
@@ -140,18 +140,9 @@ crate.spec(
 )
 
 # LSM-tree storage engine built directly on object storage (S3 etc).
-# "foyer" (a default feature) is excluded: its build.rs reads
-# CARGO_MANIFEST_DIR via the compile-time env!() macro instead of
-# std::env::var(), so the path it bakes in doesn't match the sandbox
-# a Bazel cargo_build_script actually runs in. Fixed upstream
-# (foyer-rs/foyer#1274, merged 2026-02-19) but not yet in a release
-# (last release 0.22.3 predates the merge). Revisit once foyer cuts
-# a new version.
 crate.spec(
-    default_features = False,
-    features = ["aws"],
     package = "slatedb",
-    version = "0.15",
+    version = "0.16",
 )
 
 # Unified async API over object storage backends (S3, GCS, Azure, local fs).
@@ -170,7 +161,7 @@ crate.spec(
 crate.spec(
     features = ["tokio"],
     package = "fastcdc",
-    version = "4.0",
+    version = "5.0",
 )
 
 # Type-safe bitflag sets.
@@ -231,7 +222,7 @@ crate.spec(
 # Incremental parsing and grammars.
 crate.spec(
     package = "tree-sitter",
-    version = "0.26",
+    version = "0.27",
 )
 crate.spec(
     package = "tree-sitter-md",
@@ -241,7 +232,7 @@ crate.spec(
 # Raw libc bindings.
 crate.spec(
     package = "libc",
-    version = "=0.2.188",
+    version = "=0.2.189",
 )
 
 # Random number generation.
@@ -259,7 +250,7 @@ crate.spec(
 # Extra iterator adaptors.
 crate.spec(
     package = "itertools",
-    version = "0.14",
+    version = "0.15",
 )
 
 # Numeric traits and types.
@@ -277,7 +268,7 @@ crate.spec(
 # Locate Bazel runfiles at runtime.
 crate.spec(
     package = "runfiles",
-    version = "0.2",
+    version = "0.3",
 )
 
 # Builder-pattern derive macro.
@@ -289,7 +280,7 @@ crate.spec(
 # Parses a derive macro's input into a syntax tree.
 crate.spec(
     package = "syn",
-    version = "2",
+    version = "3",
 )
 
 # Quasi-quotation for generating token streams.
@@ -302,6 +293,34 @@ crate.spec(
 crate.spec(
     package = "proc-macro2",
     version = "1",
+)
+
+# rust_proc_macro dependencies.
+#
+# hermetic_cc_toolchain's LLVM (20) and rustc's LLVM (22) are different
+# versions. Under --config=release, rules_rust sets -Clinker-plugin-lto
+# on rust_proc_macro dependencies, so rustc emits bitcode only, and the
+# linker (lld from hermetic_cc_toolchain) has to read it directly to
+# link a proc-macro against it. This works for some crates but not
+# others depending on which LLVM IR features they emit;
+# syn 3.0.5 hits an attribute the older lld doesn't know
+# ("Unknown attribute kind (103)"). -Clinker-plugin-lto=off makes rustc
+# embed native object code too, sidestepping the bitcode path entirely.
+crate.annotation(
+    crate = "proc-macro2",
+    rustc_flags = ["-Clinker-plugin-lto=off"],
+)
+crate.annotation(
+    crate = "syn",
+    rustc_flags = ["-Clinker-plugin-lto=off"],
+)
+crate.annotation(
+    crate = "quote",
+    rustc_flags = ["-Clinker-plugin-lto=off"],
+)
+crate.annotation(
+    crate = "unicode-ident",
+    rustc_flags = ["-Clinker-plugin-lto=off"],
 )
 
 # TODO: see bazel_dep.MODULE.bazel for why this is disabled
