@@ -268,7 +268,7 @@ crate.spec(
 # Locate Bazel runfiles at runtime.
 crate.spec(
     package = "runfiles",
-    version = "0.2",
+    version = "0.3",
 )
 
 # Builder-pattern derive macro.
