@@ -232,7 +232,7 @@ crate.spec(
 # Raw libc bindings.
 crate.spec(
     package = "libc",
-    version = "=0.2.188",
+    version = "=0.2.189",
 )
 
 # Random number generation.
