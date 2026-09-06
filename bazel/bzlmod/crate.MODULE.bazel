@@ -222,7 +222,7 @@ crate.spec(
 # Incremental parsing and grammars.
 crate.spec(
     package = "tree-sitter",
-    version = "0.26",
+    version = "0.27",
 )
 crate.spec(
     package = "tree-sitter-md",
