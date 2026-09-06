@@ -10,7 +10,7 @@ crate.spec(
 )
 crate.spec(
     package = "thiserror",
-    version = "1",
+    version = "2",
 )
 
 # Async runtime and utilities.
