@@ -47,7 +47,7 @@ bazel_dep(
 #
 #   bazel run @rules_rust//tools/upstream_wrapper:rustc -- --version --verbose
 #   bazel run @zig_sdk//:zig -- cc --version
-bazel_dep(name = "hermetic_cc_toolchain", version = "4.1.0")
+bazel_dep(name = "hermetic_cc_toolchain", version = "4.3.0")
 
 # C++ rules
 # An auto-detecting toolchain that expects to find tools installed on the host machine.
