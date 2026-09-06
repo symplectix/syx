@@ -89,15 +89,15 @@ crate.spec(
 # Protobuf code generation and runtime.
 crate.spec(
     package = "prost",
-    version = "0.13",
-)
-crate.spec(
-    package = "prost-reflect",
     version = "0.14",
 )
 crate.spec(
     package = "prost-types",
-    version = "0.13",
+    version = "0.14",
+)
+crate.spec(
+    package = "prost-reflect",
+    version = "0.16",
 )
 
 # Command-line argument parsing.
