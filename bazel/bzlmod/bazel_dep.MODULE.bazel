@@ -56,6 +56,12 @@ bazel_dep(name = "rules_rust_pyo3", version = rules_rust_version)
 # bazel_dep(name = "rules_rust_prost", version = rules_rust_version)
 # bazel_dep(name = "rules_rust_protobuf", version = rules_rust_version)
 
+# Pulled in transitively via protobuf -> rules_jvm_external -> rules_android,
+# which requests rules_go 0.51.0-rc2. That version predates the removal of the
+# top-level CcInfo symbol and fails to load under the current Bazel. Pin to a
+# version that loads CcInfo from @rules_cc.
+bazel_dep(name = "rules_go", version = "0.63.0", dev_dependency = True)
+
 # Python rules for Bazel
 bazel_dep(name = "rules_python", version = "2.2.0")
 bazel_dep(name = "rules_uv", version = "0.89.2")
