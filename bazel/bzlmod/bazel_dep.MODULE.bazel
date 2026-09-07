@@ -56,11 +56,18 @@ bazel_dep(name = "rules_rust_pyo3", version = rules_rust_version)
 # bazel_dep(name = "rules_rust_prost", version = rules_rust_version)
 # bazel_dep(name = "rules_rust_protobuf", version = rules_rust_version)
 
-# Pulled in transitively via protobuf -> rules_jvm_external -> rules_android,
-# which requests rules_go 0.51.0-rc2. That version predates the removal of the
-# top-level CcInfo symbol and fails to load under the current Bazel. Pin to a
-# version that loads CcInfo from @rules_cc.
+# protobuf pulls in rules_go, rules_jvm_external, and rules_android
+# transitively. Left to MVS they resolve to rules_go 0.51, rules_jvm_external
+# 6.7, and rules_android 0.6.4, all of which reference the top-level CcInfo
+# symbol that the current Bazel has removed, so loading them fails. These pins
+# raise them to loadable versions.
+#
+# Nothing here uses rules_android directly. It still breaks CI because GitHub
+# runners set ANDROID_HOME, which makes rules_android fetch @androidsdk and
+# load its .bzl files during toolchain resolution.
 bazel_dep(name = "rules_go", version = "0.63.0", dev_dependency = True)
+bazel_dep(name = "rules_jvm_external", version = "6.10", dev_dependency = True)
+bazel_dep(name = "rules_android", version = "0.7.1", dev_dependency = True)
 
 # Python rules for Bazel
 bazel_dep(name = "rules_python", version = "2.2.0")
