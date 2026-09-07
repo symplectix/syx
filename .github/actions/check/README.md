@@ -1,35 +1,18 @@
 # Check action
 
-Runs pre-build checks, build, and test. Supports two modes:
+Runs pre-build checks, then builds and tests `//...`. Supports two modes:
 
-- `presubmit`: builds only targets affected by the change.
-- `postsubmit`: unconditionally builds `//...`.
+- `presubmit`: runs the pre-build hooks, then builds and tests.
+- `postsubmit`: builds and tests, and saves the Bazel caches.
 
-## presubmit
+## Caches
 
-[bazel-diff] computes impacted targets by hashing the Bazel target graph at the
-base commit and at HEAD, then diffing the two hash sets. If no targets are
-affected, Build and Test are skipped entirely.
+The repository cache and disk cache are restored in both modes but saved only
+in postsubmit, so short-lived PR branches do not pollute caches shared across
+runs. Unchanged targets are served from the restored/remote caches.
 
-The impacted target list is printed in the "Compute impacted targets" step log,
-so a suspiciously short or empty list is visible in Actions.
+## Pre-build
 
-Base hashes are restored from a cache saved by the preceding postsubmit run.
-The cache key is `bazel-diff-<os>-<base-sha>`, where `base-sha` equals
-`head-sha` of the postsubmit run at that commit. On cache miss, base hashes
-are generated via a git worktree at the base commit.
-
-## postsubmit
-
-Builds and tests `//...`. Also saves disk cache, repository cache and
-bazel-diff hashes for use by the next presubmit run.
-
-Bazel caches are saved only in postsubmit to prevent short-lived PR branches
-from polluting caches shared across runs.
-
-Head hashes are saved before Build and Test so the cache is populated even if
-the build fails, ensuring the next presubmit always has base hashes to restore.
-
-Postsubmit runs on every push to main and weekly on Monday.
-
-[bazel-diff]: https://github.com/Tinder/bazel-diff
+In presubmit, `prek run --from-ref <base-sha>` runs the `ci` hook group over
+the files changed since the base commit. `base-sha` is the PR base (or the
+merge-group base). It is empty on `workflow_dispatch`, which skips this step.

@@ -27,13 +27,6 @@ bazel_dep(
     dev_dependency = True,
 )
 
-# Bazel target diffing between two git revisions
-bazel_dep(
-    name = "bazel-diff",
-    version = "46.1.0",
-    dev_dependency = True,
-)
-
 # Hermetic C/C++ toolchain using Zig-bundled Clang.
 bazel_dep(name = "hermetic_cc_toolchain", version = "4.3.0")
 
